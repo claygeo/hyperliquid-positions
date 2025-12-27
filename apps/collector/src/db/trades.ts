@@ -13,21 +13,19 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
   if (trades.length === 0) return 0;
 
   try {
-    // Filter out any trades with missing required fields
     const validTrades = trades.filter(t => t.wallet && t.coin && t.tx_hash);
     
     if (validTrades.length === 0) return 0;
 
     const { data, error } = await db.client
       .from('trades')
-      .upsert(validTrades, { 
+      .upsert(validTrades as any, { 
         onConflict: 'wallet,tx_hash,oid',
         ignoreDuplicates: true 
       })
       .select('id');
 
     if (error) {
-      // Silently handle duplicates and FK violations
       if (error.code === '23505' || error.code === '23503') {
         return 0;
       }
@@ -58,7 +56,7 @@ export async function getTradesForWallet(wallet: string, limit: number = 100): P
     return [];
   }
 
-  return data || [];
+  return (data || []) as DBTrade[];
 }
 
 /**
@@ -76,7 +74,7 @@ export async function getRecentTrades(limit: number = 100): Promise<DBTrade[]> {
     return [];
   }
 
-  return data || [];
+  return (data || []) as DBTrade[];
 }
 
 /**
@@ -96,7 +94,7 @@ export async function getClosedTrades(wallet: string, limit: number = 100): Prom
     return [];
   }
 
-  return data || [];
+  return (data || []) as DBTrade[];
 }
 
 /**

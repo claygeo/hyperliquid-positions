@@ -1,23 +1,14 @@
-// Update wallet scores job
+// Update scores job - now handled by alpha detector
 
-import { scoreAllWallets } from '../processors/wallet-scorer.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('jobs:update-scores');
 
 /**
- * Job to update all wallet scores
+ * Update wallet scores (handled by alpha detector)
  */
 export async function updateScoresJob(): Promise<void> {
-  logger.info('Starting wallet score update job');
-  
-  try {
-    await scoreAllWallets(20);
-    logger.info('Wallet score update complete');
-  } catch (error) {
-    logger.error('Wallet score update failed', error);
-    throw error;
-  }
+  logger.debug('Score updates handled by alpha detector');
 }
 
 export default updateScoresJob;

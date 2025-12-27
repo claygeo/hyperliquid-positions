@@ -32,11 +32,11 @@ export function processTrade(trade: {
   const size = parseFloat(trade.sz);
   const timestamp = new Date(trade.time);
 
-  // Create trade record
+  // Create trade record - use 'B' or 'A' format for DB
   const tradeRecord: DBTradeInsert = {
     wallet: trade.user.toLowerCase(),
     coin: trade.coin,
-    side: trade.side === 'B' ? 'buy' : 'sell',
+    side: trade.side === 'B' ? 'B' : 'A',
     price: price,
     size: size,
     notional: price * size,

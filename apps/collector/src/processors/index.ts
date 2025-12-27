@@ -7,3 +7,6 @@ export {
   getTopAlphaWallets,
   startAlphaFlushInterval 
 } from './alpha-detector.js';
+export { detectClusters } from './cluster-detector.js';
+export { analyzeEntries, clearOldCache } from './entry-analyzer.js';
+export { scoreAllWallets, getTopScoredWallets } from './wallet-scorer.js';

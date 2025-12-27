@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import type { RealtimeChannel } from '@supabase/supabase-js';
+import type { RealtimeChannel, RealtimePostgresChangesPayload } from '@supabase/supabase-js';
 
 type EventType = 'INSERT' | 'UPDATE' | 'DELETE' | '*';
 
@@ -32,15 +32,15 @@ export function useRealtime<T extends Record<string, unknown>>({
 
     const channel = supabase
       .channel(`${table}-changes-${Date.now()}`)
-      .on(
-        'postgres_changes',
+      .on<T>(
+        'postgres_changes' as const,
         {
           event,
           schema: 'public',
           table,
           filter,
         },
-        (payload) => {
+        (payload: RealtimePostgresChangesPayload<T>) => {
           const newRecord = payload.new as T;
           const oldRecord = payload.old as T;
 

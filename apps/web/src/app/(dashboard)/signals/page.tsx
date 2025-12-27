@@ -17,7 +17,7 @@ export default function SignalsPage() {
         </p>
       </div>
 
-      <SignalFilters filter={filters} onFilterChange={setFilters} />
+      <SignalFilters filters={filters} onFilterChange={setFilters} />
 
       {isLoading ? (
         <div className="flex justify-center py-12">

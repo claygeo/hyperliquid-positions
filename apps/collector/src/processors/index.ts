@@ -1,4 +1,9 @@
-export { processTrade, processFill } from './trade-processor.js';
-export { scoreWallet, scoreAllWallets, getTopWallets } from './wallet-scorer.js';
-export { analyzeEntries, clearOldCache } from './entry-analyzer.js';
-export { detectClusters } from './cluster-detector.js';
+// Processors module exports
+
+export { processTrade, flushPendingData, startFlushInterval } from './trade-processor.js';
+export { 
+  processTradeForAlpha, 
+  flushAlphaBuffer, 
+  getTopAlphaWallets,
+  startAlphaFlushInterval 
+} from './alpha-detector.js';

@@ -13,20 +13,26 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
   if (trades.length === 0) return 0;
 
   try {
+    // Filter out any trades with missing required fields
+    const validTrades = trades.filter(t => t.wallet && t.coin && t.tx_hash);
+    
+    if (validTrades.length === 0) return 0;
+
     const { data, error } = await db.client
       .from('trades')
-      .upsert(trades, { 
+      .upsert(validTrades, { 
         onConflict: 'wallet,tx_hash,oid',
         ignoreDuplicates: true 
       })
       .select('id');
 
     if (error) {
-      if (error.code === '23505') {
-        logger.debug(`Skipped ${trades.length} duplicate trades`);
+      // Silently handle duplicates and FK violations
+      if (error.code === '23505' || error.code === '23503') {
         return 0;
       }
-      throw error;
+      logger.error('Failed to bulk insert trades', error);
+      return 0;
     }
 
     return data?.length || 0;
@@ -37,13 +43,13 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
 }
 
 /**
- * Get trades for scoring a wallet
+ * Get trades for a wallet
  */
-export async function getTradesForScoring(wallet: string, limit: number = 1000): Promise<DBTrade[]> {
+export async function getTradesForWallet(wallet: string, limit: number = 100): Promise<DBTrade[]> {
   const { data, error } = await db.client
     .from('trades')
     .select('*')
-    .eq('wallet', wallet)
+    .eq('wallet', wallet.toLowerCase())
     .order('timestamp', { ascending: false })
     .limit(limit);
 
@@ -56,9 +62,9 @@ export async function getTradesForScoring(wallet: string, limit: number = 1000):
 }
 
 /**
- * Get recent trades (for wallet discovery)
+ * Get recent trades
  */
-export async function getRecentTrades(limit: number = 1000): Promise<DBTrade[]> {
+export async function getRecentTrades(limit: number = 100): Promise<DBTrade[]> {
   const { data, error } = await db.client
     .from('trades')
     .select('*')
@@ -74,89 +80,23 @@ export async function getRecentTrades(limit: number = 1000): Promise<DBTrade[]> 
 }
 
 /**
- * Get recent trades for a coin
+ * Get trades with profit/loss
  */
-export async function getRecentTradesForCoin(coin: string, limit: number = 100): Promise<DBTrade[]> {
+export async function getClosedTrades(wallet: string, limit: number = 100): Promise<DBTrade[]> {
   const { data, error } = await db.client
     .from('trades')
     .select('*')
-    .eq('coin', coin)
+    .eq('wallet', wallet.toLowerCase())
+    .neq('closed_pnl', 0)
     .order('timestamp', { ascending: false })
     .limit(limit);
 
   if (error) {
-    logger.error(`Failed to get trades for ${coin}`, error);
+    logger.error(`Failed to get closed trades for ${wallet}`, error);
     return [];
   }
 
   return data || [];
-}
-
-/**
- * Get trades needing price backfill
- */
-export async function getTradesNeedingPriceBackfill(limit: number = 100): Promise<DBTrade[]> {
-  const { data, error } = await db.client
-    .from('trades')
-    .select('*')
-    .is('entry_score', null)
-    .order('timestamp', { ascending: false })
-    .limit(limit);
-
-  if (error) {
-    logger.error('Failed to get trades needing backfill', error);
-    return [];
-  }
-
-  return data || [];
-}
-
-/**
- * Update trade entry score
- */
-export async function updateTradeEntryScore(
-  tradeId: number,
-  entryScore: number,
-  priceAtEntry: number,
-  price5mAfter: number | null,
-  price1hAfter: number | null
-): Promise<void> {
-  const { error } = await db.client
-    .from('trades')
-    .update({
-      entry_score: entryScore,
-      price_at_entry: priceAtEntry,
-      price_5m_after: price5mAfter,
-      price_1h_after: price1hAfter,
-    })
-    .eq('id', tradeId);
-
-  if (error) {
-    logger.error(`Failed to update entry score for trade ${tradeId}`, error);
-  }
-}
-
-/**
- * Bulk update trade entry scores
- */
-export async function updateTradeEntryScores(
-  updates: Array<{
-    id: number;
-    entry_score: number;
-    price_at_entry: number;
-    price_5m_after: number | null;
-    price_1h_after: number | null;
-  }>
-): Promise<void> {
-  for (const update of updates) {
-    await updateTradeEntryScore(
-      update.id,
-      update.entry_score,
-      update.price_at_entry,
-      update.price_5m_after,
-      update.price_1h_after
-    );
-  }
 }
 
 /**
@@ -180,31 +120,10 @@ export async function deleteOldTrades(olderThanDays: number = 30): Promise<numbe
   return data?.length || 0;
 }
 
-/**
- * Get trade count for wallet
- */
-export async function getTradeCountForWallet(wallet: string): Promise<number> {
-  const { count, error } = await db.client
-    .from('trades')
-    .select('*', { count: 'exact', head: true })
-    .eq('wallet', wallet);
-
-  if (error) {
-    logger.error(`Failed to get trade count for ${wallet}`, error);
-    return 0;
-  }
-
-  return count || 0;
-}
-
 export default {
   bulkInsertTrades,
-  getTradesForScoring,
+  getTradesForWallet,
   getRecentTrades,
-  getRecentTradesForCoin,
-  getTradesNeedingPriceBackfill,
-  updateTradeEntryScore,
-  updateTradeEntryScores,
+  getClosedTrades,
   deleteOldTrades,
-  getTradeCountForWallet,
 };

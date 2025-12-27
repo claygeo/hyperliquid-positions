@@ -2,6 +2,7 @@
   "name": "hyperliquid-tracker",
   "version": "1.0.0",
   "private": true,
+  "packageManager": "npm@10.2.0",
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -9,10 +10,15 @@
   "scripts": {
     "dev": "turbo run dev",
     "build": "turbo run build",
+    "build:shared": "npm run build --workspace=packages/shared",
+    "build:sdk": "npm run build --workspace=packages/hyperliquid-sdk",
+    "build:web": "npm run build:shared && npm run build:sdk && npm run build --workspace=apps/web",
+    "build:collector": "npm run build:shared && npm run build:sdk && npm run build --workspace=apps/collector",
     "lint": "turbo run lint",
     "clean": "turbo run clean",
     "collector:dev": "npm run dev --workspace=apps/collector",
     "collector:build": "npm run build --workspace=apps/collector",
+    "collector:start": "npm run start --workspace=apps/collector",
     "web:dev": "npm run dev --workspace=apps/web",
     "web:build": "npm run build --workspace=apps/web",
     "db:generate-types": "./scripts/generate-types.sh",

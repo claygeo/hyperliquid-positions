@@ -1,7 +1,15 @@
 'use client';
 
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
+
+const SIGNAL_TYPES = [
+  { value: 'new_position', label: 'New Position' },
+  { value: 'position_increase', label: 'Increased' },
+  { value: 'position_close', label: 'Closed' },
+  { value: 'unusual_size', label: 'Unusual Size' },
+  { value: 'cluster_convergence', label: 'Cluster' },
+  { value: 'high_conviction', label: 'High Conviction' },
+];
 
 interface SignalFilters {
   types: string[];
@@ -10,44 +18,36 @@ interface SignalFilters {
 
 interface SignalFiltersProps {
   filters: SignalFilters;
-  onChange: (filters: SignalFilters) => void;
+  onFilterChange: (filters: SignalFilters) => void;
 }
 
-const signalTypes = [
-  { value: 'new_position', label: 'New Position' },
-  { value: 'position_increase', label: 'Increase' },
-  { value: 'position_close', label: 'Close' },
-  { value: 'cluster_convergence', label: 'Cluster' },
-  { value: 'unusual_size', label: 'Unusual Size' },
-];
-
-export function SignalFilters({ filters, onChange }: SignalFiltersProps) {
+export function SignalFilters({ filters, onFilterChange }: SignalFiltersProps) {
   const toggleType = (type: string) => {
     const newTypes = filters.types.includes(type)
       ? filters.types.filter((t) => t !== type)
       : [...filters.types, type];
-    onChange({ ...filters, types: newTypes });
+    onFilterChange({ ...filters, types: newTypes });
+  };
+
+  const clearFilters = () => {
+    onFilterChange({ types: [], minConfidence: 0 });
   };
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <span className="text-sm text-muted-foreground mr-2">Filter:</span>
-      {signalTypes.map((type) => (
+      {SIGNAL_TYPES.map((signalType) => (
         <Button
-          key={type.value}
-          variant={filters.types.includes(type.value) ? 'default' : 'outline'}
+          key={signalType.value}
+          variant={filters.types.includes(signalType.value) ? 'default' : 'outline'}
           size="sm"
-          onClick={() => toggleType(type.value)}
+          onClick={() => toggleType(signalType.value)}
         >
-          {type.label}
+          {signalType.label}
         </Button>
       ))}
+
       {filters.types.length > 0 && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => onChange({ ...filters, types: [] })}
-        >
+        <Button variant="ghost" size="sm" onClick={clearFilters}>
           Clear
         </Button>
       )}

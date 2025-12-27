@@ -1,21 +1,21 @@
-// Update scores job - periodically recalculate wallet scores
+// Update wallet scores job
 
-import { scoreWallets } from '../processors/wallet-scorer.js';
+import { scoreAllWallets } from '../processors/wallet-scorer.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('jobs:update-scores');
 
 /**
- * Job to update wallet scores
+ * Job to update all wallet scores
  */
 export async function updateScoresJob(): Promise<void> {
-  logger.info('Starting score update job');
+  logger.info('Starting wallet score update job');
   
   try {
-    const scored = await scoreWallets(100);
-    logger.info(`Score update complete: ${scored} wallets scored`);
+    await scoreAllWallets(20);
+    logger.info('Wallet score update complete');
   } catch (error) {
-    logger.error('Score update job failed', error);
+    logger.error('Wallet score update failed', error);
     throw error;
   }
 }

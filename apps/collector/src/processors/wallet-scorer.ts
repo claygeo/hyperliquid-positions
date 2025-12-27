@@ -4,12 +4,7 @@ import { createLogger } from '../utils/logger.js';
 import { getWalletsForScoring, updateWallet } from '../db/wallets.js';
 import { getTradesForScoring } from '../db/trades.js';
 import {
-  calculateWinRate,
-  calculateAvgEntryScore,
-  calculateRiskAdjustedReturn,
-  calculateConsistency,
   calculateOverallScore,
-  SCORING_WEIGHTS,
 } from '@hyperliquid-tracker/shared';
 import type { DBWallet } from '@hyperliquid-tracker/shared';
 
@@ -36,7 +31,7 @@ export async function scoreWallet(address: string): Promise<number | null> {
     }
 
     const winRate = calculateWinRateFromTrades(trades);
-    const entryScore = calculateEntryScoreFromTrades(trades);
+    const entryQuality = calculateEntryScoreFromTrades(trades);
     const riskAdjusted = calculateRiskAdjustedFromTrades(trades);
     const consistency = calculateConsistencyFromTrades(trades);
     
@@ -44,19 +39,22 @@ export async function scoreWallet(address: string): Promise<number | null> {
     const fundingEfficiency = 0.5;
 
     const overallScore = calculateOverallScore({
+      entryQuality,
       winRate,
-      entryScore,
       riskAdjusted,
       consistency,
       fundingEfficiency,
     });
 
+    if (overallScore === null) {
+      return null;
+    }
+
     // Update wallet with new scores
     await updateWallet(address, {
       win_rate: winRate,
-      entry_score: entryScore,
+      entry_score: entryQuality,
       risk_adjusted_return: riskAdjusted,
-      consistency_score: consistency,
       overall_score: overallScore,
     });
 
@@ -71,9 +69,9 @@ export async function scoreWallet(address: string): Promise<number | null> {
 /**
  * Score all eligible wallets
  */
-export async function scoreAllWallets(): Promise<void> {
+export async function scoreAllWallets(minTrades: number = 20): Promise<void> {
   try {
-    const wallets = await getWalletsForScoring();
+    const wallets = await getWalletsForScoring(minTrades);
     logger.info(`Scoring ${wallets.length} wallets`);
 
     let scored = 0;
@@ -98,8 +96,8 @@ export async function scoreAllWallets(): Promise<void> {
 /**
  * Get top wallets by score
  */
-export async function getTopWallets(limit: number = 100): Promise<DBWallet[]> {
-  const wallets = await getWalletsForScoring();
+export async function getTopWallets(limit: number = 100, minTrades: number = 20): Promise<DBWallet[]> {
+  const wallets = await getWalletsForScoring(minTrades);
   return wallets
     .filter(w => w.overall_score !== null)
     .sort((a, b) => (b.overall_score || 0) - (a.overall_score || 0))

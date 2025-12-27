@@ -20,7 +20,7 @@ export default function DiscoverPage() {
   const [wallets, setWallets] = useState<LeaderboardWallet[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
+  useEffect(function() {
     async function fetchLeaderboard() {
       const supabase = createClient();
       const { data, error } = await supabase
@@ -38,7 +38,9 @@ export default function DiscoverPage() {
     fetchLeaderboard();
     
     const interval = setInterval(fetchLeaderboard, 5 * 60 * 1000);
-    return () => clearInterval(interval);
+    return function() {
+      clearInterval(interval);
+    };
   }, []);
 
   function formatPnl(pnl: number): string {
@@ -56,6 +58,20 @@ export default function DiscoverPage() {
 
   function shortenAddress(addr: string): string {
     return addr.slice(0, 6) + '...' + addr.slice(-4);
+  }
+
+  function getPnlClass(pnl: number): string {
+    if (pnl >= 0) {
+      return 'p-4 text-right font-medium text-green-500';
+    }
+    return 'p-4 text-right font-medium text-red-500';
+  }
+
+  function getRoiClass(roi: number): string {
+    if (roi >= 0) {
+      return 'p-4 text-right text-green-500';
+    }
+    return 'p-4 text-right text-red-500';
   }
 
   if (isLoading) {
@@ -87,34 +103,36 @@ export default function DiscoverPage() {
             </tr>
           </thead>
           <tbody>
-            {wallets.map((wallet) => (
-              <tr key={wallet.address} className="border-b hover:bg-muted/50 transition-colors">
-                <td className="p-4">
-                  <Badge variant={wallet.rank <= 10 ? 'default' : 'secondary'}>
-                    #{wallet.rank}
-                  </Badge>
-                </td>
-                <td className="p-4 font-mono text-sm">
-                  
-                    href={'https://app.hyperliquid.xyz/explorer/address/' + wallet.address}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="hover:underline text-blue-500"
-                  >
-                    {shortenAddress(wallet.address)}
-                  </a>
-                </td>
-                <td className={'p-4 text-right font-medium ' + (wallet.pnl >= 0 ? 'text-green-500' : 'text-red-500')}>
-                  {formatPnl(wallet.pnl)}
-                </td>
-                <td className={'p-4 text-right ' + (wallet.roi >= 0 ? 'text-green-500' : 'text-red-500')}>
-                  {formatRoi(wallet.roi)}
-                </td>
-                <td className="p-4 text-right text-muted-foreground">
-                  ${wallet.account_value.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                </td>
-              </tr>
-            ))}
+            {wallets.map(function(wallet) {
+              return (
+                <tr key={wallet.address} className="border-b hover:bg-muted/50 transition-colors">
+                  <td className="p-4">
+                    <Badge variant={wallet.rank <= 10 ? 'default' : 'secondary'}>
+                      #{wallet.rank}
+                    </Badge>
+                  </td>
+                  <td className="p-4 font-mono text-sm">
+                    <a
+                      href={'https://app.hyperliquid.xyz/explorer/address/' + wallet.address}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline text-blue-500"
+                    >
+                      {shortenAddress(wallet.address)}
+                    </a>
+                  </td>
+                  <td className={getPnlClass(wallet.pnl)}>
+                    {formatPnl(wallet.pnl)}
+                  </td>
+                  <td className={getRoiClass(wallet.roi)}>
+                    {formatRoi(wallet.roi)}
+                  </td>
+                  <td className="p-4 text-right text-muted-foreground">
+                    ${wallet.account_value.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

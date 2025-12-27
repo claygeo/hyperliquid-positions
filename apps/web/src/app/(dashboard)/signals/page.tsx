@@ -25,7 +25,7 @@ export default function SignalsPage() {
   const [signals, setSignals] = useState<ConvergenceSignal[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
+  useEffect(function() {
     async function fetchSignals() {
       const supabase = createClient();
       const { data, error } = await supabase
@@ -46,7 +46,9 @@ export default function SignalsPage() {
     fetchSignals();
     
     const interval = setInterval(fetchSignals, 30 * 1000);
-    return () => clearInterval(interval);
+    return function() {
+      clearInterval(interval);
+    };
   }, []);
 
   function getTimeAgo(dateString: string): string {
@@ -76,6 +78,23 @@ export default function SignalsPage() {
     return '$' + value.toLocaleString('en-US', { maximumFractionDigits: 0 });
   }
 
+  function getDirectionBgClass(direction: string): string {
+    if (direction === 'long') {
+      return 'w-32 flex flex-col items-center justify-center p-4 bg-green-500/10';
+    }
+    return 'w-32 flex flex-col items-center justify-center p-4 bg-red-500/10';
+  }
+
+  function formatWalletList(walletList: string[] | null): string {
+    if (!walletList || walletList.length === 0) return '';
+    const shortened = walletList.slice(0, 5).map(shortenAddress);
+    let result = shortened.join(', ');
+    if (walletList.length > 5) {
+      result = result + ' +' + (walletList.length - 5) + ' more';
+    }
+    return result;
+  }
+
   if (isLoading) {
     return (
       <div className="flex justify-center py-12">
@@ -95,55 +114,56 @@ export default function SignalsPage() {
 
       {signals.length > 0 ? (
         <div className="grid gap-4">
-          {signals.map((signal) => (
-            <Card key={signal.id} className="overflow-hidden">
-              <CardContent className="p-0">
-                <div className="flex items-stretch">
-                  <div className={'w-32 flex flex-col items-center justify-center p-4 ' + (signal.direction === 'long' ? 'bg-green-500/10' : 'bg-red-500/10')}>
-                    <span className="text-2xl font-bold">{signal.coin}</span>
-                    <Badge variant={signal.direction === 'long' ? 'default' : 'destructive'} className="mt-1">
-                      {signal.direction.toUpperCase()}
-                    </Badge>
-                  </div>
+          {signals.map(function(signal) {
+            return (
+              <Card key={signal.id} className="overflow-hidden">
+                <CardContent className="p-0">
+                  <div className="flex items-stretch">
+                    <div className={getDirectionBgClass(signal.direction)}>
+                      <span className="text-2xl font-bold">{signal.coin}</span>
+                      <Badge variant={signal.direction === 'long' ? 'default' : 'destructive'} className="mt-1">
+                        {signal.direction.toUpperCase()}
+                      </Badge>
+                    </div>
 
-                  <div className="flex-1 p-4">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <span className="text-lg font-semibold">
-                          {signal.wallet_count} traders converging
+                    <div className="flex-1 p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-2">
+                          <span className="text-lg font-semibold">
+                            {signal.wallet_count} traders converging
+                          </span>
+                          <Badge variant="outline" className="text-xs">
+                            {signal.confidence}% confidence
+                          </Badge>
+                        </div>
+                        <span className="text-sm text-muted-foreground">
+                          {getTimeAgo(signal.created_at)}
                         </span>
-                        <Badge variant="outline" className="text-xs">
-                          {signal.confidence}% confidence
-                        </Badge>
                       </div>
-                      <span className="text-sm text-muted-foreground">
-                        {getTimeAgo(signal.created_at)}
-                      </span>
-                    </div>
 
-                    <div className="grid grid-cols-2 gap-4 text-sm">
-                      <div>
-                        <span className="text-muted-foreground">Avg Entry: </span>
-                        <span className="font-medium">{formatPrice(signal.avg_entry_price)}</span>
+                      <div className="grid grid-cols-2 gap-4 text-sm">
+                        <div>
+                          <span className="text-muted-foreground">Avg Entry: </span>
+                          <span className="font-medium">{formatPrice(signal.avg_entry_price)}</span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Total Value: </span>
+                          <span className="font-medium">{formatValue(signal.total_value_usd)}</span>
+                        </div>
                       </div>
-                      <div>
-                        <span className="text-muted-foreground">Total Value: </span>
-                        <span className="font-medium">{formatValue(signal.total_value_usd)}</span>
-                      </div>
-                    </div>
 
-                    <div className="mt-3 pt-3 border-t">
-                      <span className="text-xs text-muted-foreground">Traders: </span>
-                      <span className="text-xs font-mono">
-                        {signal.wallets && signal.wallets.slice(0, 5).map(shortenAddress).join(', ')}
-                        {signal.wallets && signal.wallets.length > 5 && ' +' + (signal.wallets.length - 5) + ' more'}
-                      </span>
+                      <div className="mt-3 pt-3 border-t">
+                        <span className="text-xs text-muted-foreground">Traders: </span>
+                        <span className="text-xs font-mono">
+                          {formatWalletList(signal.wallets)}
+                        </span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
+                </CardContent>
+              </Card>
+            );
+          })}
         </div>
       ) : (
         <Card>

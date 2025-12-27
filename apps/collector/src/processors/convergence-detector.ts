@@ -47,11 +47,32 @@ interface ConvergenceGroup {
   oldestEntry: Date;
 }
 
+interface SignalRecord {
+  id?: number;
+  coin: string;
+  direction: string;
+  wallet_count: number;
+  wallets: string[];
+  avg_entry_price: number;
+  total_value_usd: number;
+  confidence: number;
+  signal_strength: string;
+  fresh_entries: number;
+  winning_count: number;
+  losing_count: number;
+  avg_return_pct: number;
+  avg_position_pct: number;
+  freshness_minutes: number;
+  time_window_minutes: number;
+  is_active: boolean;
+  expires_at: string;
+  created_at?: string;
+}
+
 function calculateSignalStrength(group: ConvergenceGroup): { confidence: number; strength: string } {
   var confidence = 0;
   
   // Base score from fresh wallet count (up to 30 points)
-  // Fresh wallets matter most - these are actionable
   confidence += Math.min(30, group.freshWallets.length * 10);
   
   // Winning vs losing (up to 25 points, can go negative)
@@ -59,20 +80,17 @@ function calculateSignalStrength(group: ConvergenceGroup): { confidence: number;
   if (totalTraders > 0) {
     var winRatio = group.winningCount / totalTraders;
     if (winRatio >= 0.7) {
-      // 70%+ winning = strong signal
       confidence += 25;
     } else if (winRatio >= 0.5) {
-      // 50-70% winning = decent
       confidence += 15;
     } else if (winRatio < 0.3) {
-      // Less than 30% winning = potential squeeze, negative signal
       confidence -= 20;
     }
   }
   
   // Conviction - avg position size as % of account (up to 20 points)
   if (group.avgPositionPct >= 20) {
-    confidence += 20; // High conviction
+    confidence += 20;
   } else if (group.avgPositionPct >= 10) {
     confidence += 15;
   } else if (group.avgPositionPct >= 5) {
@@ -81,19 +99,19 @@ function calculateSignalStrength(group: ConvergenceGroup): { confidence: number;
   
   // Total value in position (up to 15 points)
   if (group.totalValue >= 10000000) {
-    confidence += 15; // $10M+
+    confidence += 15;
   } else if (group.totalValue >= 1000000) {
-    confidence += 10; // $1M+
+    confidence += 10;
   } else if (group.totalValue >= 100000) {
-    confidence += 5; // $100k+
+    confidence += 5;
   }
   
   // Freshness bonus (up to 10 points)
   var freshestMs = new Date().getTime() - group.freshestEntry.getTime();
   if (freshestMs < 15 * 60 * 1000) {
-    confidence += 10; // Entry in last 15 min
+    confidence += 10;
   } else if (freshestMs < 30 * 60 * 1000) {
-    confidence += 5; // Entry in last 30 min
+    confidence += 5;
   }
   
   // Clamp confidence
@@ -134,7 +152,7 @@ export async function detectConvergence(): Promise<void> {
   
   var changes = result.data as PositionChange[];
   
-  if (changes.length === 0) {
+  if (!changes || changes.length === 0) {
     return;
   }
   
@@ -167,10 +185,10 @@ export async function detectConvergence(): Promise<void> {
     // Only count each wallet once per group
     if (group.wallets.indexOf(change.wallet) === -1) {
       group.wallets.push(change.wallet);
-      group.totalValue += change.value_usd;
-      group.avgEntryPrice += change.entry_price;
-      group.avgReturnPct += change.return_on_equity * 100;
-      group.avgPositionPct += change.position_pct;
+      group.totalValue += change.value_usd || 0;
+      group.avgEntryPrice += change.entry_price || 0;
+      group.avgReturnPct += (change.return_on_equity || 0) * 100;
+      group.avgPositionPct += change.position_pct || 0;
       
       if (change.is_winning) {
         group.winningCount++;
@@ -235,7 +253,7 @@ export async function detectConvergence(): Promise<void> {
       .eq('is_active', true)
       .single();
     
-    var signalData = {
+    var signalData: SignalRecord = {
       coin: grp.coin,
       direction: grp.direction,
       wallet_count: walletCount,
@@ -265,7 +283,7 @@ export async function detectConvergence(): Promise<void> {
       signalsUpdated++;
       logger.info('🔄 Updated: ' + grp.coin + ' ' + grp.direction.toUpperCase() + ' - ' + walletCount + ' wallets (' + grp.freshWallets.length + ' fresh) | ' + scoring.strength.toUpperCase());
     } else {
-      // Create new signal
+      // Create new signal - add created_at
       signalData.created_at = new Date().toISOString();
       
       await db.client
@@ -292,6 +310,11 @@ export async function detectConvergence(): Promise<void> {
   }
 }
 
+// Alias for backwards compatibility
+export async function checkConvergence(): Promise<void> {
+  return detectConvergence();
+}
+
 export async function expireOldSignals(): Promise<void> {
   var now = new Date().toISOString();
   
@@ -306,13 +329,26 @@ export async function expireOldSignals(): Promise<void> {
   }
 }
 
-export async function getActiveSignals(): Promise<number> {
+export async function getActiveSignals(): Promise<SignalRecord[]> {
   var result = await db.client
     .from('convergence_signals')
-    .select('id', { count: 'exact' })
-    .eq('is_active', true);
+    .select('*')
+    .eq('is_active', true)
+    .order('confidence', { ascending: false })
+    .limit(20);
   
-  return result.count || 0;
+  return result.data || [];
 }
 
-export default { detectConvergence, expireOldSignals, getActiveSignals };
+// Alias for backwards compatibility
+export async function getRecentSignals(): Promise<SignalRecord[]> {
+  return getActiveSignals();
+}
+
+export default { 
+  detectConvergence, 
+  checkConvergence,
+  expireOldSignals, 
+  getActiveSignals,
+  getRecentSignals
+};

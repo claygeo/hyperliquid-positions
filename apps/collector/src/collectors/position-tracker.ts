@@ -49,6 +49,23 @@ interface ClearinghouseResponse {
   };
 }
 
+interface PositionChangeRecord {
+  wallet: string;
+  coin: string;
+  change_type: string;
+  direction: string;
+  old_size: number;
+  new_size: number;
+  entry_price: number;
+  value_usd: number;
+  unrealized_pnl: number;
+  return_on_equity: number;
+  position_pct: number;
+  account_value: number;
+  is_winning: boolean;
+  detected_at: string;
+}
+
 async function fetchPositions(wallet: string): Promise<{ positions: PositionFromAPI[]; accountValue: number } | null> {
   try {
     var response = await fetch(HYPERLIQUID_API, {
@@ -62,9 +79,15 @@ async function fetchPositions(wallet: string): Promise<{ positions: PositionFrom
     var data = await response.json() as ClearinghouseResponse;
     var accountValue = parseFloat(data.marginSummary?.accountValue || '0');
     
-    var positions = data.assetPositions
-      ?.filter(function(p) { return p.position && parseFloat(p.position.szi) !== 0; })
-      .map(function(p) { return p.position; }) || [];
+    var positions: PositionFromAPI[] = [];
+    if (data.assetPositions) {
+      for (var i = 0; i < data.assetPositions.length; i++) {
+        var ap = data.assetPositions[i];
+        if (ap.position && parseFloat(ap.position.szi) !== 0) {
+          positions.push(ap.position);
+        }
+      }
+    }
 
     return { positions: positions, accountValue: accountValue };
   } catch (error) {
@@ -80,21 +103,7 @@ async function processWalletPositions(wallet: string): Promise<void> {
   var positions = result.positions;
   var accountValue = result.accountValue;
   var walletCache = positionCache.get(wallet) || new Map<string, CachedPosition>();
-  var changes: Array<{
-    wallet: string;
-    coin: string;
-    changeType: string;
-    direction: string;
-    oldSize: number;
-    newSize: number;
-    entryPrice: number;
-    valueUsd: number;
-    unrealizedPnl: number;
-    returnOnEquity: number;
-    positionPct: number;
-    accountValue: number;
-    isWinning: boolean;
-  }> = [];
+  var changes: PositionChangeRecord[] = [];
 
   // Check each position
   for (var i = 0; i < positions.length; i++) {
@@ -143,24 +152,25 @@ async function processWalletPositions(wallet: string): Promise<void> {
       changes.push({
         wallet: wallet,
         coin: coin,
-        changeType: changeType,
+        change_type: changeType,
         direction: direction,
-        oldSize: oldSize,
-        newSize: absSize,
-        entryPrice: entryPrice,
-        valueUsd: valueUsd,
-        unrealizedPnl: unrealizedPnl,
-        returnOnEquity: returnOnEquity,
-        positionPct: positionPct,
-        accountValue: accountValue,
-        isWinning: isWinning,
+        old_size: oldSize,
+        new_size: absSize,
+        entry_price: entryPrice,
+        value_usd: valueUsd,
+        unrealized_pnl: unrealizedPnl,
+        return_on_equity: returnOnEquity,
+        position_pct: positionPct,
+        account_value: accountValue,
+        is_winning: isWinning,
+        detected_at: new Date().toISOString(),
       });
 
+      var pnlStr = unrealizedPnl >= 0 ? '+$' + Math.round(unrealizedPnl) : '-$' + Math.abs(Math.round(unrealizedPnl));
+      var roePct = (returnOnEquity * 100).toFixed(1);
       logger.info(
         '📊 ' + wallet.slice(0, 10) + '... ' + changeType.toUpperCase() + ' ' + direction.toUpperCase() + ' ' + coin +
-        ' - $' + Math.round(valueUsd) +
-        ' | PnL: ' + (unrealizedPnl >= 0 ? '+' : '') + '$' + Math.round(unrealizedPnl) +
-        ' (' + (returnOnEquity * 100).toFixed(1) + '%)'
+        ' - $' + Math.round(valueUsd) + ' | PnL: ' + pnlStr + ' (' + roePct + '%)'
       );
     }
 
@@ -180,32 +190,45 @@ async function processWalletPositions(wallet: string): Promise<void> {
   }
 
   // Check for closed positions
-  walletCache.forEach(function(cached, coin) {
-    var stillOpen = positions.some(function(p) { return p.coin === coin; });
+  var cachedCoins = Array.from(walletCache.keys());
+  for (var j = 0; j < cachedCoins.length; j++) {
+    var cachedCoin = cachedCoins[j];
+    var cachedPos = walletCache.get(cachedCoin);
+    if (!cachedPos) continue;
+    
+    var stillOpen = false;
+    for (var k = 0; k < positions.length; k++) {
+      if (positions[k].coin === cachedCoin) {
+        stillOpen = true;
+        break;
+      }
+    }
+    
     if (!stillOpen) {
-      var isMajorAsset = MAJOR_ASSETS.indexOf(coin) !== -1;
-      if (isMajorAsset && cached.valueUsd > 10000) {
+      var isMajor = MAJOR_ASSETS.indexOf(cachedCoin) !== -1;
+      if (isMajor && cachedPos.valueUsd > 10000) {
         changes.push({
           wallet: wallet,
-          coin: coin,
-          changeType: 'close',
-          direction: cached.direction,
-          oldSize: cached.size,
-          newSize: 0,
-          entryPrice: cached.entryPrice,
-          valueUsd: 0,
-          unrealizedPnl: 0,
-          returnOnEquity: 0,
-          positionPct: 0,
-          accountValue: accountValue,
-          isWinning: false,
+          coin: cachedCoin,
+          change_type: 'close',
+          direction: cachedPos.direction,
+          old_size: cachedPos.size,
+          new_size: 0,
+          entry_price: cachedPos.entryPrice,
+          value_usd: 0,
+          unrealized_pnl: 0,
+          return_on_equity: 0,
+          position_pct: 0,
+          account_value: accountValue,
+          is_winning: false,
+          detected_at: new Date().toISOString(),
         });
 
-        logger.info('📊 ' + wallet.slice(0, 10) + '... CLOSE ' + cached.direction.toUpperCase() + ' ' + coin);
+        logger.info('📊 ' + wallet.slice(0, 10) + '... CLOSE ' + cachedPos.direction.toUpperCase() + ' ' + cachedCoin);
       }
-      walletCache.delete(coin);
+      walletCache.delete(cachedCoin);
     }
-  });
+  }
 
   positionCache.set(wallet, walletCache);
 
@@ -215,41 +238,8 @@ async function processWalletPositions(wallet: string): Promise<void> {
   }
 }
 
-async function savePositionChanges(changes: Array<{
-  wallet: string;
-  coin: string;
-  changeType: string;
-  direction: string;
-  oldSize: number;
-  newSize: number;
-  entryPrice: number;
-  valueUsd: number;
-  unrealizedPnl: number;
-  returnOnEquity: number;
-  positionPct: number;
-  accountValue: number;
-  isWinning: boolean;
-}>): Promise<void> {
-  var records = changes.map(function(c) {
-    return {
-      wallet: c.wallet,
-      coin: c.coin,
-      change_type: c.changeType,
-      direction: c.direction,
-      old_size: c.oldSize,
-      new_size: c.newSize,
-      entry_price: c.entryPrice,
-      value_usd: c.valueUsd,
-      unrealized_pnl: c.unrealizedPnl,
-      return_on_equity: c.returnOnEquity,
-      position_pct: c.positionPct,
-      account_value: c.accountValue,
-      is_winning: c.isWinning,
-      detected_at: new Date().toISOString(),
-    };
-  });
-
-  var result = await db.client.from('position_changes').insert(records);
+async function savePositionChanges(changes: PositionChangeRecord[]): Promise<void> {
+  var result = await db.client.from('position_changes').insert(changes);
 
   if (result.error) {
     logger.error('Failed to save position changes', result.error);
@@ -272,14 +262,21 @@ async function pollAllWallets(): Promise<void> {
     return;
   }
 
-  var wallets = result.data.map(function(w) { return w.address; });
+  var wallets: string[] = [];
+  for (var i = 0; i < result.data.length; i++) {
+    wallets.push(result.data[i].address);
+  }
 
   // Process in batches
-  for (var i = 0; i < wallets.length; i += BATCH_SIZE) {
-    var batch = wallets.slice(i, i + BATCH_SIZE);
-    await Promise.all(batch.map(processWalletPositions));
+  for (var j = 0; j < wallets.length; j += BATCH_SIZE) {
+    var batch = wallets.slice(j, j + BATCH_SIZE);
+    var promises: Promise<void>[] = [];
+    for (var k = 0; k < batch.length; k++) {
+      promises.push(processWalletPositions(batch[k]));
+    }
+    await Promise.all(promises);
     
-    if (i + BATCH_SIZE < wallets.length) {
+    if (j + BATCH_SIZE < wallets.length) {
       await new Promise(function(resolve) { setTimeout(resolve, BATCH_DELAY); });
     }
   }

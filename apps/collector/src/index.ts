@@ -1,121 +1,105 @@
-// Collector entry point - Convergence Detection System
+// Collector entry point - Convergence Tracker
 
 import { config } from 'dotenv';
 config();
 
-import CONFIG, { validateConfig } from './config.js';
 import { createLogger } from './utils/logger.js';
-import { metrics } from './utils/metrics.js';
-import { startLeaderboardFetcher, stopLeaderboardFetcher, getLeaderboardWallets } from './collectors/leaderboard-fetcher.js';
-import { startPositionTracker, stopPositionTracker } from './collectors/position-tracker.js';
+import { startLeaderboardFetcher } from './collectors/leaderboard-fetcher.js';
+import { startPositionTracker } from './collectors/position-tracker.js';
 import { getActiveSignals, expireOldSignals } from './processors/convergence-detector.js';
-import { scheduler } from './jobs/scheduler.js';
+import db from './db/client.js';
 
-const logger = createLogger('main');
+var logger = createLogger('main');
 
 async function main(): Promise<void> {
-  logger.info('');
-  logger.info('═══════════════════════════════════════════════════════════════');
-  logger.info('   Hyperliquid Convergence Tracker');
-  logger.info('   Detecting when top traders align on positions');
-  logger.info('═══════════════════════════════════════════════════════════════');
-  logger.info('');
+  logger.info('Starting Hyperliquid Convergence Tracker');
 
-  // Validate configuration
-  try {
-    validateConfig();
-  } catch (error) {
-    logger.error('Configuration error', error);
+  // Validate environment
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    logger.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY');
     process.exit(1);
   }
 
+  logger.info('Configuration validated');
+
   try {
-    // Step 1: Fetch leaderboard wallets
-    logger.info('Step 1: Fetching top traders from leaderboard...');
-    await startLeaderboardFetcher();
-    
-    const wallets = await getLeaderboardWallets(100);
-    logger.info(`Tracking ${wallets.length} top traders`);
-    
-    // Step 2: Start position tracking
-    logger.info('Step 2: Starting position tracker...');
-    await startPositionTracker();
-    
-    // Step 3: Register cleanup job (pass function directly)
-    scheduler.register('expire-signals', expireOldSignals, 15 * 60 * 1000);
-    
-    scheduler.start();
-    logger.info('Step 3: Scheduler started');
+    // Start leaderboard fetcher (syncs top traders hourly)
+    startLeaderboardFetcher();
+    logger.info('Leaderboard fetcher started');
+
+    // Start position tracker (polls positions every 60s)
+    startPositionTracker();
+    logger.info('Position tracker started');
+
+    // Expire old signals periodically
+    setInterval(function() {
+      expireOldSignals();
+    }, 5 * 60 * 1000); // Every 5 minutes
 
     // Log status periodically
-    setInterval(async () => {
-      const signals = await getActiveSignals();
-      const walletCount = (await getLeaderboardWallets(200)).length;
-      
-      logger.info('');
-      logger.info('── Status Update ──────────────────────────────');
-      logger.info(`Tracking: ${walletCount} wallets`);
-      logger.info(`Active signals: ${signals.length}`);
-      
-      if (signals.length > 0) {
-        logger.info('Current signals:');
-        for (const sig of signals.slice(0, 5)) {
-          logger.info(`  • ${sig.coin} ${sig.direction.toUpperCase()} - ${sig.wallet_count} wallets (${sig.confidence}% confidence)`);
+    setInterval(async function() {
+      try {
+        // Get wallet count
+        var walletResult = await db.client
+          .from('leaderboard_wallets')
+          .select('address', { count: 'exact' });
+        
+        var walletCount = walletResult.count || 0;
+
+        // Get active signals
+        var signals = await getActiveSignals();
+        var signalCount = signals.length;
+
+        logger.info('');
+        logger.info('── Status Update ──────────────────────────────');
+        logger.info('Tracking: ' + walletCount + ' wallets');
+        logger.info('Active signals: ' + signalCount);
+        
+        if (signals.length > 0) {
+          logger.info('Current signals:');
+          var topSignals = signals.slice(0, 5);
+          for (var i = 0; i < topSignals.length; i++) {
+            var s = topSignals[i];
+            logger.info('  • ' + s.coin + ' ' + s.direction.toUpperCase() + ' - ' + s.wallet_count + ' wallets (' + s.confidence + '% confidence)');
+          }
         }
+        
+        logger.info('───────────────────────────────────────────────');
+        logger.info('');
+      } catch (err) {
+        logger.error('Status update failed', err);
       }
-      logger.info('───────────────────────────────────────────────');
-      logger.info('');
-    }, 5 * 60 * 1000);
+    }, 5 * 60 * 1000); // Every 5 minutes
 
-    // Log metrics periodically
-    setInterval(() => {
-      metrics.logSummary();
-    }, 10 * 60 * 1000);
-
-    logger.info('');
-    logger.info('✅ Convergence Tracker fully operational');
-    logger.info('   Watching for signals when 3+ traders enter same position...');
-    logger.info('');
+    logger.info('Convergence Tracker fully operational');
+    logger.info('Tracking top traders and detecting convergence...');
 
   } catch (error) {
     logger.error('Failed to start collector', error);
-    await shutdown();
     process.exit(1);
   }
 
   // Handle graceful shutdown
-  const handleShutdown = async (signal: string) => {
-    logger.info(`Received ${signal}, shutting down gracefully...`);
-    await shutdown();
+  process.on('SIGINT', function() {
+    logger.info('Received SIGINT, shutting down...');
     process.exit(0);
-  };
+  });
 
-  process.on('SIGINT', () => handleShutdown('SIGINT'));
-  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+  process.on('SIGTERM', function() {
+    logger.info('Received SIGTERM, shutting down...');
+    process.exit(0);
+  });
 
-  process.on('uncaughtException', (error) => {
+  process.on('uncaughtException', function(error) {
     logger.error('Uncaught exception', error);
-    metrics.increment('uncaught_exceptions');
   });
 
-  process.on('unhandledRejection', (reason) => {
+  process.on('unhandledRejection', function(reason) {
     logger.error('Unhandled rejection', reason);
-    metrics.increment('unhandled_rejections');
   });
 }
 
-async function shutdown(): Promise<void> {
-  logger.info('Shutting down...');
-
-  scheduler.stop();
-  await stopPositionTracker();
-  await stopLeaderboardFetcher();
-
-  metrics.logSummary();
-  logger.info('Shutdown complete');
-}
-
-main().catch((error) => {
+main().catch(function(error) {
   console.error('Fatal error:', error);
   process.exit(1);
 });

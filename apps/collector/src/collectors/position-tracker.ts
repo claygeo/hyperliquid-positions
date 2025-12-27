@@ -1,362 +1,308 @@
-// Position Tracker - Poll positions and detect changes for convergence
+// Position tracker - polls positions for leaderboard wallets with PnL tracking
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
-import { getLeaderboardWallets } from './leaderboard-fetcher.js';
-import { checkConvergence } from '../processors/convergence-detector.js';
+import { detectConvergence } from '../processors/convergence-detector.js';
 
-const logger = createLogger('collector:position-tracker');
+var logger = createLogger('collector:position-tracker');
 
-const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
-const POLL_INTERVAL = 60000; // Poll every 60 seconds
-const BATCH_SIZE = 10; // Process wallets in batches to avoid rate limits
-const BATCH_DELAY = 500; // Delay between batches
+var HYPERLIQUID_API = 'https://api.hyperliquid.xyz/info';
+var POLL_INTERVAL = 60000; // 60 seconds
+var BATCH_SIZE = 10;
+var BATCH_DELAY = 500;
 
-let pollInterval: NodeJS.Timeout | null = null;
-let isRunning = false;
+// Major assets we care about
+var MAJOR_ASSETS = ['BTC', 'ETH', 'SOL', 'HYPE', 'XRP', 'DOGE', 'SUI', 'AVAX', 'LINK', 'BNB'];
 
-// In-memory cache of last known positions
-const positionCache = new Map<string, Map<string, PositionData>>();
+// In-memory cache of positions
+var positionCache = new Map<string, Map<string, CachedPosition>>();
 
-interface PositionData {
+interface CachedPosition {
   coin: string;
   size: number;
-  direction: 'long' | 'short';
+  direction: string;
   entryPrice: number;
   leverage: number;
   valueUsd: number;
+  unrealizedPnl: number;
+  returnOnEquity: number;
+  accountValue: number;
+  lastSeen: Date;
 }
 
-interface HyperliquidPosition {
-  position: {
-    coin: string;
-    szi: string;
-    entryPx: string;
-    leverage: {
-      type: string;
-      value: number;
-    };
-    unrealizedPnl: string;
-    marginUsed: string;
-    liquidationPx: string | null;
-  };
+interface PositionFromAPI {
+  coin: string;
+  szi: string;
+  entryPx: string;
+  leverage: { value: string };
+  positionValue: string;
+  unrealizedPnl: string;
+  returnOnEquity: string;
 }
 
 interface ClearinghouseResponse {
-  assetPositions?: HyperliquidPosition[];
-  marginSummary?: {
+  assetPositions: Array<{
+    position: PositionFromAPI;
+  }>;
+  marginSummary: {
     accountValue: string;
   };
 }
 
-/**
- * Fetch positions for a wallet from Hyperliquid API
- */
-async function fetchWalletPositions(address: string): Promise<PositionData[]> {
+async function fetchPositions(wallet: string): Promise<{ positions: PositionFromAPI[]; accountValue: number } | null> {
   try {
-    const response = await fetch(HYPERLIQUID_INFO_URL, {
+    var response = await fetch(HYPERLIQUID_API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'clearinghouseState',
-        user: address,
-      }),
+      body: JSON.stringify({ type: 'clearinghouseState', user: wallet }),
     });
 
-    if (!response.ok) return [];
+    if (!response.ok) return null;
 
-    const data = await response.json() as ClearinghouseResponse;
-    const positions = data?.assetPositions || [];
+    var data = await response.json() as ClearinghouseResponse;
+    var accountValue = parseFloat(data.marginSummary?.accountValue || '0');
+    
+    var positions = data.assetPositions
+      ?.filter(function(p) { return p.position && parseFloat(p.position.szi) !== 0; })
+      .map(function(p) { return p.position; }) || [];
 
-    return positions
-      .filter(p => parseFloat(p.position.szi) !== 0)
-      .map(p => {
-        const size = parseFloat(p.position.szi);
-        const entryPrice = parseFloat(p.position.entryPx);
-        return {
-          coin: p.position.coin,
-          size: Math.abs(size),
-          direction: (size > 0 ? 'long' : 'short') as 'long' | 'short',
-          entryPrice: entryPrice,
-          leverage: p.position.leverage?.value || 1,
-          valueUsd: Math.abs(size) * entryPrice,
-        };
-      });
+    return { positions: positions, accountValue: accountValue };
   } catch (error) {
-    logger.error(`Failed to fetch positions for ${address}`, error);
-    return [];
+    logger.error('Failed to fetch positions for ' + wallet, error);
+    return null;
   }
 }
 
-/**
- * Detect changes between old and new positions
- */
-function detectChanges(
-  wallet: string,
-  oldPositions: Map<string, PositionData>,
-  newPositions: PositionData[]
-): Array<{
-  wallet: string;
-  coin: string;
-  changeType: 'open' | 'close' | 'increase' | 'decrease' | 'flip';
-  direction: 'long' | 'short';
-  oldSize: number;
-  newSize: number;
-  sizeChangePct: number;
-  entryPrice: number;
-  valueUsd: number;
-}> {
-  const changes: Array<{
+async function processWalletPositions(wallet: string): Promise<void> {
+  var result = await fetchPositions(wallet);
+  if (!result) return;
+
+  var positions = result.positions;
+  var accountValue = result.accountValue;
+  var walletCache = positionCache.get(wallet) || new Map<string, CachedPosition>();
+  var changes: Array<{
     wallet: string;
     coin: string;
-    changeType: 'open' | 'close' | 'increase' | 'decrease' | 'flip';
-    direction: 'long' | 'short';
+    changeType: string;
+    direction: string;
     oldSize: number;
     newSize: number;
-    sizeChangePct: number;
     entryPrice: number;
     valueUsd: number;
+    unrealizedPnl: number;
+    returnOnEquity: number;
+    positionPct: number;
+    accountValue: number;
+    isWinning: boolean;
   }> = [];
 
-  const newPositionMap = new Map(newPositions.map(p => [p.coin, p]));
+  // Check each position
+  for (var i = 0; i < positions.length; i++) {
+    var pos = positions[i];
+    var coin = pos.coin;
+    var size = parseFloat(pos.szi);
+    var direction = size > 0 ? 'long' : 'short';
+    var absSize = Math.abs(size);
+    var entryPrice = parseFloat(pos.entryPx || '0');
+    var leverage = parseFloat(pos.leverage?.value || '1');
+    var valueUsd = parseFloat(pos.positionValue || '0');
+    var unrealizedPnl = parseFloat(pos.unrealizedPnl || '0');
+    var returnOnEquity = parseFloat(pos.returnOnEquity || '0');
+    var positionPct = accountValue > 0 ? (valueUsd / accountValue) * 100 : 0;
+    var isWinning = unrealizedPnl > 0;
 
-  // Check for new and changed positions
-  for (const newPos of newPositions) {
-    const oldPos = oldPositions.get(newPos.coin);
+    var cached = walletCache.get(coin);
 
-    if (!oldPos) {
-      // New position opened
-      changes.push({
-        wallet,
-        coin: newPos.coin,
-        changeType: 'open',
-        direction: newPos.direction,
-        oldSize: 0,
-        newSize: newPos.size,
-        sizeChangePct: 100,
-        entryPrice: newPos.entryPrice,
-        valueUsd: newPos.valueUsd,
-      });
-    } else if (oldPos.direction !== newPos.direction) {
-      // Position flipped (was long, now short or vice versa)
-      changes.push({
-        wallet,
-        coin: newPos.coin,
-        changeType: 'flip',
-        direction: newPos.direction,
-        oldSize: oldPos.size,
-        newSize: newPos.size,
-        sizeChangePct: 100,
-        entryPrice: newPos.entryPrice,
-        valueUsd: newPos.valueUsd,
-      });
+    // Determine change type
+    var changeType: string | null = null;
+    var oldSize = 0;
+
+    if (!cached) {
+      // New position
+      changeType = 'open';
     } else {
-      // Same direction - check for size change
-      const sizeDiff = newPos.size - oldPos.size;
-      const sizeChangePct = oldPos.size > 0 ? (sizeDiff / oldPos.size) * 100 : 100;
+      oldSize = cached.size;
+      var oldDirection = cached.direction;
 
-      // Only log significant changes (>25% change or >$10k)
-      if (Math.abs(sizeChangePct) >= 25 || Math.abs(sizeDiff * newPos.entryPrice) >= 10000) {
-        changes.push({
-          wallet,
-          coin: newPos.coin,
-          changeType: sizeDiff > 0 ? 'increase' : 'decrease',
-          direction: newPos.direction,
-          oldSize: oldPos.size,
-          newSize: newPos.size,
-          sizeChangePct: sizeChangePct,
-          entryPrice: newPos.entryPrice,
-          valueUsd: newPos.valueUsd,
-        });
+      if (oldDirection !== direction) {
+        // Flipped direction
+        changeType = 'flip';
+      } else {
+        var sizeChange = Math.abs(absSize - oldSize) / oldSize;
+        if (sizeChange > 0.25) {
+          // Significant size change
+          changeType = absSize > oldSize ? 'increase' : 'decrease';
+        }
       }
     }
+
+    // Only track changes for major assets
+    var isMajorAsset = MAJOR_ASSETS.indexOf(coin) !== -1;
+
+    if (changeType && isMajorAsset && valueUsd > 10000) {
+      changes.push({
+        wallet: wallet,
+        coin: coin,
+        changeType: changeType,
+        direction: direction,
+        oldSize: oldSize,
+        newSize: absSize,
+        entryPrice: entryPrice,
+        valueUsd: valueUsd,
+        unrealizedPnl: unrealizedPnl,
+        returnOnEquity: returnOnEquity,
+        positionPct: positionPct,
+        accountValue: accountValue,
+        isWinning: isWinning,
+      });
+
+      logger.info(
+        '📊 ' + wallet.slice(0, 10) + '... ' + changeType.toUpperCase() + ' ' + direction.toUpperCase() + ' ' + coin +
+        ' - $' + Math.round(valueUsd) +
+        ' | PnL: ' + (unrealizedPnl >= 0 ? '+' : '') + '$' + Math.round(unrealizedPnl) +
+        ' (' + (returnOnEquity * 100).toFixed(1) + '%)'
+      );
+    }
+
+    // Update cache
+    walletCache.set(coin, {
+      coin: coin,
+      size: absSize,
+      direction: direction,
+      entryPrice: entryPrice,
+      leverage: leverage,
+      valueUsd: valueUsd,
+      unrealizedPnl: unrealizedPnl,
+      returnOnEquity: returnOnEquity,
+      accountValue: accountValue,
+      lastSeen: new Date(),
+    });
   }
 
   // Check for closed positions
-  for (const [coin, oldPos] of oldPositions) {
-    if (!newPositionMap.has(coin)) {
-      changes.push({
-        wallet,
-        coin: coin,
-        changeType: 'close',
-        direction: oldPos.direction,
-        oldSize: oldPos.size,
-        newSize: 0,
-        sizeChangePct: -100,
-        entryPrice: oldPos.entryPrice,
-        valueUsd: 0,
-      });
-    }
-  }
+  walletCache.forEach(function(cached, coin) {
+    var stillOpen = positions.some(function(p) { return p.coin === coin; });
+    if (!stillOpen) {
+      var isMajorAsset = MAJOR_ASSETS.indexOf(coin) !== -1;
+      if (isMajorAsset && cached.valueUsd > 10000) {
+        changes.push({
+          wallet: wallet,
+          coin: coin,
+          changeType: 'close',
+          direction: cached.direction,
+          oldSize: cached.size,
+          newSize: 0,
+          entryPrice: cached.entryPrice,
+          valueUsd: 0,
+          unrealizedPnl: 0,
+          returnOnEquity: 0,
+          positionPct: 0,
+          accountValue: accountValue,
+          isWinning: false,
+        });
 
-  return changes;
+        logger.info('📊 ' + wallet.slice(0, 10) + '... CLOSE ' + cached.direction.toUpperCase() + ' ' + coin);
+      }
+      walletCache.delete(coin);
+    }
+  });
+
+  positionCache.set(wallet, walletCache);
+
+  // Save changes to database
+  if (changes.length > 0) {
+    await savePositionChanges(changes);
+  }
 }
 
-/**
- * Save position change to database
- */
-async function savePositionChange(change: {
+async function savePositionChanges(changes: Array<{
   wallet: string;
   coin: string;
   changeType: string;
   direction: string;
   oldSize: number;
   newSize: number;
-  sizeChangePct: number;
   entryPrice: number;
   valueUsd: number;
-}): Promise<void> {
-  const { error } = await db.client
-    .from('position_changes')
-    .insert({
-      wallet: change.wallet,
-      coin: change.coin,
-      change_type: change.changeType,
-      direction: change.direction,
-      old_size: change.oldSize,
-      new_size: change.newSize,
-      size_change_pct: change.sizeChangePct,
-      entry_price: change.entryPrice,
-      value_usd: change.valueUsd,
+  unrealizedPnl: number;
+  returnOnEquity: number;
+  positionPct: number;
+  accountValue: number;
+  isWinning: boolean;
+}>): Promise<void> {
+  var records = changes.map(function(c) {
+    return {
+      wallet: c.wallet,
+      coin: c.coin,
+      change_type: c.changeType,
+      direction: c.direction,
+      old_size: c.oldSize,
+      new_size: c.newSize,
+      entry_price: c.entryPrice,
+      value_usd: c.valueUsd,
+      unrealized_pnl: c.unrealizedPnl,
+      return_on_equity: c.returnOnEquity,
+      position_pct: c.positionPct,
+      account_value: c.accountValue,
+      is_winning: c.isWinning,
       detected_at: new Date().toISOString(),
-    });
+    };
+  });
 
-  if (error) {
-    logger.error('Failed to save position change', error);
+  var result = await db.client.from('position_changes').insert(records);
+
+  if (result.error) {
+    logger.error('Failed to save position changes', result.error);
+  } else {
+    logger.info('Detected ' + changes.length + ' position changes');
+    // Trigger convergence detection
+    await detectConvergence();
   }
 }
 
-/**
- * Save position snapshot to database
- */
-async function savePositionSnapshot(wallet: string, position: PositionData): Promise<void> {
-  const { error } = await db.client
-    .from('position_snapshots')
-    .insert({
-      wallet: wallet,
-      coin: position.coin,
-      size: position.size,
-      direction: position.direction,
-      entry_price: position.entryPrice,
-      leverage: position.leverage,
-      value_usd: position.valueUsd,
-      snapshot_at: new Date().toISOString(),
-    });
-
-  if (error && error.code !== '23505') { // Ignore duplicate key errors
-    logger.error('Failed to save position snapshot', error);
-  }
-}
-
-/**
- * Process a single wallet
- */
-async function processWallet(wallet: string): Promise<number> {
-  const newPositions = await fetchWalletPositions(wallet);
-  
-  // Get cached positions
-  const oldPositions = positionCache.get(wallet) || new Map<string, PositionData>();
-  
-  // Detect changes
-  const changes = detectChanges(wallet, oldPositions, newPositions);
-  
-  // Save changes and log significant ones
-  for (const change of changes) {
-    await savePositionChange(change);
-    
-    // Log significant changes
-    if (change.changeType === 'open' || change.changeType === 'flip') {
-      logger.info(`📊 ${wallet.slice(0, 10)}... ${change.changeType.toUpperCase()} ${change.direction.toUpperCase()} ${change.coin} - $${change.valueUsd.toFixed(0)}`);
-    }
-  }
-  
-  // Update cache
-  const newCache = new Map<string, PositionData>();
-  for (const pos of newPositions) {
-    newCache.set(pos.coin, pos);
-    await savePositionSnapshot(wallet, pos);
-  }
-  positionCache.set(wallet, newCache);
-  
-  return changes.length;
-}
-
-/**
- * Poll all tracked wallets
- */
 async function pollAllWallets(): Promise<void> {
-  const wallets = await getLeaderboardWallets(100);
-  
-  if (wallets.length === 0) {
-    logger.debug('No wallets to poll');
+  // Get wallets from leaderboard
+  var result = await db.client
+    .from('leaderboard_wallets')
+    .select('address')
+    .limit(100);
+
+  if (result.error || !result.data) {
+    logger.error('Failed to get leaderboard wallets', result.error);
     return;
   }
 
-  logger.debug(`Polling ${wallets.length} wallets...`);
-  
-  let totalChanges = 0;
-  
+  var wallets = result.data.map(function(w) { return w.address; });
+
   // Process in batches
-  for (let i = 0; i < wallets.length; i += BATCH_SIZE) {
-    const batch = wallets.slice(i, i + BATCH_SIZE);
+  for (var i = 0; i < wallets.length; i += BATCH_SIZE) {
+    var batch = wallets.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(processWalletPositions));
     
-    const results = await Promise.all(
-      batch.map(wallet => processWallet(wallet).catch(() => 0))
-    );
-    
-    totalChanges += results.reduce((a, b) => a + b, 0);
-    
-    // Delay between batches
     if (i + BATCH_SIZE < wallets.length) {
-      await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+      await new Promise(function(resolve) { setTimeout(resolve, BATCH_DELAY); });
     }
-  }
-  
-  if (totalChanges > 0) {
-    logger.info(`Detected ${totalChanges} position changes`);
-    
-    // Check for convergence after detecting changes
-    await checkConvergence();
   }
 }
 
-/**
- * Start position tracking
- */
-export async function startPositionTracker(): Promise<void> {
-  isRunning = true;
+var pollInterval: NodeJS.Timeout | null = null;
+
+export function startPositionTracker(): void {
+  logger.info('Position tracker started (tracking: ' + MAJOR_ASSETS.join(', ') + ')');
   
   // Initial poll
-  await pollAllWallets();
+  pollAllWallets();
   
-  // Start polling interval
-  pollInterval = setInterval(() => {
-    if (isRunning) {
-      pollAllWallets().catch(err => {
-        logger.error('Position poll failed', err);
-      });
-    }
-  }, POLL_INTERVAL);
-  
-  logger.info('Position tracker started');
+  // Start interval
+  pollInterval = setInterval(pollAllWallets, POLL_INTERVAL);
 }
 
-/**
- * Stop position tracking
- */
-export async function stopPositionTracker(): Promise<void> {
-  isRunning = false;
-  
+export function stopPositionTracker(): void {
   if (pollInterval) {
     clearInterval(pollInterval);
     pollInterval = null;
   }
-  
   logger.info('Position tracker stopped');
 }
 
-export default {
-  startPositionTracker,
-  stopPositionTracker,
-  pollAllWallets,
-};
+export default { startPositionTracker, stopPositionTracker };

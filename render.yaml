@@ -1,0 +1,31 @@
+# Render Blueprint
+# https://render.com/docs/blueprint-spec
+
+services:
+  # Collector Background Worker
+  - type: worker
+    name: hyperliquid-collector
+    runtime: node
+    region: oregon
+    plan: starter
+    buildCommand: npm install && npm run build --workspace=packages/shared && npm run build --workspace=packages/hyperliquid-sdk && npm run build --workspace=apps/collector
+    startCommand: npm run start --workspace=apps/collector
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: HYPERLIQUID_API_URL
+        value: https://api.hyperliquid.xyz
+      - key: HYPERLIQUID_WS_URL
+        value: wss://api.hyperliquid.xyz/ws
+      - key: LOG_LEVEL
+        value: info
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false

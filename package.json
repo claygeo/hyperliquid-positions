@@ -1,0 +1,29 @@
+{
+  "name": "hyperliquid-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean",
+    "collector:dev": "npm run dev --workspace=apps/collector",
+    "collector:build": "npm run build --workspace=apps/collector",
+    "web:dev": "npm run dev --workspace=apps/web",
+    "web:build": "npm run build --workspace=apps/web",
+    "db:generate-types": "./scripts/generate-types.sh",
+    "db:migrate": "supabase db push",
+    "db:reset": "supabase db reset"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

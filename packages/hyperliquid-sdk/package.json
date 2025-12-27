@@ -1,0 +1,21 @@
+{
+  "name": "@hyperliquid-tracker/sdk",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@hyperliquid-tracker/shared": "*",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.10",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  }
+}

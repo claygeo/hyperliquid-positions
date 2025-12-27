@@ -13,6 +13,14 @@ import { scheduler } from './jobs/scheduler.js';
 
 const logger = createLogger('main');
 
+// Create job wrapper for scheduler
+const expireSignalsJob = {
+  name: 'expire-signals',
+  run: async () => {
+    await expireOldSignals();
+  },
+};
+
 async function main(): Promise<void> {
   logger.info('');
   logger.info('═══════════════════════════════════════════════════════════════');
@@ -42,10 +50,7 @@ async function main(): Promise<void> {
     await startPositionTracker();
     
     // Step 3: Register cleanup job
-    scheduler.register('expire-signals', {
-      name: 'expire-signals',
-      run: expireOldSignals,
-    }, 15 * 60 * 1000); // Every 15 minutes
+    scheduler.register('expire-signals', expireSignalsJob, 15 * 60 * 1000); // Every 15 minutes
     
     scheduler.start();
     logger.info('Step 3: Scheduler started');

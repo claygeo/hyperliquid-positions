@@ -9,8 +9,7 @@ export {
 
 export { 
   startPositionTracker, 
-  stopPositionTracker,
-  pollAllWallets 
+  stopPositionTracker
 } from './position-tracker.js';
 
 // Legacy exports (can be removed later)

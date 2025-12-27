@@ -24,25 +24,29 @@ interface ConvergenceSignal {
 export default function SignalsPage() {
   const [signals, setSignals] = useState<ConvergenceSignal[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [expandedSignal, setExpandedSignal] = useState<number | null>(null);
+  const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
+  const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+
+  async function fetchSignals() {
+    const supabase = createClient();
+    const { data, error } = await supabase
+      .from('convergence_signals')
+      .select('*')
+      .eq('is_active', true)
+      .gt('expires_at', new Date().toISOString())
+      .order('confidence', { ascending: false })
+      .order('wallet_count', { ascending: false })
+      .limit(50);
+
+    if (!error && data) {
+      setSignals(data);
+    }
+    setIsLoading(false);
+    setLastRefresh(new Date());
+  }
 
   useEffect(function() {
-    async function fetchSignals() {
-      const supabase = createClient();
-      const { data, error } = await supabase
-        .from('convergence_signals')
-        .select('*')
-        .eq('is_active', true)
-        .gt('expires_at', new Date().toISOString())
-        .order('confidence', { ascending: false })
-        .order('wallet_count', { ascending: false })
-        .limit(50);
-
-      if (!error && data) {
-        setSignals(data);
-      }
-      setIsLoading(false);
-    }
-
     fetchSignals();
     
     const interval = setInterval(fetchSignals, 30 * 1000);
@@ -50,6 +54,11 @@ export default function SignalsPage() {
       clearInterval(interval);
     };
   }, []);
+
+  function handleRefresh() {
+    setIsLoading(true);
+    fetchSignals();
+  }
 
   function getTimeAgo(dateString: string): string {
     const date = new Date(dateString);
@@ -85,17 +94,35 @@ export default function SignalsPage() {
     return 'w-32 flex flex-col items-center justify-center p-4 bg-red-500/10';
   }
 
-  function formatWalletList(walletList: string[] | null): string {
-    if (!walletList || walletList.length === 0) return '';
-    const shortened = walletList.slice(0, 5).map(shortenAddress);
-    let result = shortened.join(', ');
-    if (walletList.length > 5) {
-      result = result + ' +' + (walletList.length - 5) + ' more';
-    }
-    return result;
+  function getTraderUrl(wallet: string): string {
+    return 'https://legacy.hyperdash.com/trader/' + wallet;
   }
 
-  if (isLoading) {
+  function copyToClipboard(address: string): void {
+    navigator.clipboard.writeText(address);
+    setCopiedAddress(address);
+    setTimeout(function() {
+      setCopiedAddress(null);
+    }, 2000);
+  }
+
+  function toggleExpanded(signalId: number): void {
+    if (expandedSignal === signalId) {
+      setExpandedSignal(null);
+    } else {
+      setExpandedSignal(signalId);
+    }
+  }
+
+  function formatLastRefresh(): string {
+    return lastRefresh.toLocaleTimeString('en-US', { 
+      hour: '2-digit', 
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  }
+
+  if (isLoading && signals.length === 0) {
     return (
       <div className="flex justify-center py-12">
         <LoadingSpinner size="lg" />
@@ -105,16 +132,36 @@ export default function SignalsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold">Convergence Signals</h1>
-        <p className="text-muted-foreground mt-1">
-          When 3+ top traders enter the same position
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold">Convergence Signals</h1>
+          <p className="text-muted-foreground mt-1">
+            When 3+ top traders enter the same position
+          </p>
+        </div>
+        <div className="flex flex-col items-end gap-1">
+          <button
+            onClick={handleRefresh}
+            disabled={isLoading}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 disabled:cursor-not-allowed text-white rounded-md text-sm flex items-center gap-2"
+          >
+            {isLoading ? (
+              <span>Refreshing...</span>
+            ) : (
+              <span>Refresh</span>
+            )}
+          </button>
+          <span className="text-xs text-muted-foreground">
+            Last: {formatLastRefresh()}
+          </span>
+        </div>
       </div>
 
       {signals.length > 0 ? (
         <div className="grid gap-4">
           {signals.map(function(signal) {
+            const isExpanded = expandedSignal === signal.id;
+            
             return (
               <Card key={signal.id} className="overflow-hidden">
                 <CardContent className="p-0">
@@ -153,10 +200,67 @@ export default function SignalsPage() {
                       </div>
 
                       <div className="mt-3 pt-3 border-t">
-                        <span className="text-xs text-muted-foreground">Traders: </span>
-                        <span className="text-xs font-mono">
-                          {formatWalletList(signal.wallets)}
-                        </span>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs text-muted-foreground">
+                            Traders ({signal.wallets ? signal.wallets.length : 0}):
+                          </span>
+                          <button
+                            onClick={function() { toggleExpanded(signal.id); }}
+                            className="text-xs text-blue-500 hover:text-blue-400"
+                          >
+                            {isExpanded ? 'Show less' : 'Show all'}
+                          </button>
+                        </div>
+                        
+                        {isExpanded ? (
+                          <div className="space-y-1 max-h-48 overflow-y-auto">
+                            {signal.wallets && signal.wallets.map(function(wallet) {
+                              return (
+                                <div key={wallet} className="flex items-center gap-2 text-xs">
+                                  
+                                    href={getTraderUrl(wallet)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="font-mono text-blue-500 hover:text-blue-400 hover:underline"
+                                  >
+                                    {wallet}
+                                  </a>
+                                  <button
+                                    onClick={function() { copyToClipboard(wallet); }}
+                                    className="text-muted-foreground hover:text-foreground px-1"
+                                    title="Copy address"
+                                  >
+                                    {copiedAddress === wallet ? '✓' : '📋'}
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap gap-1">
+                            {signal.wallets && signal.wallets.slice(0, 5).map(function(wallet) {
+                              return (
+                                
+                                  key={wallet}
+                                  href={getTraderUrl(wallet)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-xs font-mono text-blue-500 hover:text-blue-400 hover:underline"
+                                >
+                                  {shortenAddress(wallet)}
+                                </a>
+                              );
+                            })}
+                            {signal.wallets && signal.wallets.length > 5 && (
+                              <button
+                                onClick={function() { toggleExpanded(signal.id); }}
+                                className="text-xs text-muted-foreground hover:text-foreground"
+                              >
+                                +{signal.wallets.length - 5} more
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -182,7 +286,7 @@ export default function SignalsPage() {
           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
           <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
         </span>
-        <span>Live - updates every 30 seconds</span>
+        <span>Live - auto-refreshes every 30 seconds</span>
       </div>
     </div>
   );

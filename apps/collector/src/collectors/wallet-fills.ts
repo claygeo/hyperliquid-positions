@@ -7,10 +7,23 @@ const logger = createLogger('collector:wallet-fills');
 
 const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
 
+interface Fill {
+  coin: string;
+  px: string;
+  sz: string;
+  side: string;
+  time: number;
+  closedPnl: string;
+  hash: string;
+  oid: number;
+  crossed: boolean;
+  fee: string;
+}
+
 /**
  * Fetch fills for a wallet
  */
-export async function fetchWalletFills(address: string): Promise<any[]> {
+export async function fetchWalletFills(address: string): Promise<Fill[]> {
   try {
     const response = await fetch(HYPERLIQUID_INFO_URL, {
       method: 'POST',
@@ -23,8 +36,8 @@ export async function fetchWalletFills(address: string): Promise<any[]> {
 
     if (!response.ok) return [];
 
-    const data = await response.json();
-    return data || [];
+    const data = await response.json() as Fill[] | null;
+    return Array.isArray(data) ? data : [];
   } catch (error) {
     logger.error(`Failed to fetch fills for ${address}`, error);
     return [];

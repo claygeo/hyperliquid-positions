@@ -23,6 +23,17 @@ interface WalletBuffer {
   coins: Set<string>;
 }
 
+interface ExistingWallet {
+  win_count?: number;
+  loss_count?: number;
+  avg_win?: number;
+  avg_loss?: number;
+  realized_pnl?: number;
+  largest_win?: number;
+  largest_loss?: number;
+  first_seen_at?: string;
+}
+
 /**
  * Process a trade from the stream
  */
@@ -93,7 +104,6 @@ function calculateScore(metrics: {
   let score = 0;
 
   // Win Rate Score (0-25 points)
-  // 50% = 0, 60% = 12.5, 70% = 25
   if (metrics.tradeCount >= 5) {
     const winRateScore = Math.max(0, (metrics.winRate - 50) * 1.25);
     breakdown.winRate = Math.min(25, Math.round(winRateScore));
@@ -101,7 +111,6 @@ function calculateScore(metrics: {
   }
 
   // Profit Factor Score (0-25 points)
-  // 1.0 = 0, 1.5 = 12.5, 2.0+ = 25
   if (metrics.profitFactor > 0) {
     const pfScore = Math.max(0, (metrics.profitFactor - 1) * 25);
     breakdown.profitFactor = Math.min(25, Math.round(pfScore));
@@ -109,20 +118,17 @@ function calculateScore(metrics: {
   }
 
   // Total PnL Score (0-20 points)
-  // Log scale: $100 = 5, $1000 = 10, $10000 = 15, $100000 = 20
   if (metrics.totalPnl > 0) {
     const pnlScore = Math.log10(metrics.totalPnl + 1) * 5;
     breakdown.totalPnl = Math.min(20, Math.round(pnlScore));
     score += breakdown.totalPnl;
   } else if (metrics.totalPnl < 0) {
-    // Penalty for negative PnL
     const penalty = Math.min(20, Math.log10(Math.abs(metrics.totalPnl) + 1) * 3);
     breakdown.totalPnl = -Math.round(penalty);
     score += breakdown.totalPnl;
   }
 
   // Consistency Score (0-15 points)
-  // Based on avg win vs avg loss ratio
   if (metrics.avgLoss > 0) {
     const riskReward = metrics.avgWin / metrics.avgLoss;
     const consistencyScore = Math.min(15, riskReward * 5);
@@ -131,7 +137,6 @@ function calculateScore(metrics: {
   }
 
   // Activity Score (0-10 points)
-  // More trades = more reliable signal (up to a point)
   if (metrics.tradeCount >= 3) {
     const activityScore = Math.min(10, Math.log10(metrics.tradeCount) * 5);
     breakdown.activity = Math.round(activityScore);
@@ -139,7 +144,6 @@ function calculateScore(metrics: {
   }
 
   // Fresh Wallet Bonus (0-5 points)
-  // New wallet with good performance
   if (metrics.daysSinceFirstSeen <= 7 && metrics.totalPnl > 0 && metrics.winRate > 55) {
     breakdown.freshBonus = 5;
     score += 5;
@@ -165,30 +169,32 @@ export async function flushAlphaBuffer(): Promise<void> {
   for (const buffer of walletsToUpdate) {
     try {
       // First, get or create wallet
-      const { data: existing } = await db.client
+      const { data: existingData } = await db.client
         .from('wallets')
         .select('*')
         .eq('address', buffer.address)
         .single();
 
+      const existing: ExistingWallet = existingData || {};
+
       // Calculate cumulative metrics
-      const wins = (existing?.win_count || 0) + buffer.wins;
-      const losses = (existing?.loss_count || 0) + buffer.losses;
+      const wins = (existing.win_count || 0) + buffer.wins;
+      const losses = (existing.loss_count || 0) + buffer.losses;
       const totalTrades = wins + losses;
       const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
 
-      const totalWinAmount = (existing?.avg_win || 0) * (existing?.win_count || 0) + buffer.totalWinAmount;
-      const totalLossAmount = (existing?.avg_loss || 0) * (existing?.loss_count || 0) + buffer.totalLossAmount;
+      const totalWinAmount = (existing.avg_win || 0) * (existing.win_count || 0) + buffer.totalWinAmount;
+      const totalLossAmount = (existing.avg_loss || 0) * (existing.loss_count || 0) + buffer.totalLossAmount;
       
       const avgWin = wins > 0 ? totalWinAmount / wins : 0;
       const avgLoss = losses > 0 ? totalLossAmount / losses : 0;
       const profitFactor = totalLossAmount > 0 ? totalWinAmount / totalLossAmount : totalWinAmount > 0 ? 999 : 0;
 
-      const realizedPnl = (existing?.realized_pnl || 0) + buffer.totalPnl;
-      const largestWin = Math.max(existing?.largest_win || 0, buffer.largestWin);
-      const largestLoss = Math.max(existing?.largest_loss || 0, buffer.largestLoss);
+      const realizedPnl = (existing.realized_pnl || 0) + buffer.totalPnl;
+      const largestWin = Math.max(existing.largest_win || 0, buffer.largestWin);
+      const largestLoss = Math.max(existing.largest_loss || 0, buffer.largestLoss);
 
-      const firstSeenAt = existing?.first_seen_at || new Date();
+      const firstSeenAt = existing.first_seen_at || new Date().toISOString();
       const daysSinceFirstSeen = (Date.now() - new Date(firstSeenAt).getTime()) / (1000 * 60 * 60 * 24);
 
       // Calculate score
@@ -245,8 +251,8 @@ export async function getTopAlphaWallets(limit: number = 50): Promise<any[]> {
   const { data, error } = await db.client
     .from('wallets')
     .select('*')
-    .gte('total_trades', 5)  // At least 5 trades
-    .gt('score', 40)          // Minimum score
+    .gte('total_trades', 5)
+    .gt('score', 40)
     .order('score', { ascending: false })
     .order('realized_pnl', { ascending: false })
     .limit(limit);

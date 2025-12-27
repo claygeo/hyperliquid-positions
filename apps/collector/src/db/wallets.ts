@@ -1,10 +1,12 @@
 // Database operations for wallets
+// Note: Using custom fields not in shared types for alpha tracking
 
 import db from './client.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('db:wallets');
 
+// Custom wallet record for alpha tracking (extends DB schema)
 export interface WalletRecord {
   address: string;
   label?: string;
@@ -45,7 +47,7 @@ export async function getTopWallets(limit: number = 50, minTrades: number = 5): 
     return [];
   }
 
-  return data || [];
+  return (data || []) as WalletRecord[];
 }
 
 /**
@@ -63,7 +65,7 @@ export async function getWalletsForScoring(minTrades: number = 0): Promise<Walle
     return [];
   }
 
-  return data || [];
+  return (data || []) as WalletRecord[];
 }
 
 /**
@@ -83,7 +85,7 @@ export async function getTrackedWallets(): Promise<WalletRecord[]> {
     return [];
   }
 
-  return data || [];
+  return (data || []) as WalletRecord[];
 }
 
 /**
@@ -101,7 +103,7 @@ export async function getWalletAddresses(): Promise<string[]> {
     return [];
   }
 
-  return data?.map(w => w.address) || [];
+  return data?.map((w: { address: string }) => w.address) || [];
 }
 
 /**
@@ -120,7 +122,7 @@ export async function getWalletByAddress(address: string): Promise<WalletRecord 
     return null;
   }
 
-  return data;
+  return data as WalletRecord;
 }
 
 /**
@@ -161,7 +163,7 @@ export async function getFreshAlphaWallets(daysOld: number = 7, minScore: number
     return [];
   }
 
-  return data || [];
+  return (data || []) as WalletRecord[];
 }
 
 export default {

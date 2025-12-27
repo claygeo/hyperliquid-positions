@@ -19,13 +19,14 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
 
     const { data, error } = await db.client
       .from('trades')
-      .upsert(validTrades as any, { 
+      .upsert(validTrades, { 
         onConflict: 'wallet,tx_hash,oid',
         ignoreDuplicates: true 
       })
       .select('id');
 
     if (error) {
+      // Silently handle duplicates and FK violations
       if (error.code === '23505' || error.code === '23503') {
         return 0;
       }

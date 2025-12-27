@@ -26,23 +26,27 @@ export function processTrade(trade: {
   oid: number;
   closedPnl?: string;
   dir?: string;
+  crossed?: boolean;
+  fee?: string;
 }): void {
   const closedPnl = parseFloat(trade.closedPnl || '0');
   const price = parseFloat(trade.px);
   const size = parseFloat(trade.sz);
+  const fee = parseFloat(trade.fee || '0');
   const timestamp = new Date(trade.time);
 
-  // Create trade record - use 'B' or 'A' format for DB
+  // Create trade record matching DBTradeInsert exactly
   const tradeRecord: DBTradeInsert = {
     wallet: trade.user.toLowerCase(),
     coin: trade.coin,
     side: trade.side === 'B' ? 'B' : 'A',
     price: price,
     size: size,
-    notional: price * size,
     tx_hash: trade.hash,
     oid: trade.oid,
     timestamp: timestamp.toISOString(),
+    is_taker: trade.crossed ?? true,
+    fee: fee,
     closed_pnl: closedPnl,
   };
 

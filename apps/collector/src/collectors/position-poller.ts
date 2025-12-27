@@ -11,6 +11,20 @@ const POLL_INTERVAL = 30000; // 30 seconds
 let pollInterval: NodeJS.Timeout | null = null;
 let isRunning = false;
 
+interface ClearinghouseResponse {
+  assetPositions?: Array<{
+    position: {
+      coin: string;
+      szi: string;
+      entryPx: string;
+      leverage: { type: string; value: number };
+      unrealizedPnl: string;
+      liquidationPx: string | null;
+      marginUsed: string;
+    };
+  }>;
+}
+
 /**
  * Fetch positions for a wallet
  */
@@ -27,8 +41,8 @@ async function fetchPositions(address: string): Promise<any[]> {
 
     if (!response.ok) return [];
 
-    const data = await response.json();
-    return data.assetPositions || [];
+    const data: ClearinghouseResponse = await response.json() as ClearinghouseResponse;
+    return data?.assetPositions || [];
   } catch (error) {
     logger.error(`Failed to fetch positions for ${address}`, error);
     return [];

@@ -3,30 +3,28 @@
 import { useSignals } from '@/hooks/use-signals';
 import { SignalFeed } from '@/components/signal/signal-feed';
 import { SignalFilters } from '@/components/signal/signal-filters';
-import { Skeleton } from '@/components/ui/skeleton';
+import { LoadingSpinner } from '@/components/common/loading-spinner';
 
 export default function SignalsPage() {
-  const { signals, isLoading, filters, setFilters } = useSignals();
+  const { signals, isLoading, filter, setFilter } = useSignals();
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-3xl font-bold">Signals</h1>
-        <p className="text-muted-foreground mt-1">
-          Real-time alerts when tracked wallets make moves
+        <h1 className="text-2xl font-bold">Signals</h1>
+        <p className="text-muted-foreground">
+          Real-time trading signals from high-scoring wallets
         </p>
       </div>
 
-      <SignalFilters filters={filters} onChange={setFilters} />
+      <SignalFilters filter={filter} onFilterChange={setFilter} />
 
       {isLoading ? (
-        <div className="space-y-4">
-          {[...Array(5)].map((_, i) => (
-            <Skeleton key={i} className="h-24" />
-          ))}
+        <div className="flex justify-center py-12">
+          <LoadingSpinner size="lg" />
         </div>
       ) : (
-        <SignalFeed signals={signals} />
+        <SignalFeed signals={signals.map(s => ({ ...s, is_active: true }))} />
       )}
     </div>
   );

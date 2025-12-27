@@ -6,7 +6,7 @@ import { SignalFilters } from '@/components/signal/signal-filters';
 import { LoadingSpinner } from '@/components/common/loading-spinner';
 
 export default function SignalsPage() {
-  const { signals, isLoading, filter, setFilter } = useSignals();
+  const { signals, isLoading, filters, setFilters } = useSignals();
 
   return (
     <div className="space-y-6">
@@ -17,7 +17,7 @@ export default function SignalsPage() {
         </p>
       </div>
 
-      <SignalFilters filter={filter} onFilterChange={setFilter} />
+      <SignalFilters filter={filters} onFilterChange={setFilters} />
 
       {isLoading ? (
         <div className="flex justify-center py-12">

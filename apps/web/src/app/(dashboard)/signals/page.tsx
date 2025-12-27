@@ -9,7 +9,7 @@ import { LoadingSpinner } from '@/components/common/loading-spinner';
 interface ConvergenceSignal {
   id: number;
   coin: string;
-  direction: 'long' | 'short';
+  direction: string;
   wallet_count: number;
   wallets: string[];
   avg_entry_price: number;
@@ -45,27 +45,36 @@ export default function SignalsPage() {
 
     fetchSignals();
     
-    // Refresh every 30 seconds
     const interval = setInterval(fetchSignals, 30 * 1000);
     return () => clearInterval(interval);
   }, []);
 
-  const getTimeAgo = (dateString: string) => {
+  function getTimeAgo(dateString: string): string {
     const date = new Date(dateString);
     const now = new Date();
     const diffMs = now.getTime() - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);
     
     if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffMins < 60) return diffMins + 'm ago';
     const diffHours = Math.floor(diffMins / 60);
-    if (diffHours < 24) return `${diffHours}h ago`;
-    return `${Math.floor(diffHours / 24)}d ago`;
-  };
+    if (diffHours < 24) return diffHours + 'h ago';
+    return Math.floor(diffHours / 24) + 'd ago';
+  }
 
-  const shortenAddress = (addr: string) => {
-    return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-  };
+  function shortenAddress(addr: string): string {
+    return addr.slice(0, 6) + '...' + addr.slice(-4);
+  }
+
+  function formatPrice(price: number | null): string {
+    if (!price) return 'N/A';
+    return '$' + price.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  }
+
+  function formatValue(value: number | null): string {
+    if (!value) return 'N/A';
+    return '$' + value.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  }
 
   if (isLoading) {
     return (
@@ -90,17 +99,13 @@ export default function SignalsPage() {
             <Card key={signal.id} className="overflow-hidden">
               <CardContent className="p-0">
                 <div className="flex items-stretch">
-                  {/* Left side - Coin & Direction */}
-                  <div className={`w-32 flex flex-col items-center justify-center p-4 ${
-                    signal.direction === 'long' ? 'bg-green-500/10' : 'bg-red-500/10'
-                  }`}>
+                  <div className={'w-32 flex flex-col items-center justify-center p-4 ' + (signal.direction === 'long' ? 'bg-green-500/10' : 'bg-red-500/10')}>
                     <span className="text-2xl font-bold">{signal.coin}</span>
                     <Badge variant={signal.direction === 'long' ? 'default' : 'destructive'} className="mt-1">
                       {signal.direction.toUpperCase()}
                     </Badge>
                   </div>
 
-                  {/* Right side - Details */}
                   <div className="flex-1 p-4">
                     <div className="flex items-center justify-between mb-3">
                       <div className="flex items-center gap-2">
@@ -118,24 +123,20 @@ export default function SignalsPage() {
 
                     <div className="grid grid-cols-2 gap-4 text-sm">
                       <div>
-                        <span className="text-muted-foreground">Avg Entry:</span>
-                        <span className="ml-2 font-medium">
-                          ${signal.avg_entry_price?.toLocaleString('en-US', { maximumFractionDigits: 2 }) || 'N/A'}
-                        </span>
+                        <span className="text-muted-foreground">Avg Entry: </span>
+                        <span className="font-medium">{formatPrice(signal.avg_entry_price)}</span>
                       </div>
                       <div>
-                        <span className="text-muted-foreground">Total Value:</span>
-                        <span className="ml-2 font-medium">
-                          ${signal.total_value_usd?.toLocaleString('en-US', { maximumFractionDigits: 0 }) || 'N/A'}
-                        </span>
+                        <span className="text-muted-foreground">Total Value: </span>
+                        <span className="font-medium">{formatValue(signal.total_value_usd)}</span>
                       </div>
                     </div>
 
                     <div className="mt-3 pt-3 border-t">
                       <span className="text-xs text-muted-foreground">Traders: </span>
                       <span className="text-xs font-mono">
-                        {signal.wallets?.slice(0, 5).map(shortenAddress).join(', ')}
-                        {signal.wallets?.length > 5 && ` +${signal.wallets.length - 5} more`}
+                        {signal.wallets && signal.wallets.slice(0, 5).map(shortenAddress).join(', ')}
+                        {signal.wallets && signal.wallets.length > 5 && ' +' + (signal.wallets.length - 5) + ' more'}
                       </span>
                     </div>
                   </div>
@@ -151,14 +152,11 @@ export default function SignalsPage() {
             <h3 className="text-lg font-medium mb-2">No Active Signals</h3>
             <p className="text-muted-foreground">
               Signals appear when 3+ top traders open the same position within 2 hours.
-              <br />
-              Check back soon!
             </p>
           </CardContent>
         </Card>
       )}
 
-      {/* Live indicator */}
       <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <span className="relative flex h-2 w-2">
           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>

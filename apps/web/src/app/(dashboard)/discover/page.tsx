@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { LoadingSpinner } from '@/components/common/loading-spinner';
 
@@ -37,28 +37,26 @@ export default function DiscoverPage() {
 
     fetchLeaderboard();
     
-    // Refresh every 5 minutes
     const interval = setInterval(fetchLeaderboard, 5 * 60 * 1000);
     return () => clearInterval(interval);
   }, []);
 
-  const formatPnl = (pnl: number) => {
-    const formatted = Math.abs(pnl).toLocaleString('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    });
-    return pnl >= 0 ? `+${formatted}` : `-${formatted}`;
-  };
+  function formatPnl(pnl: number): string {
+    const absValue = Math.abs(pnl);
+    const formatted = '$' + absValue.toLocaleString('en-US', { maximumFractionDigits: 0 });
+    if (pnl >= 0) {
+      return '+' + formatted;
+    }
+    return '-' + formatted;
+  }
 
-  const formatRoi = (roi: number) => {
-    return `${(roi * 100).toFixed(1)}%`;
-  };
+  function formatRoi(roi: number): string {
+    return (roi * 100).toFixed(1) + '%';
+  }
 
-  const shortenAddress = (addr: string) => {
-    return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-  };
+  function shortenAddress(addr: string): string {
+    return addr.slice(0, 6) + '...' + addr.slice(-4);
+  }
 
   if (isLoading) {
     return (
@@ -98,7 +96,7 @@ export default function DiscoverPage() {
                 </td>
                 <td className="p-4 font-mono text-sm">
                   
-                    href={`https://app.hyperliquid.xyz/explorer/address/${wallet.address}`}
+                    href={'https://app.hyperliquid.xyz/explorer/address/' + wallet.address}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="hover:underline text-blue-500"
@@ -106,10 +104,10 @@ export default function DiscoverPage() {
                     {shortenAddress(wallet.address)}
                   </a>
                 </td>
-                <td className={`p-4 text-right font-medium ${wallet.pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                <td className={'p-4 text-right font-medium ' + (wallet.pnl >= 0 ? 'text-green-500' : 'text-red-500')}>
                   {formatPnl(wallet.pnl)}
                 </td>
-                <td className={`p-4 text-right ${wallet.roi >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                <td className={'p-4 text-right ' + (wallet.roi >= 0 ? 'text-green-500' : 'text-red-500')}>
                   {formatRoi(wallet.roi)}
                 </td>
                 <td className="p-4 text-right text-muted-foreground">

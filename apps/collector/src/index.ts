@@ -13,14 +13,6 @@ import { scheduler } from './jobs/scheduler.js';
 
 const logger = createLogger('main');
 
-// Create job wrapper for scheduler
-const expireSignalsJob = {
-  name: 'expire-signals',
-  run: async () => {
-    await expireOldSignals();
-  },
-};
-
 async function main(): Promise<void> {
   logger.info('');
   logger.info('═══════════════════════════════════════════════════════════════');
@@ -49,8 +41,8 @@ async function main(): Promise<void> {
     logger.info('Step 2: Starting position tracker...');
     await startPositionTracker();
     
-    // Step 3: Register cleanup job
-    scheduler.register('expire-signals', expireSignalsJob, 15 * 60 * 1000); // Every 15 minutes
+    // Step 3: Register cleanup job (pass function directly)
+    scheduler.register('expire-signals', expireOldSignals, 15 * 60 * 1000);
     
     scheduler.start();
     logger.info('Step 3: Scheduler started');
@@ -73,12 +65,12 @@ async function main(): Promise<void> {
       }
       logger.info('───────────────────────────────────────────────');
       logger.info('');
-    }, 5 * 60 * 1000); // Every 5 minutes
+    }, 5 * 60 * 1000);
 
     // Log metrics periodically
     setInterval(() => {
       metrics.logSummary();
-    }, 10 * 60 * 1000); // Every 10 minutes
+    }, 10 * 60 * 1000);
 
     logger.info('');
     logger.info('✅ Convergence Tracker fully operational');

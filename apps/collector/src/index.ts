@@ -1,4 +1,4 @@
-// Collector entry point
+// Collector entry point - Convergence Detection System
 
 import { config } from 'dotenv';
 config();
@@ -6,17 +6,20 @@ config();
 import CONFIG, { validateConfig } from './config.js';
 import { createLogger } from './utils/logger.js';
 import { metrics } from './utils/metrics.js';
-import { getTradeStreamCollector } from './collectors/trade-stream.js';
-import { getPositionPoller } from './collectors/position-poller.js';
+import { startLeaderboardFetcher, stopLeaderboardFetcher, getLeaderboardWallets } from './collectors/leaderboard-fetcher.js';
+import { startPositionTracker, stopPositionTracker } from './collectors/position-tracker.js';
+import { getActiveSignals, expireOldSignals } from './processors/convergence-detector.js';
 import { scheduler } from './jobs/scheduler.js';
-import { cleanupOldTradesJob } from './jobs/cleanup-old-trades.js';
-import { flushPendingData } from './processors/trade-processor.js';
-import { getTopAlphaWallets } from './processors/alpha-detector.js';
 
 const logger = createLogger('main');
 
 async function main(): Promise<void> {
-  logger.info('Starting Hyperliquid Alpha Tracker');
+  logger.info('');
+  logger.info('═══════════════════════════════════════════════════════════════');
+  logger.info('   Hyperliquid Convergence Tracker');
+  logger.info('   Detecting when top traders align on positions');
+  logger.info('═══════════════════════════════════════════════════════════════');
+  logger.info('');
 
   // Validate configuration
   try {
@@ -26,62 +29,67 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  logger.info('Configuration validated');
-
-  // Start collectors
-  const tradeCollector = getTradeStreamCollector();
-  const positionPoller = getPositionPoller();
-
   try {
-    // Start trade stream (includes alpha detection)
-    await tradeCollector.start();
-    logger.info('Trade stream collector started with alpha detection');
-
-    // Start position polling
-    await positionPoller.start();
-    logger.info('Position poller started');
-
-    // Register cleanup job
-    scheduler.register('cleanup', cleanupOldTradesJob, 6 * 60 * 60 * 1000); // Every 6 hours
-
-    // Start scheduler
+    // Step 1: Fetch leaderboard wallets
+    logger.info('Step 1: Fetching top traders from leaderboard...');
+    await startLeaderboardFetcher();
+    
+    const wallets = await getLeaderboardWallets(100);
+    logger.info(`Tracking ${wallets.length} top traders`);
+    
+    // Step 2: Start position tracking
+    logger.info('Step 2: Starting position tracker...');
+    await startPositionTracker();
+    
+    // Step 3: Register cleanup job
+    scheduler.register('expire-signals', {
+      name: 'expire-signals',
+      run: expireOldSignals,
+    }, 15 * 60 * 1000); // Every 15 minutes
+    
     scheduler.start();
-    logger.info('Job scheduler started');
+    logger.info('Step 3: Scheduler started');
 
-    // Log top wallets periodically
+    // Log status periodically
     setInterval(async () => {
-      const topWallets = await getTopAlphaWallets(10);
-      if (topWallets.length > 0) {
-        logger.info('Current top alpha wallets:', {
-          wallets: topWallets.map(w => ({
-            address: w.address.slice(0, 10) + '...',
-            score: w.score,
-            winRate: w.win_rate?.toFixed(1) + '%',
-            pnl: '$' + (w.realized_pnl || 0).toFixed(2),
-            trades: w.total_trades,
-          }))
-        });
+      const signals = await getActiveSignals();
+      const walletCount = (await getLeaderboardWallets(200)).length;
+      
+      logger.info('');
+      logger.info('── Status Update ──────────────────────────────');
+      logger.info(`Tracking: ${walletCount} wallets`);
+      logger.info(`Active signals: ${signals.length}`);
+      
+      if (signals.length > 0) {
+        logger.info('Current signals:');
+        for (const sig of signals.slice(0, 5)) {
+          logger.info(`  • ${sig.coin} ${sig.direction.toUpperCase()} - ${sig.wallet_count} wallets (${sig.confidence}% confidence)`);
+        }
       }
+      logger.info('───────────────────────────────────────────────');
+      logger.info('');
     }, 5 * 60 * 1000); // Every 5 minutes
 
     // Log metrics periodically
     setInterval(() => {
       metrics.logSummary();
-    }, 5 * 60 * 1000);
+    }, 10 * 60 * 1000); // Every 10 minutes
 
-    logger.info('Alpha Tracker fully operational');
-    logger.info('Watching trade stream for skilled traders...');
+    logger.info('');
+    logger.info('✅ Convergence Tracker fully operational');
+    logger.info('   Watching for signals when 3+ traders enter same position...');
+    logger.info('');
 
   } catch (error) {
     logger.error('Failed to start collector', error);
-    await shutdown(tradeCollector, positionPoller);
+    await shutdown();
     process.exit(1);
   }
 
   // Handle graceful shutdown
   const handleShutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down gracefully...`);
-    await shutdown(tradeCollector, positionPoller);
+    await shutdown();
     process.exit(0);
   };
 
@@ -99,16 +107,12 @@ async function main(): Promise<void> {
   });
 }
 
-async function shutdown(
-  tradeCollector: ReturnType<typeof getTradeStreamCollector>,
-  positionPoller: ReturnType<typeof getPositionPoller>
-): Promise<void> {
+async function shutdown(): Promise<void> {
   logger.info('Shutting down...');
 
   scheduler.stop();
-  await flushPendingData();
-  await tradeCollector.stop();
-  await positionPoller.stop();
+  await stopPositionTracker();
+  await stopLeaderboardFetcher();
 
   metrics.logSummary();
   logger.info('Shutdown complete');

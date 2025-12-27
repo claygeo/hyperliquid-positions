@@ -1,6 +1,6 @@
 // Database operations for trades
 
-import supabase from './client.js';
+import db from './client.js';
 import { createLogger } from '../utils/logger.js';
 import type { DBTrade, DBTradeInsert } from '@hyperliquid-tracker/shared';
 
@@ -13,7 +13,7 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
   if (trades.length === 0) return 0;
 
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db.client
       .from('trades')
       .upsert(trades, { 
         onConflict: 'wallet,tx_hash,oid',
@@ -40,7 +40,7 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
  * Get trades for scoring a wallet
  */
 export async function getTradesForScoring(wallet: string, limit: number = 1000): Promise<DBTrade[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db.client
     .from('trades')
     .select('*')
     .eq('wallet', wallet)
@@ -59,7 +59,7 @@ export async function getTradesForScoring(wallet: string, limit: number = 1000):
  * Get recent trades (for wallet discovery)
  */
 export async function getRecentTrades(limit: number = 1000): Promise<DBTrade[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db.client
     .from('trades')
     .select('*')
     .order('timestamp', { ascending: false })
@@ -77,7 +77,7 @@ export async function getRecentTrades(limit: number = 1000): Promise<DBTrade[]> 
  * Get recent trades for a coin
  */
 export async function getRecentTradesForCoin(coin: string, limit: number = 100): Promise<DBTrade[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db.client
     .from('trades')
     .select('*')
     .eq('coin', coin)
@@ -96,7 +96,7 @@ export async function getRecentTradesForCoin(coin: string, limit: number = 100):
  * Get trades needing price backfill
  */
 export async function getTradesNeedingPriceBackfill(limit: number = 100): Promise<DBTrade[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db.client
     .from('trades')
     .select('*')
     .is('entry_score', null)
@@ -121,7 +121,7 @@ export async function updateTradeEntryScore(
   price5mAfter: number | null,
   price1hAfter: number | null
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await db.client
     .from('trades')
     .update({
       entry_score: entryScore,
@@ -166,7 +166,7 @@ export async function deleteOldTrades(olderThanDays: number = 30): Promise<numbe
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
 
-  const { data, error } = await supabase
+  const { data, error } = await db.client
     .from('trades')
     .delete()
     .lt('timestamp', cutoffDate.toISOString())
@@ -184,7 +184,7 @@ export async function deleteOldTrades(olderThanDays: number = 30): Promise<numbe
  * Get trade count for wallet
  */
 export async function getTradeCountForWallet(wallet: string): Promise<number> {
-  const { count, error } = await supabase
+  const { count, error } = await db.client
     .from('trades')
     .select('*', { count: 'exact', head: true })
     .eq('wallet', wallet);

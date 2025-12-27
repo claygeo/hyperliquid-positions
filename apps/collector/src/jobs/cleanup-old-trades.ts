@@ -2,43 +2,39 @@
 
 import { deleteOldTrades } from '../db/trades.js';
 import { createLogger } from '../utils/logger.js';
-import supabase from '../db/client.js';
+import db from '../db/client.js';
 
 const logger = createLogger('jobs:cleanup');
 
 /**
  * Clean up old data
  */
-export async function cleanupJob(): Promise<void> {
+export async function cleanupOldTradesJob(): Promise<void> {
   logger.info('Starting cleanup job');
 
   try {
-    // Delete trades older than 30 days
     const deletedTrades = await deleteOldTrades(30);
 
-    // Deactivate old signals (older than 24 hours)
     const oneDayAgo = new Date();
     oneDayAgo.setDate(oneDayAgo.getDate() - 1);
 
-    const { data: deactivated } = await supabase
+    const { data: deactivated } = await db.client
       .from('signals')
       .update({ is_active: false })
       .eq('is_active', true)
       .lt('created_at', oneDayAgo.toISOString())
       .select('id');
 
-    // Delete signals older than 7 days
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const { data: deletedSignals } = await supabase
+    const { data: deletedSignals } = await db.client
       .from('signals')
       .delete()
       .lt('created_at', sevenDaysAgo.toISOString())
       .select('id');
 
-    // Clear stale positions (not updated in 24 hours)
-    const { data: clearedPositions } = await supabase
+    const { data: clearedPositions } = await db.client
       .from('positions')
       .delete()
       .lt('updated_at', oneDayAgo.toISOString())
@@ -56,4 +52,4 @@ export async function cleanupJob(): Promise<void> {
   }
 }
 
-export default cleanupJob;
+export default cleanupOldTradesJob;

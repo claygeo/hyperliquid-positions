@@ -12,10 +12,9 @@ export async function backfillPricesJob(): Promise<void> {
   logger.info('Starting price backfill job');
   
   try {
-    const analyzed = await analyzeEntries(200);
+    const analyzed = await analyzeEntries();
     logger.info(`Price backfill complete: ${analyzed} trades analyzed`);
     
-    // Clean up old cache entries
     clearOldCache();
   } catch (error) {
     logger.error('Price backfill job failed', error);

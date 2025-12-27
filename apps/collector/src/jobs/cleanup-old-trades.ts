@@ -1,46 +1,54 @@
-// Cleanup old trades job - archive old data to keep database size manageable
+// Cleanup old trades job
 
 import { deleteOldTrades } from '../db/trades.js';
-import { deleteOldSignals, deactivateExpiredSignals } from '../db/signals.js';
-import { clearStalePositions } from '../db/positions.js';
 import { createLogger } from '../utils/logger.js';
+import supabase from '../db/client.js';
 
 const logger = createLogger('jobs:cleanup');
 
-// Keep trades for 30 days
-const TRADE_RETENTION_DAYS = 30;
-// Keep inactive signals for 7 days
-const SIGNAL_RETENTION_DAYS = 7;
-// Clear positions not updated in 24 hours
-const STALE_POSITION_HOURS = 24;
-
 /**
- * Job to clean up old data
+ * Clean up old data
  */
-export async function cleanupOldTradesJob(): Promise<void> {
+export async function cleanupJob(): Promise<void> {
   logger.info('Starting cleanup job');
-  
+
   try {
-    // Delete old trades
-    const tradesCutoff = new Date(Date.now() - TRADE_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-    const deletedTrades = await deleteOldTrades(tradesCutoff);
-    
-    // Deactivate expired signals
-    const deactivatedSignals = await deactivateExpiredSignals();
-    
-    // Delete old inactive signals
-    const signalsCutoff = new Date(Date.now() - SIGNAL_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-    const deletedSignals = await deleteOldSignals(signalsCutoff);
-    
-    // Clear stale positions
-    const positionsCutoff = new Date(Date.now() - STALE_POSITION_HOURS * 60 * 60 * 1000);
-    const clearedPositions = await clearStalePositions(positionsCutoff);
-    
+    // Delete trades older than 30 days
+    const deletedTrades = await deleteOldTrades(30);
+
+    // Deactivate old signals (older than 24 hours)
+    const oneDayAgo = new Date();
+    oneDayAgo.setDate(oneDayAgo.getDate() - 1);
+
+    const { data: deactivated } = await supabase
+      .from('signals')
+      .update({ is_active: false })
+      .eq('is_active', true)
+      .lt('created_at', oneDayAgo.toISOString())
+      .select('id');
+
+    // Delete signals older than 7 days
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const { data: deletedSignals } = await supabase
+      .from('signals')
+      .delete()
+      .lt('created_at', sevenDaysAgo.toISOString())
+      .select('id');
+
+    // Clear stale positions (not updated in 24 hours)
+    const { data: clearedPositions } = await supabase
+      .from('positions')
+      .delete()
+      .lt('updated_at', oneDayAgo.toISOString())
+      .select('id');
+
     logger.info('Cleanup complete', {
       deletedTrades,
-      deactivatedSignals,
-      deletedSignals,
-      clearedPositions,
+      deactivatedSignals: deactivated?.length || 0,
+      deletedSignals: deletedSignals?.length || 0,
+      clearedPositions: clearedPositions?.length || 0,
     });
   } catch (error) {
     logger.error('Cleanup job failed', error);
@@ -48,4 +56,4 @@ export async function cleanupOldTradesJob(): Promise<void> {
   }
 }
 
-export default cleanupOldTradesJob;
+export default cleanupJob;

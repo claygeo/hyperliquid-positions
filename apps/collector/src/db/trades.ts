@@ -1,6 +1,6 @@
 // Database operations for trades
 
-import { supabase } from './client.js';
+import supabase from './client.js';
 import { createLogger } from '../utils/logger.js';
 import type { DBTrade, DBTradeInsert } from '@hyperliquid-tracker/shared';
 
@@ -13,7 +13,6 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
   if (trades.length === 0) return 0;
 
   try {
-    // Use upsert with onConflict to ignore duplicates
     const { data, error } = await supabase
       .from('trades')
       .upsert(trades, { 
@@ -23,7 +22,6 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
       .select('id');
 
     if (error) {
-      // If still getting constraint errors, just log and continue
       if (error.code === '23505') {
         logger.debug(`Skipped ${trades.length} duplicate trades`);
         return 0;
@@ -34,7 +32,7 @@ export async function bulkInsertTrades(trades: DBTradeInsert[]): Promise<number>
     return data?.length || 0;
   } catch (error) {
     logger.error('Failed to bulk insert trades', error);
-    return 0; // Don't throw - just skip and continue
+    return 0;
   }
 }
 
@@ -51,6 +49,24 @@ export async function getTradesForScoring(wallet: string, limit: number = 1000):
 
   if (error) {
     logger.error(`Failed to get trades for ${wallet}`, error);
+    return [];
+  }
+
+  return data || [];
+}
+
+/**
+ * Get recent trades (for wallet discovery)
+ */
+export async function getRecentTrades(limit: number = 1000): Promise<DBTrade[]> {
+  const { data, error } = await supabase
+    .from('trades')
+    .select('*')
+    .order('timestamp', { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    logger.error('Failed to get recent trades', error);
     return [];
   }
 
@@ -77,9 +93,9 @@ export async function getRecentTradesForCoin(coin: string, limit: number = 100):
 }
 
 /**
- * Get trades without entry scores (for backfill)
+ * Get trades needing price backfill
  */
-export async function getTradesWithoutEntryScore(limit: number = 100): Promise<DBTrade[]> {
+export async function getTradesNeedingPriceBackfill(limit: number = 100): Promise<DBTrade[]> {
   const { data, error } = await supabase
     .from('trades')
     .select('*')
@@ -88,7 +104,7 @@ export async function getTradesWithoutEntryScore(limit: number = 100): Promise<D
     .limit(limit);
 
   if (error) {
-    logger.error('Failed to get trades without entry score', error);
+    logger.error('Failed to get trades needing backfill', error);
     return [];
   }
 
@@ -117,6 +133,29 @@ export async function updateTradeEntryScore(
 
   if (error) {
     logger.error(`Failed to update entry score for trade ${tradeId}`, error);
+  }
+}
+
+/**
+ * Bulk update trade entry scores
+ */
+export async function updateTradeEntryScores(
+  updates: Array<{
+    id: number;
+    entry_score: number;
+    price_at_entry: number;
+    price_5m_after: number | null;
+    price_1h_after: number | null;
+  }>
+): Promise<void> {
+  for (const update of updates) {
+    await updateTradeEntryScore(
+      update.id,
+      update.entry_score,
+      update.price_at_entry,
+      update.price_5m_after,
+      update.price_1h_after
+    );
   }
 }
 
@@ -161,9 +200,11 @@ export async function getTradeCountForWallet(wallet: string): Promise<number> {
 export default {
   bulkInsertTrades,
   getTradesForScoring,
+  getRecentTrades,
   getRecentTradesForCoin,
-  getTradesWithoutEntryScore,
+  getTradesNeedingPriceBackfill,
   updateTradeEntryScore,
+  updateTradeEntryScores,
   deleteOldTrades,
   getTradeCountForWallet,
 };

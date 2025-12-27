@@ -268,7 +268,7 @@ export class HyperliquidWebSocket {
   }
 
   private getSubscriptionKey(subscription: HLSubscription): string {
-    const parts = [subscription.type];
+    const parts: string[] = [subscription.type];
     if (subscription.coin) parts.push(subscription.coin);
     if (subscription.user) parts.push(subscription.user);
     if (subscription.interval) parts.push(subscription.interval);

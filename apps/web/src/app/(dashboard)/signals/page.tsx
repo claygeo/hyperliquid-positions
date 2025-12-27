@@ -28,28 +28,29 @@ export default function SignalsPage() {
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
 
-  async function fetchSignals() {
-    const supabase = createClient();
-    const { data, error } = await supabase
+  function fetchSignals() {
+    var supabase = createClient();
+    supabase
       .from('convergence_signals')
       .select('*')
       .eq('is_active', true)
       .gt('expires_at', new Date().toISOString())
       .order('confidence', { ascending: false })
       .order('wallet_count', { ascending: false })
-      .limit(50);
-
-    if (!error && data) {
-      setSignals(data);
-    }
-    setIsLoading(false);
-    setLastRefresh(new Date());
+      .limit(50)
+      .then(function(result) {
+        if (!result.error && result.data) {
+          setSignals(result.data);
+        }
+        setIsLoading(false);
+        setLastRefresh(new Date());
+      });
   }
 
   useEffect(function() {
     fetchSignals();
     
-    const interval = setInterval(fetchSignals, 30 * 1000);
+    var interval = setInterval(fetchSignals, 30 * 1000);
     return function() {
       clearInterval(interval);
     };
@@ -61,14 +62,14 @@ export default function SignalsPage() {
   }
 
   function getTimeAgo(dateString: string): string {
-    const date = new Date(dateString);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
+    var date = new Date(dateString);
+    var now = new Date();
+    var diffMs = now.getTime() - date.getTime();
+    var diffMins = Math.floor(diffMs / 60000);
     
     if (diffMins < 1) return 'Just now';
     if (diffMins < 60) return diffMins + 'm ago';
-    const diffHours = Math.floor(diffMins / 60);
+    var diffHours = Math.floor(diffMins / 60);
     if (diffHours < 24) return diffHours + 'h ago';
     return Math.floor(diffHours / 24) + 'd ago';
   }
@@ -145,11 +146,7 @@ export default function SignalsPage() {
             disabled={isLoading}
             className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 disabled:cursor-not-allowed text-white rounded-md text-sm flex items-center gap-2"
           >
-            {isLoading ? (
-              <span>Refreshing...</span>
-            ) : (
-              <span>Refresh</span>
-            )}
+            {isLoading ? 'Refreshing...' : 'Refresh'}
           </button>
           <span className="text-xs text-muted-foreground">
             Last: {formatLastRefresh()}
@@ -160,7 +157,7 @@ export default function SignalsPage() {
       {signals.length > 0 ? (
         <div className="grid gap-4">
           {signals.map(function(signal) {
-            const isExpanded = expandedSignal === signal.id;
+            var isExpanded = expandedSignal === signal.id;
             
             return (
               <Card key={signal.id} className="overflow-hidden">
@@ -217,7 +214,7 @@ export default function SignalsPage() {
                             {signal.wallets && signal.wallets.map(function(wallet) {
                               return (
                                 <div key={wallet} className="flex items-center gap-2 text-xs">
-                                  
+                                  <a
                                     href={getTraderUrl(wallet)}
                                     target="_blank"
                                     rel="noopener noreferrer"
@@ -240,7 +237,7 @@ export default function SignalsPage() {
                           <div className="flex flex-wrap gap-1">
                             {signal.wallets && signal.wallets.slice(0, 5).map(function(wallet) {
                               return (
-                                
+                                <a
                                   key={wallet}
                                   href={getTraderUrl(wallet)}
                                   target="_blank"

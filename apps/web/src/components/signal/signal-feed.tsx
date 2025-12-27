@@ -1,5 +1,3 @@
-'use client';
-
 import { SignalCard } from './signal-card';
 import { EmptyState } from '@/components/common/empty-state';
 import { Bell } from 'lucide-react';
@@ -13,6 +11,7 @@ interface Signal {
   confidence: number;
   metadata: Record<string, unknown>;
   created_at: string;
+  is_active: boolean;
 }
 
 interface SignalFeedProps {
@@ -25,7 +24,7 @@ export function SignalFeed({ signals }: SignalFeedProps) {
       <EmptyState
         icon={Bell}
         title="No signals yet"
-        description="Signals will appear here when tracked wallets make moves"
+        description="Signals will appear here when high-scoring wallets make moves"
       />
     );
   }

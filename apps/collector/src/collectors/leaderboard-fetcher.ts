@@ -5,7 +5,8 @@ import db from '../db/client.js';
 
 const logger = createLogger('collector:leaderboard');
 
-const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
+// Correct leaderboard URL
+const LEADERBOARD_URL = 'https://stats-data.hyperliquid.xyz/Mainnet/leaderboard';
 const FETCH_INTERVAL = 60 * 60 * 1000; // Refresh leaderboard every hour
 
 let fetchInterval: NodeJS.Timeout | null = null;
@@ -18,22 +19,14 @@ interface LeaderboardEntry {
   displayName?: string;
 }
 
-interface LeaderboardResponse {
-  leaderboardRows: LeaderboardEntry[];
-}
-
 /**
- * Fetch leaderboard from Hyperliquid API
+ * Fetch leaderboard from Hyperliquid stats API
  */
-async function fetchLeaderboard(timeWindow: string = 'month'): Promise<LeaderboardEntry[]> {
+async function fetchLeaderboard(): Promise<LeaderboardEntry[]> {
   try {
-    const response = await fetch(HYPERLIQUID_INFO_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'leaderboard',
-        timeWindow: timeWindow,
-      }),
+    const response = await fetch(LEADERBOARD_URL, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
     });
 
     if (!response.ok) {
@@ -41,8 +34,22 @@ async function fetchLeaderboard(timeWindow: string = 'month'): Promise<Leaderboa
       return [];
     }
 
-    const data = await response.json() as LeaderboardResponse;
-    return data?.leaderboardRows || [];
+    const data = await response.json() as any;
+    
+    // The response structure may vary - log it to understand
+    logger.debug('Leaderboard response type:', typeof data);
+    
+    // Handle different response formats
+    if (Array.isArray(data)) {
+      return data;
+    } else if (data?.leaderboardRows) {
+      return data.leaderboardRows;
+    } else if (data?.data) {
+      return data.data;
+    }
+    
+    logger.warn('Unknown leaderboard format, keys:', Object.keys(data));
+    return [];
   } catch (error) {
     logger.error('Failed to fetch leaderboard', error);
     return [];
@@ -52,30 +59,34 @@ async function fetchLeaderboard(timeWindow: string = 'month'): Promise<Leaderboa
 /**
  * Save leaderboard wallets to database
  */
-async function saveLeaderboardWallets(entries: LeaderboardEntry[], timeWindow: string): Promise<number> {
+async function saveLeaderboardWallets(entries: LeaderboardEntry[]): Promise<number> {
   if (entries.length === 0) return 0;
 
   let saved = 0;
 
-  for (let i = 0; i < entries.length; i++) {
+  for (let i = 0; i < Math.min(entries.length, 100); i++) {
     const entry = entries[i];
+    
+    // Handle different field names
+    const address = entry.ethAddress || (entry as any).address || (entry as any).wallet;
+    if (!address) continue;
     
     try {
       const { error } = await db.client
         .from('leaderboard_wallets')
         .upsert({
-          address: entry.ethAddress.toLowerCase(),
+          address: address.toLowerCase(),
           rank: i + 1,
-          pnl: parseFloat(entry.pnl) || 0,
-          roi: parseFloat(entry.roi) || 0,
-          account_value: parseFloat(entry.accountValue) || 0,
-          time_window: timeWindow,
+          pnl: parseFloat(entry.pnl || '0') || 0,
+          roi: parseFloat(entry.roi || '0') || 0,
+          account_value: parseFloat(entry.accountValue || '0') || 0,
+          time_window: 'allTime',
           last_updated: new Date().toISOString(),
         }, { onConflict: 'address' });
 
       if (!error) saved++;
     } catch (err) {
-      logger.error(`Failed to save wallet ${entry.ethAddress}`, err);
+      logger.error(`Failed to save wallet ${address}`, err);
     }
   }
 
@@ -106,18 +117,13 @@ export async function getLeaderboardWallets(limit: number = 100): Promise<string
 export async function refreshLeaderboard(): Promise<void> {
   logger.info('Refreshing leaderboard...');
 
-  // Fetch from multiple time windows for diversity
-  const windows = ['month', 'week'];
+  const entries = await fetchLeaderboard();
   
-  for (const window of windows) {
-    const entries = await fetchLeaderboard(window);
-    
-    if (entries.length > 0) {
-      // Take top 50 from each window
-      const topEntries = entries.slice(0, 50);
-      const saved = await saveLeaderboardWallets(topEntries, window);
-      logger.info(`Saved ${saved} wallets from ${window} leaderboard`);
-    }
+  if (entries.length > 0) {
+    const saved = await saveLeaderboardWallets(entries);
+    logger.info(`Saved ${saved} wallets from leaderboard`);
+  } else {
+    logger.warn('No leaderboard entries received');
   }
 
   const totalWallets = await getLeaderboardWallets(200);

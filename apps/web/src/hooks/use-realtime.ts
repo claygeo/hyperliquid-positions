@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import type { RealtimeChannel, RealtimePostgresChangesPayload } from '@supabase/supabase-js';
+import type { RealtimeChannel } from '@supabase/supabase-js';
 
 type EventType = 'INSERT' | 'UPDATE' | 'DELETE' | '*';
 
@@ -30,17 +30,18 @@ export function useRealtime<T extends Record<string, unknown>>({
   const subscribe = useCallback(() => {
     const supabase = createClient();
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const channel = supabase
       .channel(`${table}-changes-${Date.now()}`)
-      .on<T>(
-        'postgres_changes' as const,
+      .on(
+        'postgres_changes' as any,
         {
           event,
           schema: 'public',
           table,
           filter,
-        },
-        (payload: RealtimePostgresChangesPayload<T>) => {
+        } as any,
+        (payload: any) => {
           const newRecord = payload.new as T;
           const oldRecord = payload.old as T;
 

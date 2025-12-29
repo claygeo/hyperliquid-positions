@@ -142,7 +142,7 @@ export default function SignalsPage() {
   }
 
   function getTraderUrl(wallet: string): string {
-    return 'https://app.hyperliquid.xyz/explorer/address/' + wallet;
+    return 'https://legacy.hyperdash.com/trader/' + wallet;
   }
 
   const filteredSignals = signals.filter((s) => {

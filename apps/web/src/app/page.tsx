@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { ChevronDown, ChevronRight, LogIn, LogOut } from 'lucide-react';
 
 interface TraderInfo {
   address: string;
@@ -28,7 +29,24 @@ interface QualitySignal {
   avg_entry_price: number;
   signal_strength: string;
   created_at: string;
+  updated_at: string;
   is_active: boolean;
+}
+
+interface HistoryEvent {
+  id: number;
+  address: string;
+  event_type: 'opened' | 'closed';
+  quality_tier: string;
+  pnl_7d: number;
+  pnl_realized: number | null;
+  position_value: number;
+  created_at: string;
+}
+
+interface SignalHistory {
+  opened: HistoryEvent[];
+  closed: HistoryEvent[];
 }
 
 interface SystemStats {
@@ -42,6 +60,9 @@ export default function SignalsPage() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [expandedSignal, setExpandedSignal] = useState<number | null>(null);
+  const [expandedNewTrades, setExpandedNewTrades] = useState<number | null>(null);
+  const [expandedClosedTrades, setExpandedClosedTrades] = useState<number | null>(null);
+  const [signalHistory, setSignalHistory] = useState<Record<string, SignalHistory>>({});
   const [lastRefresh, setLastRefresh] = useState<string>('--:--:--');
   const [filter, setFilter] = useState<string>('all');
   const [mounted, setMounted] = useState(false);
@@ -49,6 +70,37 @@ export default function SignalsPage() {
   // Handle hydration
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  // Fetch history for a specific signal when expanded
+  const fetchHistory = useCallback(async (coin: string, direction: string) => {
+    const key = `${coin}-${direction}`;
+    
+    const supabase = createClient();
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    
+    try {
+      const { data, error } = await supabase
+        .from('signal_position_history')
+        .select('*')
+        .eq('coin', coin)
+        .eq('direction', direction)
+        .gte('created_at', since)
+        .order('created_at', { ascending: false });
+      
+      if (!error && data) {
+        setSignalHistory(prev => ({
+          ...prev,
+          [key]: {
+            opened: data.filter((e: HistoryEvent) => e.event_type === 'opened'),
+            closed: data.filter((e: HistoryEvent) => e.event_type === 'closed'),
+          }
+        }));
+      }
+    } catch (err) {
+      // Table might not exist yet, that's ok
+      console.log('History table not available yet');
+    }
   }, []);
 
   async function fetchData() {
@@ -102,6 +154,7 @@ export default function SignalsPage() {
 
   function handleRefresh() {
     setIsLoading(true);
+    setSignalHistory({}); // Clear history cache on refresh
     fetchData();
   }
 
@@ -142,7 +195,29 @@ export default function SignalsPage() {
   }
 
   function getTraderUrl(wallet: string): string {
-    return 'https://legacy.hyperdash.com/trader/' + wallet;
+    return 'https://hypurrscan.io/address/' + wallet;
+  }
+
+  // Toggle new trades section
+  function toggleNewTrades(signalId: number, coin: string, direction: string) {
+    if (expandedNewTrades === signalId) {
+      setExpandedNewTrades(null);
+    } else {
+      setExpandedNewTrades(signalId);
+      setExpandedClosedTrades(null); // Close the other one
+      fetchHistory(coin, direction);
+    }
+  }
+
+  // Toggle closed trades section
+  function toggleClosedTrades(signalId: number, coin: string, direction: string) {
+    if (expandedClosedTrades === signalId) {
+      setExpandedClosedTrades(null);
+    } else {
+      setExpandedClosedTrades(signalId);
+      setExpandedNewTrades(null); // Close the other one
+      fetchHistory(coin, direction);
+    }
   }
 
   const filteredSignals = signals.filter((s) => {
@@ -193,26 +268,25 @@ export default function SignalsPage() {
             <div className="flex items-center gap-4">
               {stats && (
                 <div className="text-sm text-muted-foreground">
-                  <span className="text-green-500">{stats.elite_count}</span> Elite
-                  <span className="mx-2">|</span>
-                  <span className="text-blue-500">{stats.good_count}</span> Good
-                  <span className="mx-2">|</span>
-                  {stats.tracked_count} Tracked
+                  <span className="text-green-500 font-medium">{stats.elite_count} Elite</span>
+                  <span className="mx-1">|</span>
+                  <span className="text-blue-500 font-medium">{stats.good_count} Good</span>
+                  <span className="mx-1">|</span>
+                  <span className="font-medium">{stats.tracked_count} Tracked</span>
                 </div>
               )}
               <button
                 onClick={handleRefresh}
                 disabled={isLoading}
-                className="px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 disabled:opacity-50 rounded-md transition-colors"
+                className="px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 rounded-md transition-colors disabled:opacity-50"
               >
-                {isLoading ? 'Loading...' : 'Refresh'}
+                Refresh
               </button>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Main content */}
       <main className="max-w-6xl mx-auto px-4 py-6">
         {/* Filters */}
         <div className="flex gap-2 mb-6">
@@ -224,7 +298,7 @@ export default function SignalsPage() {
           </button>
           <button
             onClick={() => setFilter('strong')}
-            className={'px-3 py-1.5 text-sm rounded-md transition-colors ' + (filter === 'strong' ? 'bg-primary text-primary-foreground' : 'bg-secondary hover:bg-secondary/80')}
+            className={'px-3 py-1.5 text-sm rounded-md transition-colors ' + (filter === 'strong' ? 'bg-yellow-600 text-white' : 'bg-secondary hover:bg-secondary/80')}
           >
             Strong Only
           </button>
@@ -248,6 +322,10 @@ export default function SignalsPage() {
             {filteredSignals.map((signal) => {
               const isExpanded = expandedSignal === signal.id;
               const traders = Array.isArray(signal.traders) ? signal.traders : [];
+              const historyKey = `${signal.coin}-${signal.direction}`;
+              const history = signalHistory[historyKey] || { opened: [], closed: [] };
+              const isNewTradesOpen = expandedNewTrades === signal.id;
+              const isClosedTradesOpen = expandedClosedTrades === signal.id;
               
               return (
                 <Card key={signal.id} className="overflow-hidden">
@@ -283,7 +361,7 @@ export default function SignalsPage() {
                             </Badge>
                           </div>
                           <span className="text-sm text-muted-foreground">
-                            {getTimeAgo(signal.created_at)}
+                            {getTimeAgo(signal.updated_at || signal.created_at)}
                           </span>
                         </div>
 
@@ -315,7 +393,7 @@ export default function SignalsPage() {
                           </div>
                         </div>
 
-                        {/* Traders section */}
+                        {/* Active Traders section */}
                         <div className="border-t border-border pt-3">
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-xs text-muted-foreground">
@@ -386,6 +464,122 @@ export default function SignalsPage() {
                             </div>
                           ) : (
                             <div className="text-xs text-muted-foreground">No trader details available</div>
+                          )}
+                        </div>
+
+                        {/* New Trades Section (Collapsible) */}
+                        <div className="border-t border-border mt-3 pt-3">
+                          <button
+                            onClick={() => toggleNewTrades(signal.id, signal.coin, signal.direction)}
+                            className="flex items-center gap-2 w-full text-left hover:bg-muted/50 rounded px-2 py-1 -mx-2 transition-colors"
+                          >
+                            {isNewTradesOpen ? (
+                              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                            )}
+                            <LogIn className="h-4 w-4 text-green-500" />
+                            <span className="text-xs font-medium">New Trades</span>
+                            <span className="text-xs text-muted-foreground">
+                              ({history.opened.length > 0 ? history.opened.length : '?'})
+                            </span>
+                            <span className="text-xs text-muted-foreground ml-auto">Last 24h</span>
+                          </button>
+                          
+                          {isNewTradesOpen && (
+                            <div className="mt-2 pl-6 space-y-1">
+                              {history.opened.length === 0 ? (
+                                <div className="text-xs text-muted-foreground py-2">
+                                  No new entries in last 24h
+                                </div>
+                              ) : (
+                                history.opened.map((event) => (
+                                  <div key={event.id} className="flex items-center justify-between text-xs py-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className={'px-1 py-0.5 rounded ' + (event.quality_tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500')}>
+                                        {event.quality_tier === 'elite' ? 'E' : 'G'}
+                                      </span>
+                                      <a
+                                        href={getTraderUrl(event.address)}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="font-mono text-primary hover:underline"
+                                      >
+                                        {shortenAddress(event.address)}
+                                      </a>
+                                      {event.pnl_7d > 0 && (
+                                        <span className="text-green-500">+{formatPnl(event.pnl_7d)}</span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-2 text-muted-foreground">
+                                      {event.position_value > 0 && (
+                                        <span>{formatValue(event.position_value)}</span>
+                                      )}
+                                      <span>{getTimeAgo(event.created_at)}</span>
+                                    </div>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Closed Trades Section (Collapsible) */}
+                        <div className="border-t border-border mt-3 pt-3">
+                          <button
+                            onClick={() => toggleClosedTrades(signal.id, signal.coin, signal.direction)}
+                            className="flex items-center gap-2 w-full text-left hover:bg-muted/50 rounded px-2 py-1 -mx-2 transition-colors"
+                          >
+                            {isClosedTradesOpen ? (
+                              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                            )}
+                            <LogOut className="h-4 w-4 text-red-500" />
+                            <span className="text-xs font-medium">Closed Trades</span>
+                            <span className="text-xs text-muted-foreground">
+                              ({history.closed.length > 0 ? history.closed.length : '?'})
+                            </span>
+                            <span className="text-xs text-muted-foreground ml-auto">Last 24h</span>
+                          </button>
+                          
+                          {isClosedTradesOpen && (
+                            <div className="mt-2 pl-6 space-y-1">
+                              {history.closed.length === 0 ? (
+                                <div className="text-xs text-muted-foreground py-2">
+                                  No exits in last 24h
+                                </div>
+                              ) : (
+                                history.closed.map((event) => (
+                                  <div key={event.id} className="flex items-center justify-between text-xs py-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className={'px-1 py-0.5 rounded ' + (event.quality_tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500')}>
+                                        {event.quality_tier === 'elite' ? 'E' : 'G'}
+                                      </span>
+                                      <a
+                                        href={getTraderUrl(event.address)}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="font-mono text-primary hover:underline"
+                                      >
+                                        {shortenAddress(event.address)}
+                                      </a>
+                                      {event.pnl_realized !== null && (
+                                        <span className={event.pnl_realized >= 0 ? 'text-green-500' : 'text-red-500'}>
+                                          {event.pnl_realized >= 0 ? '+' : ''}{formatPnl(event.pnl_realized)}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-2 text-muted-foreground">
+                                      {event.position_value > 0 && (
+                                        <span>{formatValue(event.position_value)}</span>
+                                      )}
+                                      <span>{getTimeAgo(event.created_at)}</span>
+                                    </div>
+                                  </div>
+                                ))
+                              )}
+                            </div>
                           )}
                         </div>
                       </div>

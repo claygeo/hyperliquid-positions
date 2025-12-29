@@ -1,5 +1,5 @@
 // Position Tracker - Tracks positions of quality traders
-// Runs continuously, polls every 60 seconds
+// Now includes history tracking for opens/closes
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -34,6 +34,16 @@ interface TrackedTrader {
   quality_tier: string;
   pnl_7d: number;
   win_rate: number;
+}
+
+interface StoredPosition {
+  coin: string;
+  direction: string;
+  entry_price: number;
+  value_usd: number;
+  size: number;
+  leverage: number;
+  updated_at: string;
 }
 
 // ============================================
@@ -71,21 +81,104 @@ async function fetchPositions(address: string): Promise<Position[]> {
 }
 
 // ============================================
+// History Logging
+// ============================================
+
+async function logPositionOpened(
+  trader: TrackedTrader,
+  coin: string,
+  direction: string,
+  entryPrice: number,
+  valueUsd: number,
+  size: number,
+  leverage: number
+): Promise<void> {
+  try {
+    await db.client
+      .from('signal_position_history')
+      .insert({
+        coin,
+        direction,
+        address: trader.address,
+        event_type: 'opened',
+        entry_price: entryPrice,
+        position_value: valueUsd,
+        size,
+        leverage,
+        quality_tier: trader.quality_tier,
+        pnl_7d: trader.pnl_7d,
+        win_rate: trader.win_rate,
+      });
+  } catch (error) {
+    // Silently fail - history is nice to have but not critical
+  }
+}
+
+async function logPositionClosed(
+  trader: TrackedTrader,
+  coin: string,
+  direction: string,
+  entryPrice: number,
+  exitPrice: number,
+  valueUsd: number,
+  size: number,
+  leverage: number,
+  openedAt: string
+): Promise<void> {
+  try {
+    // Calculate hold duration
+    const openTime = new Date(openedAt).getTime();
+    const closeTime = Date.now();
+    const holdDurationHours = (closeTime - openTime) / (1000 * 60 * 60);
+    
+    // Estimate realized PnL
+    let pnlRealized = 0;
+    if (direction === 'long') {
+      pnlRealized = (exitPrice - entryPrice) / entryPrice * valueUsd;
+    } else {
+      pnlRealized = (entryPrice - exitPrice) / entryPrice * valueUsd;
+    }
+    
+    await db.client
+      .from('signal_position_history')
+      .insert({
+        coin,
+        direction,
+        address: trader.address,
+        event_type: 'closed',
+        entry_price: entryPrice,
+        exit_price: exitPrice,
+        position_value: valueUsd,
+        size,
+        leverage,
+        quality_tier: trader.quality_tier,
+        pnl_7d: trader.pnl_7d,
+        win_rate: trader.win_rate,
+        pnl_realized: pnlRealized,
+        hold_duration_hours: holdDurationHours,
+      });
+  } catch (error) {
+    // Silently fail
+  }
+}
+
+// ============================================
 // Position Updates
 // ============================================
 
 async function updateTraderPositions(trader: TrackedTrader): Promise<number> {
   const positions = await fetchPositions(trader.address);
   
-  // Get current stored positions
+  // Get current stored positions with full details
   const existingResult = await db.client
     .from('trader_positions')
-    .select('coin')
+    .select('coin, direction, entry_price, value_usd, size, leverage, updated_at')
     .eq('address', trader.address);
   
-  const existingCoins = new Set(
-    (existingResult.data || []).map((p: { coin: string }) => p.coin)
-  );
+  const existingPositions = new Map<string, StoredPosition>();
+  for (const p of (existingResult.data || []) as StoredPosition[]) {
+    existingPositions.set(p.coin, p);
+  }
   
   const currentCoins = new Set<string>();
   let updatedCount = 0;
@@ -108,6 +201,40 @@ async function updateTraderPositions(trader: TrackedTrader): Promise<number> {
     
     currentCoins.add(coin);
     
+    // Check if this is a NEW position or direction change
+    const existing = existingPositions.get(coin);
+    const isNewPosition = !existing;
+    const isDirectionChange = existing && existing.direction !== direction;
+    
+    if (isNewPosition || isDirectionChange) {
+      // Log the new position opened
+      await logPositionOpened(
+        trader,
+        coin,
+        direction,
+        entryPrice,
+        valueUsd,
+        Math.abs(size),
+        leverage
+      );
+      
+      // If direction changed, also log the old one as closed
+      if (isDirectionChange && existing) {
+        // Get current price for exit (approximation - use entry of new position)
+        await logPositionClosed(
+          trader,
+          coin,
+          existing.direction,
+          existing.entry_price,
+          entryPrice, // Current price as exit
+          existing.value_usd,
+          existing.size,
+          existing.leverage,
+          existing.updated_at
+        );
+      }
+    }
+    
     await db.client
       .from('trader_positions')
       .upsert({
@@ -127,9 +254,28 @@ async function updateTraderPositions(trader: TrackedTrader): Promise<number> {
     updatedCount++;
   }
   
-  // Remove closed positions
-  for (const coin of existingCoins) {
+  // Remove closed positions and log them
+  for (const [coin, existing] of existingPositions) {
     if (!currentCoins.has(coin)) {
+      // Position was closed - need to get current price for exit
+      // Fetch current price from positions (if available) or use entry as approximation
+      let exitPrice = existing.entry_price;
+      
+      // Try to get current price from another position or API
+      // For now, use a simple approximation
+      
+      await logPositionClosed(
+        trader,
+        coin,
+        existing.direction,
+        existing.entry_price,
+        exitPrice, // Best approximation
+        existing.value_usd,
+        existing.size,
+        existing.leverage,
+        existing.updated_at
+      );
+      
       await db.client
         .from('trader_positions')
         .delete()
@@ -227,4 +373,28 @@ export async function getPositionStats(): Promise<{ totalPositions: number; uniq
   };
 }
 
-export default { startPositionTracker, stopPositionTracker, getPositionStats };
+// Get position history for a specific signal (coin + direction)
+export async function getSignalHistory(
+  coin: string,
+  direction: string,
+  hoursBack: number = 24
+): Promise<{ opened: any[]; closed: any[] }> {
+  const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+  
+  const result = await db.client
+    .from('signal_position_history')
+    .select('*')
+    .eq('coin', coin)
+    .eq('direction', direction)
+    .gte('created_at', since)
+    .order('created_at', { ascending: false });
+  
+  const history = result.data || [];
+  
+  return {
+    opened: history.filter((h: any) => h.event_type === 'opened'),
+    closed: history.filter((h: any) => h.event_type === 'closed'),
+  };
+}
+
+export default { startPositionTracker, stopPositionTracker, getPositionStats, getSignalHistory };

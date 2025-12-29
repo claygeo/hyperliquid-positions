@@ -5,8 +5,8 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Hyperliquid Tracker',
-  description: 'Track and analyze smart money wallets on Hyperliquid',
+  title: 'Quality Trader Signals',
+  description: 'Real-time convergence signals from verified profitable traders',
 };
 
 export default function RootLayout({

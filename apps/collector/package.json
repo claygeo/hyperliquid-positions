@@ -1,24 +1,22 @@
 {
   "name": "@hyperliquid-tracker/collector",
   "version": "1.0.0",
-  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts",
-    "clean": "rm -rf dist"
+    "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "@hyperliquid-tracker/shared": "*",
-    "@hyperliquid-tracker/sdk": "*",
-    "@supabase/supabase-js": "^2.42.0",
-    "dotenv": "^16.4.0",
-    "ws": "^8.16.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "ws": "^8.14.2"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^20.10.0",
     "@types/ws": "^8.5.10",
-    "tsx": "^4.7.0",
-    "typescript": "^5.4.0"
+    "tsx": "^4.6.0",
+    "typescript": "^5.3.0"
   }
 }

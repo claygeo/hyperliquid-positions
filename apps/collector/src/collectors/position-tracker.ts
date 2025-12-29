@@ -2,7 +2,7 @@
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
-import { generateSignals } from './signal-generator.js';
+import { generateSignals } from '../processors/signal-generator.js';
 
 const logger = createLogger('position-tracker');
 
@@ -27,6 +27,17 @@ interface Position {
 
 interface ClearinghouseResponse {
   assetPositions: Array<{ position: Position }>;
+}
+
+interface TraderRecord {
+  address: string;
+  quality_tier: string;
+  pnl_7d: number;
+  win_rate: number;
+}
+
+interface PositionRecord {
+  coin: string;
 }
 
 async function fetchPositions(address: string): Promise<Position[]> {
@@ -73,9 +84,8 @@ async function updateTraderPositions(
     .select('coin')
     .eq('address', address.toLowerCase());
   
-  const existingCoins = new Set(
-    existingResult.data?.map((p: { coin: string }) => p.coin) || []
-  );
+  const existingData = (existingResult.data || []) as PositionRecord[];
+  const existingCoins = new Set(existingData.map(p => p.coin));
   
   const currentCoins = new Set<string>();
   
@@ -136,7 +146,7 @@ async function pollQualityTraders(): Promise<void> {
     return;
   }
   
-  const traders = result.data;
+  const traders = result.data as TraderRecord[];
   logger.info('Polling positions for ' + traders.length + ' quality traders');
   
   // Process in batches
@@ -190,8 +200,8 @@ export async function getPositionStats(): Promise<{ totalPositions: number; uniq
     .from('trader_positions')
     .select('coin');
   
-  const positions = result.data || [];
-  const uniqueCoins = new Set(positions.map((p: { coin: string }) => p.coin));
+  const positions = (result.data || []) as PositionRecord[];
+  const uniqueCoins = new Set(positions.map(p => p.coin));
   
   return {
     totalPositions: positions.length,

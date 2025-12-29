@@ -47,6 +47,16 @@ interface QualityMetrics {
   quality_tier: 'elite' | 'good' | 'weak';
 }
 
+interface WalletRecord {
+  address: string;
+}
+
+interface ClearinghouseResponse {
+  marginSummary?: {
+    accountValue: string;
+  };
+}
+
 async function fetchUserFills(address: string): Promise<UserFill[]> {
   try {
     const response = await fetch(HYPERLIQUID_API, {
@@ -64,7 +74,7 @@ async function fetchUserFills(address: string): Promise<UserFill[]> {
     }
     
     const data = await response.json();
-    return Array.isArray(data) ? data : [];
+    return Array.isArray(data) ? data as UserFill[] : [];
   } catch (error) {
     logger.error('Error fetching fills for ' + address, error);
     return [];
@@ -84,7 +94,7 @@ async function fetchAccountValue(address: string): Promise<number> {
     
     if (!response.ok) return 0;
     
-    const data = await response.json();
+    const data = await response.json() as ClearinghouseResponse;
     return parseFloat(data.marginSummary?.accountValue || '0');
   } catch {
     return 0;
@@ -171,7 +181,6 @@ function calculateMetrics(fills: UserFill[]): QualityMetrics {
   else if (trades_7d >= 3) quality_score += 3;
   
   // Consistency bonus (up to 10 points)
-  // Good if both 7d and 30d are positive
   if (pnl_7d > 0 && pnl_30d > 0) quality_score += 10;
   else if (pnl_7d > 0 || pnl_30d > 0) quality_score += 5;
   
@@ -258,7 +267,8 @@ async function analyzeNewWallets(): Promise<void> {
     return;
   }
   
-  const wallets = result.data.map((w: { address: string }) => w.address);
+  const walletData = result.data as WalletRecord[];
+  const wallets = walletData.map(w => w.address);
   logger.info('Analyzing ' + wallets.length + ' new wallets...');
   
   let eliteCount = 0;
@@ -314,7 +324,8 @@ async function reanalyzeTrackedWallets(): Promise<void> {
     return;
   }
   
-  const wallets = result.data.map((w: { address: string }) => w.address);
+  const walletData = result.data as WalletRecord[];
+  const wallets = walletData.map(w => w.address);
   logger.info('Re-analyzing ' + wallets.length + ' tracked wallets...');
   
   for (let i = 0; i < wallets.length; i += BATCH_SIZE) {

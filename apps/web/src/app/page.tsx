@@ -233,9 +233,9 @@ export default function SignalsPage() {
     return addr.slice(0, 6) + '...' + addr.slice(-4);
   }
 
-  function getTraderUrl(wallet: string): string {
-    return 'https://hypurrscan.io/address/' + wallet;
-  }
+function getTraderUrl(wallet: string): string {
+  return 'https://legacy.hyperdash.com/trader/' + wallet;
+}
 
   // Toggle new trades section
   function toggleNewTrades(signalId: number, coin: string, direction: string) {

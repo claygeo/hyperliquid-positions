@@ -1,10 +1,10 @@
 // Configuration for Quality Trader System
 
 export const config = {
-  // Supabase (used by existing client.ts)
+  // Supabase connection
   supabase: {
     url: process.env.SUPABASE_URL || '',
-    serviceRoleKey: process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+    serviceRoleKey: process.env.SUPABASE_SERVICE_KEY || '',
   },
 
   // Logging
@@ -21,7 +21,7 @@ export const config = {
 
   // HYPE holder thresholds
   holders: {
-    minHypeBalance: 1000, // Minimum HYPE to be considered (filters to ~5k wallets)
+    minHypeBalance: 500, // Lowered from 1000 - captures traders with ~$10k+ in HYPE
     fetchLimit: 10000, // Max holders to fetch per request
   },
 
@@ -70,8 +70,5 @@ export const config = {
     delayBetweenRequests: 100, // ms
   },
 };
-
-// Also export as CONFIG for backwards compatibility with existing files
-export const CONFIG = config;
 
 export default config;

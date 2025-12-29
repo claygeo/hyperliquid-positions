@@ -41,6 +41,8 @@ interface HistoryEvent {
   pnl_7d: number;
   pnl_realized: number | null;
   position_value: number;
+  entry_price: number | null;
+  exit_price: number | null;
   created_at: string;
 }
 
@@ -63,6 +65,7 @@ export default function SignalsPage() {
   const [expandedNewTrades, setExpandedNewTrades] = useState<number | null>(null);
   const [expandedClosedTrades, setExpandedClosedTrades] = useState<number | null>(null);
   const [signalHistory, setSignalHistory] = useState<Record<string, SignalHistory>>({});
+  const [historyLoading, setHistoryLoading] = useState<Record<string, boolean>>({});
   const [lastRefresh, setLastRefresh] = useState<string>('--:--:--');
   const [filter, setFilter] = useState<string>('all');
   const [mounted, setMounted] = useState(false);
@@ -72,12 +75,37 @@ export default function SignalsPage() {
     setMounted(true);
   }, []);
 
-  // Fetch history for a specific signal when expanded
+  // Format date/time in EST
+  function formatDateTime(dateString: string): string {
+    const date = new Date(dateString);
+    return date.toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }) + ' EST';
+  }
+
+  // Format just date for grouping
+  function formatDate(dateString: string): string {
+    const date = new Date(dateString);
+    return date.toLocaleDateString('en-US', {
+      timeZone: 'America/New_York',
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+    });
+  }
+
+  // Fetch ALL history for a specific signal (no time limit)
   const fetchHistory = useCallback(async (coin: string, direction: string) => {
     const key = `${coin}-${direction}`;
     
+    setHistoryLoading(prev => ({ ...prev, [key]: true }));
+    
     const supabase = createClient();
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     
     try {
       const { data, error } = await supabase
@@ -85,8 +113,8 @@ export default function SignalsPage() {
         .select('*')
         .eq('coin', coin)
         .eq('direction', direction)
-        .gte('created_at', since)
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending: false })
+        .limit(100); // Limit to last 100 events per type to avoid huge lists
       
       if (!error && data) {
         setSignalHistory(prev => ({
@@ -101,6 +129,8 @@ export default function SignalsPage() {
       // Table might not exist yet, that's ok
       console.log('History table not available yet');
     }
+    
+    setHistoryLoading(prev => ({ ...prev, [key]: false }));
   }, []);
 
   async function fetchData() {
@@ -167,7 +197,9 @@ export default function SignalsPage() {
     if (diffMins < 60) return diffMins + 'm ago';
     const diffHours = Math.floor(diffMins / 60);
     if (diffHours < 24) return diffHours + 'h ago';
-    return Math.floor(diffHours / 24) + 'd ago';
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays < 7) return diffDays + 'd ago';
+    return Math.floor(diffDays / 7) + 'w ago';
   }
 
   function formatPnl(value: number): string {
@@ -189,6 +221,13 @@ export default function SignalsPage() {
     return '$' + value.toFixed(0);
   }
 
+  function formatPrice(value: number | null): string {
+    if (!value) return '';
+    if (value >= 1000) return '$' + value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    if (value >= 1) return '$' + value.toFixed(2);
+    return '$' + value.toFixed(4);
+  }
+
   function shortenAddress(addr: string): string {
     if (!addr) return '';
     return addr.slice(0, 6) + '...' + addr.slice(-4);
@@ -205,7 +244,10 @@ export default function SignalsPage() {
     } else {
       setExpandedNewTrades(signalId);
       setExpandedClosedTrades(null); // Close the other one
-      fetchHistory(coin, direction);
+      const key = `${coin}-${direction}`;
+      if (!signalHistory[key]) {
+        fetchHistory(coin, direction);
+      }
     }
   }
 
@@ -216,7 +258,10 @@ export default function SignalsPage() {
     } else {
       setExpandedClosedTrades(signalId);
       setExpandedNewTrades(null); // Close the other one
-      fetchHistory(coin, direction);
+      const key = `${coin}-${direction}`;
+      if (!signalHistory[key]) {
+        fetchHistory(coin, direction);
+      }
     }
   }
 
@@ -324,6 +369,7 @@ export default function SignalsPage() {
               const traders = Array.isArray(signal.traders) ? signal.traders : [];
               const historyKey = `${signal.coin}-${signal.direction}`;
               const history = signalHistory[historyKey] || { opened: [], closed: [] };
+              const isHistoryLoading = historyLoading[historyKey] || false;
               const isNewTradesOpen = expandedNewTrades === signal.id;
               const isClosedTradesOpen = expandedClosedTrades === signal.id;
               
@@ -480,45 +526,54 @@ export default function SignalsPage() {
                             )}
                             <LogIn className="h-4 w-4 text-green-500" />
                             <span className="text-xs font-medium">New Trades</span>
-                            <span className="text-xs text-muted-foreground">
-                              ({history.opened.length > 0 ? history.opened.length : '?'})
-                            </span>
-                            <span className="text-xs text-muted-foreground ml-auto">Last 24h</span>
+                            {signalHistory[historyKey] && (
+                              <span className="text-xs text-muted-foreground">
+                                ({history.opened.length})
+                              </span>
+                            )}
                           </button>
                           
                           {isNewTradesOpen && (
-                            <div className="mt-2 pl-6 space-y-1">
-                              {history.opened.length === 0 ? (
+                            <div className="mt-2 pl-6">
+                              {isHistoryLoading ? (
+                                <div className="text-xs text-muted-foreground py-2">Loading...</div>
+                              ) : history.opened.length === 0 ? (
                                 <div className="text-xs text-muted-foreground py-2">
-                                  No new entries in last 24h
+                                  No entries recorded yet
                                 </div>
                               ) : (
-                                history.opened.map((event) => (
-                                  <div key={event.id} className="flex items-center justify-between text-xs py-1">
-                                    <div className="flex items-center gap-2">
-                                      <span className={'px-1 py-0.5 rounded ' + (event.quality_tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500')}>
-                                        {event.quality_tier === 'elite' ? 'E' : 'G'}
-                                      </span>
-                                      <a
-                                        href={getTraderUrl(event.address)}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="font-mono text-primary hover:underline"
-                                      >
-                                        {shortenAddress(event.address)}
-                                      </a>
-                                      {event.pnl_7d > 0 && (
-                                        <span className="text-green-500">+{formatPnl(event.pnl_7d)}</span>
-                                      )}
+                                <div className="space-y-1 max-h-64 overflow-y-auto">
+                                  {history.opened.map((event) => (
+                                    <div key={event.id} className="flex items-center justify-between text-xs py-1.5 border-b border-border/50 last:border-0">
+                                      <div className="flex items-center gap-2">
+                                        <span className={'px-1 py-0.5 rounded ' + (event.quality_tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500')}>
+                                          {event.quality_tier === 'elite' ? 'E' : 'G'}
+                                        </span>
+                                        <a
+                                          href={getTraderUrl(event.address)}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-mono text-primary hover:underline"
+                                        >
+                                          {shortenAddress(event.address)}
+                                        </a>
+                                        {event.position_value > 0 && (
+                                          <span className="text-muted-foreground">
+                                            {formatValue(event.position_value)}
+                                          </span>
+                                        )}
+                                        {event.entry_price && (
+                                          <span className="text-muted-foreground">
+                                            @ {formatPrice(event.entry_price)}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-muted-foreground whitespace-nowrap">
+                                        {formatDateTime(event.created_at)}
+                                      </div>
                                     </div>
-                                    <div className="flex items-center gap-2 text-muted-foreground">
-                                      {event.position_value > 0 && (
-                                        <span>{formatValue(event.position_value)}</span>
-                                      )}
-                                      <span>{getTimeAgo(event.created_at)}</span>
-                                    </div>
-                                  </div>
-                                ))
+                                  ))}
+                                </div>
                               )}
                             </div>
                           )}
@@ -537,47 +592,54 @@ export default function SignalsPage() {
                             )}
                             <LogOut className="h-4 w-4 text-red-500" />
                             <span className="text-xs font-medium">Closed Trades</span>
-                            <span className="text-xs text-muted-foreground">
-                              ({history.closed.length > 0 ? history.closed.length : '?'})
-                            </span>
-                            <span className="text-xs text-muted-foreground ml-auto">Last 24h</span>
+                            {signalHistory[historyKey] && (
+                              <span className="text-xs text-muted-foreground">
+                                ({history.closed.length})
+                              </span>
+                            )}
                           </button>
                           
                           {isClosedTradesOpen && (
-                            <div className="mt-2 pl-6 space-y-1">
-                              {history.closed.length === 0 ? (
+                            <div className="mt-2 pl-6">
+                              {isHistoryLoading ? (
+                                <div className="text-xs text-muted-foreground py-2">Loading...</div>
+                              ) : history.closed.length === 0 ? (
                                 <div className="text-xs text-muted-foreground py-2">
-                                  No exits in last 24h
+                                  No exits recorded yet
                                 </div>
                               ) : (
-                                history.closed.map((event) => (
-                                  <div key={event.id} className="flex items-center justify-between text-xs py-1">
-                                    <div className="flex items-center gap-2">
-                                      <span className={'px-1 py-0.5 rounded ' + (event.quality_tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500')}>
-                                        {event.quality_tier === 'elite' ? 'E' : 'G'}
-                                      </span>
-                                      <a
-                                        href={getTraderUrl(event.address)}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="font-mono text-primary hover:underline"
-                                      >
-                                        {shortenAddress(event.address)}
-                                      </a>
-                                      {event.pnl_realized !== null && (
-                                        <span className={event.pnl_realized >= 0 ? 'text-green-500' : 'text-red-500'}>
-                                          {event.pnl_realized >= 0 ? '+' : ''}{formatPnl(event.pnl_realized)}
+                                <div className="space-y-1 max-h-64 overflow-y-auto">
+                                  {history.closed.map((event) => (
+                                    <div key={event.id} className="flex items-center justify-between text-xs py-1.5 border-b border-border/50 last:border-0">
+                                      <div className="flex items-center gap-2">
+                                        <span className={'px-1 py-0.5 rounded ' + (event.quality_tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500')}>
+                                          {event.quality_tier === 'elite' ? 'E' : 'G'}
                                         </span>
-                                      )}
+                                        <a
+                                          href={getTraderUrl(event.address)}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-mono text-primary hover:underline"
+                                        >
+                                          {shortenAddress(event.address)}
+                                        </a>
+                                        {event.pnl_realized !== null && (
+                                          <span className={event.pnl_realized >= 0 ? 'text-green-500 font-medium' : 'text-red-500 font-medium'}>
+                                            {event.pnl_realized >= 0 ? '+' : ''}{formatPnl(event.pnl_realized)}
+                                          </span>
+                                        )}
+                                        {event.exit_price && (
+                                          <span className="text-muted-foreground">
+                                            @ {formatPrice(event.exit_price)}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-muted-foreground whitespace-nowrap">
+                                        {formatDateTime(event.created_at)}
+                                      </div>
                                     </div>
-                                    <div className="flex items-center gap-2 text-muted-foreground">
-                                      {event.position_value > 0 && (
-                                        <span>{formatValue(event.position_value)}</span>
-                                      )}
-                                      <span>{getTimeAgo(event.created_at)}</span>
-                                    </div>
-                                  </div>
-                                ))
+                                  ))}
+                                </div>
                               )}
                             </div>
                           )}

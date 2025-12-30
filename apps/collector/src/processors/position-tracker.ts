@@ -8,7 +8,7 @@
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import { config } from '../config.js';
-import hyperliquid from '../utils/hyperliquid-api.js';
+import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
 import { generateSignals } from './signal-generator.js';
 
 const logger = createLogger('position-tracker-v4');
@@ -29,7 +29,7 @@ interface TrackedPosition {
   margin_used: number;
   liquidation_price: number | null;
   // V4 additions
-  conviction_pct: number; // position_value / account_value
+  conviction_pct: number;
   has_pending_entry: boolean;
   has_stop_order: boolean;
   has_tp_order: boolean;
@@ -61,7 +61,7 @@ interface UrgentReevalTrigger {
 
 async function processOpenOrders(
   address: string,
-  orders: hyperliquid.OpenOrder[]
+  orders: OpenOrder[]
 ): Promise<TrackedOpenOrder[]> {
   const tracked: TrackedOpenOrder[] = [];
 
@@ -85,7 +85,6 @@ async function processOpenOrders(
 async function saveOpenOrders(orders: TrackedOpenOrder[]): Promise<void> {
   if (orders.length === 0) return;
 
-  // Group by address
   const byAddress = new Map<string, TrackedOpenOrder[]>();
   for (const order of orders) {
     const existing = byAddress.get(order.address) || [];
@@ -94,13 +93,11 @@ async function saveOpenOrders(orders: TrackedOpenOrder[]): Promise<void> {
   }
 
   for (const [address, addressOrders] of byAddress) {
-    // Delete old orders for this address
     await db.client
       .from('trader_open_orders')
       .delete()
       .eq('address', address);
 
-    // Insert new orders
     if (addressOrders.length > 0) {
       await db.client.from('trader_open_orders').insert(
         addressOrders.map(o => ({
@@ -130,14 +127,12 @@ async function checkForUrgentReeval(
   unrealizedPnl: number,
   tier: string
 ): Promise<UrgentReevalTrigger | null> {
-  // Calculate drawdown percentage
   const drawdownPct = accountValue > 0 
     ? (unrealizedPnl / accountValue) * 100 
     : 0;
 
   const triggers: UrgentReevalTrigger[] = [];
 
-  // Trigger 1: Severe drawdown (>15% unrealized loss)
   if (drawdownPct < -15) {
     triggers.push({
       address,
@@ -145,9 +140,7 @@ async function checkForUrgentReeval(
       priority: 1,
       currentDrawdownPct: drawdownPct,
     });
-  }
-  // Trigger 2: Moderate drawdown for elite traders (>10%)
-  else if (tier === 'elite' && drawdownPct < -10) {
+  } else if (tier === 'elite' && drawdownPct < -10) {
     triggers.push({
       address,
       reason: `elite_drawdown_${Math.abs(drawdownPct).toFixed(1)}pct`,
@@ -155,7 +148,7 @@ async function checkForUrgentReeval(
       currentDrawdownPct: drawdownPct,
     });
   }
-  // Trigger 3: Check for recent liquidation
+
   const { wasLiquidated } = await hyperliquid.checkRecentLiquidations(address, 24);
   if (wasLiquidated) {
     triggers.push({
@@ -168,7 +161,6 @@ async function checkForUrgentReeval(
 
   if (triggers.length === 0) return null;
 
-  // Return highest priority trigger
   triggers.sort((a, b) => a.priority - b.priority);
   return triggers[0];
 }
@@ -199,8 +191,8 @@ async function queueUrgentReeval(trigger: UrgentReevalTrigger): Promise<void> {
 
 function processPositions(
   address: string,
-  positions: hyperliquid.Position[],
-  orders: hyperliquid.OpenOrder[],
+  positions: Position[],
+  orders: OpenOrder[],
   accountValue: number
 ): TrackedPosition[] {
   return positions
@@ -213,12 +205,10 @@ function processPositions(
       const coin = p.coin;
       const positionValue = Math.abs(parseFloat(p.positionValue));
 
-      // Calculate conviction (position size relative to account)
       const convictionPct = accountValue > 0 
         ? (positionValue / accountValue) * 100 
         : 0;
 
-      // Check for related orders
       const relatedOrders = orders.filter(o => o.coin === coin);
       const hasPendingEntry = relatedOrders.some(o => !o.reduceOnly);
       const hasStopOrder = relatedOrders.some(o => 
@@ -229,7 +219,6 @@ function processPositions(
         o.reduceOnly && !o.isTrigger
       );
 
-      // Get pending order price if exists
       const pendingEntry = relatedOrders.find(o => !o.reduceOnly);
       const pendingOrderPrice = pendingEntry 
         ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
@@ -270,13 +259,11 @@ async function savePositions(positions: TrackedPosition[]): Promise<void> {
   }
 
   for (const [address, addressPositions] of byAddress) {
-    // Delete old positions
     await db.client
       .from('trader_positions')
       .delete()
       .eq('address', address);
 
-    // Insert new positions
     if (addressPositions.length > 0) {
       const { error } = await db.client
         .from('trader_positions')
@@ -319,7 +306,6 @@ async function pollPositions(): Promise<void> {
   isPolling = true;
 
   try {
-    // Get all tracked traders with their tier
     const { data: trackedTraders, error } = await db.client
       .from('trader_quality')
       .select('address, quality_tier, account_value')
@@ -339,7 +325,6 @@ async function pollPositions(): Promise<void> {
     let urgentReevals = 0;
 
     for (const trader of trackedTraders) {
-      // Get full position data including open orders
       const data = await hyperliquid.getFullPositionData(trader.address);
       
       if (!data) {
@@ -347,7 +332,6 @@ async function pollPositions(): Promise<void> {
         continue;
       }
 
-      // Process positions with conviction scoring
       const processed = processPositions(
         trader.address,
         data.positions,
@@ -356,11 +340,9 @@ async function pollPositions(): Promise<void> {
       );
       allPositions.push(...processed);
 
-      // Process open orders
       const orders = await processOpenOrders(trader.address, data.openOrders);
       allOpenOrders.push(...orders);
 
-      // Check for urgent re-evaluation
       const totalUnrealizedPnl = data.positions.reduce(
         (sum, p) => sum + parseFloat(p.unrealizedPnl || '0'),
         0
@@ -378,11 +360,9 @@ async function pollPositions(): Promise<void> {
         urgentReevals++;
       }
 
-      // Rate limiting
       await new Promise(resolve => setTimeout(resolve, config.rateLimit.delayBetweenRequests));
     }
 
-    // Save all data
     await savePositions(allPositions);
     await saveOpenOrders(allOpenOrders);
 
@@ -391,7 +371,6 @@ async function pollPositions(): Promise<void> {
       (urgentReevals > 0 ? `, ${urgentReevals} urgent reevals` : '')
     );
 
-    // Generate signals based on new positions
     await generateSignals();
 
   } catch (error) {
@@ -419,13 +398,11 @@ async function processUrgentReevals(): Promise<void> {
     logger.info(`Processing ${queue.length} urgent re-evaluations...`);
 
     for (const item of queue) {
-      // Import dynamically to avoid circular dependency
       const { analyzeTrader, saveTraderAnalysis } = await import('./pnl-analyzer.js');
       
       const analysis = await analyzeTrader(item.address);
       
       if (analysis) {
-        // Check if should be demoted
         if (analysis.quality_tier === 'weak') {
           logger.warn(
             `⬇️ DEMOTED: ${item.address.slice(0, 10)}... | ` +
@@ -442,7 +419,6 @@ async function processUrgentReevals(): Promise<void> {
         await saveTraderAnalysis(analysis);
       }
 
-      // Mark as processed
       await db.client
         .from('trader_reeval_queue')
         .update({ processed_at: new Date().toISOString() })
@@ -462,13 +438,10 @@ async function processUrgentReevals(): Promise<void> {
 export function startPositionTracker(): void {
   logger.info('Position tracker V4 starting...');
   
-  // Initial poll
   pollPositions();
   
-  // Regular polling
   pollInterval = setInterval(pollPositions, config.positions.pollIntervalMs);
   
-  // Process urgent reevals every 2 minutes
   setInterval(processUrgentReevals, 2 * 60 * 1000);
 }
 
@@ -509,7 +482,7 @@ export async function getPositionStats(): Promise<{
     totalPositions: positions.length,
     uniqueCoins,
     totalValue,
-    avgConviction: 0, // Would need account values to calculate
+    avgConviction: 0,
     withStopOrders,
   };
 }

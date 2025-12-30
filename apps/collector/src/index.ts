@@ -10,14 +10,14 @@ import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 import { createLogger } from './utils/logger.js';
-import { startPositionTracker, stopPositionTracker, getPositionStats } from './processors/position-tracker-v4.js';
+import { startPositionTracker, stopPositionTracker, getPositionStats } from './processors/position-tracker.js';
 import { getQualityStats, analyzeTrader, saveTraderAnalysis } from './processors/pnl-analyzer.js';
-import { generateSignals, getActiveSignals, getHighConvictionSignals } from './processors/signal-generator-v4.js';
+import { generateSignals, getActiveSignals, getHighConvictionSignals } from './processors/signal-generator.js';
 import { startSignalTracker, stopSignalTracker, getPerformanceSummary } from './processors/signal-tracker.js';
 import { reEvaluateAllTraders, cleanupOldHistory } from './processors/trader-reeval.js';
 import { startWebSocketStream, stopWebSocketStream, getStreamStats, onFill } from './processors/websocket-stream.js';
-import { startFundingTracker, stopFundingTracker, getTopFundingRates } from './processors/funding-tracker.js';
-import { startVolatilityTracker, stopVolatilityTracker, getMostVolatileCoins } from './processors/volatility-tracker.js';
+import { startFundingTracker, stopFundingTracker } from './processors/funding-tracker.js';
+import { startVolatilityTracker, stopVolatilityTracker } from './processors/volatility-tracker.js';
 import db from './db/client.js';
 import { config } from './config.js';
 

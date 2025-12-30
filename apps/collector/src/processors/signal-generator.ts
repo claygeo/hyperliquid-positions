@@ -136,7 +136,7 @@ async function getCurrentPrice(coin: string): Promise<number | null> {
       body: JSON.stringify({ type: 'allMids' }),
     });
     
-    const data = await response.json();
+    const data = await response.json() as Record<string, string>;
     return data[coin] ? parseFloat(data[coin]) : null;
   } catch (error) {
     logger.error(`Failed to get price for ${coin}`, error);
@@ -435,7 +435,7 @@ export async function generateSignals(): Promise<void> {
     const positionsByCoin = new Map<string, TraderPosition[]>();
     for (const pos of positions) {
       const existing = positionsByCoin.get(pos.coin) || [];
-      existing.push(pos);
+      existing.push(pos as TraderPosition);
       positionsByCoin.set(pos.coin, existing);
     }
     
@@ -693,7 +693,7 @@ export async function getActiveSignals(): Promise<SignalData[]> {
     return [];
   }
   
-  return data || [];
+  return (data || []) as SignalData[];
 }
 
 export async function getSignalForCoin(coin: string): Promise<SignalData | null> {
@@ -705,5 +705,5 @@ export async function getSignalForCoin(coin: string): Promise<SignalData | null>
     .single();
   
   if (error) return null;
-  return data;
+  return data as SignalData;
 }

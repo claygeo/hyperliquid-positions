@@ -84,12 +84,14 @@ async function getAllPrices(): Promise<Map<string, number>> {
       body: JSON.stringify({ type: 'allMids' }),
     });
     
-    const data = await response.json();
+    const data = await response.json() as Record<string, string>;
     const prices = new Map<string, number>();
     
-    for (const [coin, price] of Object.entries(data)) {
-      if (typeof price === 'string') {
-        prices.set(coin, parseFloat(price));
+    if (data && typeof data === 'object') {
+      for (const [coin, price] of Object.entries(data)) {
+        if (typeof price === 'string') {
+          prices.set(coin, parseFloat(price));
+        }
       }
     }
     
@@ -383,7 +385,7 @@ export async function syncSignalOutcomes(): Promise<void> {
     
     // Create outcomes for any signals without them
     for (const signal of signals) {
-      await createSignalOutcome(signal);
+      await createSignalOutcome(signal as ActiveSignal);
     }
   } catch (error) {
     logger.error('syncSignalOutcomes failed', error);
@@ -456,7 +458,7 @@ export async function getPerformanceSummary(): Promise<PerformanceSummary> {
   };
 }
 
-export async function getAssetPerformance(): Promise<any[]> {
+export async function getAssetPerformance(): Promise<unknown[]> {
   const { data } = await db.client
     .from('asset_performance')
     .select('*')

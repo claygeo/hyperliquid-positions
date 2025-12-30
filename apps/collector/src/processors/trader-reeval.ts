@@ -46,7 +46,7 @@ interface ReEvalStats {
 /**
  * Check if elite trader should be demoted
  */
-function shouldDemoteElite(trader: any): { demote: boolean; reason: string } {
+function shouldDemoteElite(trader: { pnl_7d?: number; win_rate?: number; profit_factor?: number }): { demote: boolean; reason: string } {
   const { demoteEliteIf } = config.reeval;
   
   if ((trader.pnl_7d || 0) < demoteEliteIf.pnl7dBelow) {
@@ -67,7 +67,7 @@ function shouldDemoteElite(trader: any): { demote: boolean; reason: string } {
 /**
  * Check if good trader should be demoted
  */
-function shouldDemoteGood(trader: any): { demote: boolean; reason: string } {
+function shouldDemoteGood(trader: { pnl_7d?: number; win_rate?: number }): { demote: boolean; reason: string } {
   const { demoteGoodIf } = config.reeval;
   
   if ((trader.pnl_7d || 0) < demoteGoodIf.pnl7dBelow) {
@@ -128,7 +128,7 @@ async function updateTierChangeTracking(
     await db.client
       .from('trader_quality')
       .update({
-        tier_change_count: (trader?.tier_change_count || 0) + 1,
+        tier_change_count: ((trader?.tier_change_count as number) || 0) + 1,
         last_tier_change_at: new Date().toISOString(),
       })
       .eq('address', address);
@@ -179,7 +179,7 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
     
     for (const trader of trackedTraders) {
       stats.totalEvaluated++;
-      const previousTier = trader.quality_tier;
+      const previousTier = trader.quality_tier as string;
       
       // Re-analyze trader with fresh data
       const analysis = await analyzeTrader(trader.address);
@@ -261,10 +261,20 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
       // Determine if still tracked
       const isTracked = finalTier === 'elite' || finalTier === 'good';
       
-      // Save the updated analysis with final tier
-      analysis.quality_tier = finalTier;
-      analysis.is_tracked = isTracked;
-      await saveTraderAnalysis(analysis);
+      // Update the analysis object for saving
+      const updatedAnalysis = {
+        ...analysis,
+        quality_tier: finalTier,
+      };
+      
+      // Save the updated analysis
+      await saveTraderAnalysis(updatedAnalysis);
+      
+      // Also update is_tracked separately since it might not be in the analysis
+      await db.client
+        .from('trader_quality')
+        .update({ is_tracked: isTracked })
+        .eq('address', trader.address);
       
       // Update tier change tracking
       await updateTierChangeTracking(trader.address, finalTier, previousTier);
@@ -305,6 +315,12 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
         
         if (analysis && (analysis.quality_tier === 'elite' || analysis.quality_tier === 'good')) {
           await saveTraderAnalysis(analysis);
+          
+          // Also update is_tracked
+          await db.client
+            .from('trader_quality')
+            .update({ is_tracked: true })
+            .eq('address', potential.address);
           
           if (analysis.quality_tier === 'elite') {
             stats.newElite++;
@@ -365,7 +381,7 @@ export async function cleanupOldHistory(): Promise<void> {
 /**
  * Get trader history
  */
-export async function getTraderHistory(address: string, limit: number = 10): Promise<any[]> {
+export async function getTraderHistory(address: string, limit: number = 10): Promise<unknown[]> {
   const { data } = await db.client
     .from('trader_performance_history')
     .select('*')
@@ -379,7 +395,7 @@ export async function getTraderHistory(address: string, limit: number = 10): Pro
 /**
  * Get traders with most tier changes (volatile performers)
  */
-export async function getVolatileTraders(limit: number = 10): Promise<any[]> {
+export async function getVolatileTraders(limit: number = 10): Promise<unknown[]> {
   const { data } = await db.client
     .from('trader_quality')
     .select('address, quality_tier, tier_change_count, pnl_7d, win_rate')

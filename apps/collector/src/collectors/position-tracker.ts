@@ -1,48 +1,41 @@
-// Quality Position Tracker - Tracks positions of ELITE and GOOD traders only
+// Position Tracker V3
+// Polls positions for quality traders and triggers signal generation
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
-import { generateSignals } from '../processors/signal-generator.js';
+import { config } from '../config.js';
+import { generateSignals } from './signal-generator.js';
 
 const logger = createLogger('position-tracker');
 
-const HYPERLIQUID_API = 'https://api.hyperliquid.xyz/info';
-const POLL_INTERVAL = 60000; // 60 seconds
-const BATCH_SIZE = 10;
-const BATCH_DELAY = 500;
+// ============================================
+// Types
+// ============================================
 
-// Major assets we care about
-const MAJOR_ASSETS = ['BTC', 'ETH', 'SOL', 'HYPE', 'XRP', 'DOGE', 'SUI', 'AVAX', 'LINK', 'BNB'];
-const MIN_POSITION_VALUE = 5000; // $5k minimum
-
-interface Position {
+interface HyperliquidPosition {
   coin: string;
   szi: string;
   entryPx: string;
-  leverage: { value: string };
   positionValue: string;
+  leverage: { type: string; value: number };
   unrealizedPnl: string;
-  returnOnEquity: string;
+  marginUsed: string;
+  liquidationPx: string | null;
 }
 
-interface ClearinghouseResponse {
-  assetPositions: Array<{ position: Position }>;
+interface ClearinghouseState {
+  assetPositions: Array<{
+    position: HyperliquidPosition;
+  }>;
 }
 
-interface TraderRecord {
-  address: string;
-  quality_tier: string;
-  pnl_7d: number;
-  win_rate: number;
-}
+// ============================================
+// API Functions
+// ============================================
 
-interface PositionRecord {
-  coin: string;
-}
-
-async function fetchPositions(address: string): Promise<Position[]> {
+async function fetchPositions(address: string): Promise<HyperliquidPosition[]> {
   try {
-    const response = await fetch(HYPERLIQUID_API, {
+    const response = await fetch(config.hyperliquid.api, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -50,163 +43,211 @@ async function fetchPositions(address: string): Promise<Position[]> {
         user: address,
       }),
     });
-    
-    if (!response.ok) return [];
-    
-    const data = await response.json() as ClearinghouseResponse;
-    
-    const positions: Position[] = [];
-    if (data.assetPositions) {
-      for (const ap of data.assetPositions) {
-        if (ap.position && parseFloat(ap.position.szi) !== 0) {
-          positions.push(ap.position);
-        }
-      }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
+
+    const data: ClearinghouseState = await response.json();
     
-    return positions;
+    if (!data || !data.assetPositions) {
+      return [];
+    }
+
+    // Filter to positions with non-zero size
+    return data.assetPositions
+      .map(ap => ap.position)
+      .filter(p => parseFloat(p.szi) !== 0);
   } catch (error) {
+    logger.error(`Failed to fetch positions for ${address}`, error);
     return [];
   }
 }
 
-async function updateTraderPositions(
-  address: string, 
-  tier: string,
-  pnl_7d: number,
-  win_rate: number
-): Promise<void> {
-  const positions = await fetchPositions(address);
-  
-  // Get current stored positions for this trader
-  const existingResult = await db.client
-    .from('trader_positions')
-    .select('coin')
-    .eq('address', address.toLowerCase());
-  
-  const existingData = (existingResult.data || []) as PositionRecord[];
-  const existingCoins = new Set(existingData.map(p => p.coin));
-  
-  const currentCoins = new Set<string>();
-  
-  // Update/insert current positions
+// ============================================
+// Position Processing
+// ============================================
+
+interface TrackedPosition {
+  address: string;
+  coin: string;
+  direction: 'long' | 'short';
+  size: number;
+  entry_price: number;
+  value_usd: number;
+  leverage: number;
+  unrealized_pnl: number;
+  margin_used: number;
+  liquidation_price: number | null;
+}
+
+function processPositions(address: string, positions: HyperliquidPosition[]): TrackedPosition[] {
+  return positions
+    .filter(p => {
+      const value = Math.abs(parseFloat(p.positionValue || '0'));
+      return value >= config.positions.minPositionValue;
+    })
+    .map(p => {
+      const size = parseFloat(p.szi);
+      return {
+        address,
+        coin: p.coin,
+        direction: size > 0 ? 'long' : 'short',
+        size: Math.abs(size),
+        entry_price: parseFloat(p.entryPx),
+        value_usd: Math.abs(parseFloat(p.positionValue)),
+        leverage: p.leverage?.value || 1,
+        unrealized_pnl: parseFloat(p.unrealizedPnl || '0'),
+        margin_used: parseFloat(p.marginUsed || '0'),
+        liquidation_price: p.liquidationPx ? parseFloat(p.liquidationPx) : null,
+      };
+    }) as TrackedPosition[];
+}
+
+// ============================================
+// Database Operations
+// ============================================
+
+async function savePositions(positions: TrackedPosition[]): Promise<void> {
+  if (positions.length === 0) return;
+
+  // Group by address for efficient upsert
+  const byAddress = new Map<string, TrackedPosition[]>();
   for (const pos of positions) {
-    const coin = pos.coin;
-    const size = parseFloat(pos.szi);
-    const direction = size > 0 ? 'long' : 'short';
-    const valueUsd = parseFloat(pos.positionValue || '0');
-    const entryPrice = parseFloat(pos.entryPx || '0');
-    const leverage = parseFloat(pos.leverage?.value || '1');
-    const unrealizedPnl = parseFloat(pos.unrealizedPnl || '0');
-    const returnOnEquity = parseFloat(pos.returnOnEquity || '0');
-    
-    // Only track major assets with significant value
-    if (!MAJOR_ASSETS.includes(coin)) continue;
-    if (valueUsd < MIN_POSITION_VALUE) continue;
-    
-    currentCoins.add(coin);
-    
+    const existing = byAddress.get(pos.address) || [];
+    existing.push(pos);
+    byAddress.set(pos.address, existing);
+  }
+
+  for (const [address, addressPositions] of byAddress) {
+    // Delete old positions for this address
     await db.client
       .from('trader_positions')
-      .upsert({
-        address: address.toLowerCase(),
-        coin,
-        direction,
-        size: Math.abs(size),
-        entry_price: entryPrice,
-        value_usd: valueUsd,
-        leverage,
-        unrealized_pnl: unrealizedPnl,
-        return_on_equity: returnOnEquity,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'address,coin' });
-  }
-  
-  // Remove closed positions
-  for (const coin of existingCoins) {
-    if (!currentCoins.has(coin)) {
-      await db.client
+      .delete()
+      .eq('address', address);
+
+    // Insert new positions
+    if (addressPositions.length > 0) {
+      const { error } = await db.client
         .from('trader_positions')
-        .delete()
-        .eq('address', address.toLowerCase())
-        .eq('coin', coin);
+        .insert(
+          addressPositions.map(p => ({
+            ...p,
+            updated_at: new Date().toISOString(),
+          }))
+        );
+
+      if (error) {
+        logger.error(`Failed to save positions for ${address}`, error);
+      }
     }
   }
 }
 
-async function pollQualityTraders(): Promise<void> {
-  // Get all tracked traders (ELITE and GOOD)
-  const result = await db.client
-    .from('trader_quality')
-    .select('address, quality_tier, pnl_7d, win_rate')
-    .eq('is_tracked', true)
-    .in('quality_tier', ['elite', 'good']);
-  
-  if (result.error || !result.data || result.data.length === 0) {
-    return;
-  }
-  
-  const traders = result.data as TraderRecord[];
-  logger.info('Polling positions for ' + traders.length + ' quality traders');
-  
-  // Process in batches
-  for (let i = 0; i < traders.length; i += BATCH_SIZE) {
-    const batch = traders.slice(i, i + BATCH_SIZE);
-    
-    await Promise.all(
-      batch.map(trader => 
-        updateTraderPositions(
-          trader.address, 
-          trader.quality_tier,
-          trader.pnl_7d,
-          trader.win_rate
-        )
-      )
-    );
-    
-    if (i + BATCH_SIZE < traders.length) {
-      await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
-    }
-  }
-  
-  // After updating positions, check for convergence signals
-  await generateSignals();
-}
+// ============================================
+// Main Polling Loop
+// ============================================
 
 let pollInterval: NodeJS.Timeout | null = null;
+let isPolling = false;
+
+async function pollPositions(): Promise<void> {
+  if (isPolling) return;
+  isPolling = true;
+
+  try {
+    // Get all tracked traders
+    const { data: trackedTraders, error } = await db.client
+      .from('trader_quality')
+      .select('address')
+      .eq('is_tracked', true)
+      .in('quality_tier', ['elite', 'good']);
+
+    if (error || !trackedTraders || trackedTraders.length === 0) {
+      logger.debug('No tracked traders to poll');
+      isPolling = false;
+      return;
+    }
+
+    logger.info(`Polling ${trackedTraders.length} quality traders...`);
+
+    const allPositions: TrackedPosition[] = [];
+
+    // Fetch positions for each trader
+    for (const trader of trackedTraders) {
+      const positions = await fetchPositions(trader.address);
+      const processed = processPositions(trader.address, positions);
+      allPositions.push(...processed);
+
+      // Rate limiting
+      await new Promise(resolve => setTimeout(resolve, config.rateLimit.delayBetweenRequests));
+    }
+
+    // Save all positions
+    await savePositions(allPositions);
+    
+    logger.info(`Updated ${allPositions.length} positions`);
+
+    // Generate signals based on new positions
+    await generateSignals();
+
+  } catch (error) {
+    logger.error('Position polling failed', error);
+  } finally {
+    isPolling = false;
+  }
+}
+
+// ============================================
+// Exports
+// ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Starting position tracker...');
-  logger.info('Tracking assets: ' + MAJOR_ASSETS.join(', '));
-  logger.info('Minimum position: $' + MIN_POSITION_VALUE);
+  logger.info('Position tracker starting...');
   
-  // Initial poll after short delay (let analyzer run first)
-  setTimeout(pollQualityTraders, 10000);
+  // Initial poll
+  pollPositions();
   
-  // Start interval
-  pollInterval = setInterval(pollQualityTraders, POLL_INTERVAL);
+  // Schedule regular polling
+  pollInterval = setInterval(pollPositions, config.positions.pollIntervalMs);
 }
 
 export function stopPositionTracker(): void {
   if (pollInterval) {
     clearInterval(pollInterval);
     pollInterval = null;
+    logger.info('Position tracker stopped');
   }
-  logger.info('Position tracker stopped');
 }
 
-export async function getPositionStats(): Promise<{ totalPositions: number; uniqueCoins: number }> {
-  const result = await db.client
+export async function getPositionStats(): Promise<{
+  totalPositions: number;
+  uniqueCoins: number;
+  totalValue: number;
+}> {
+  const { data: positions } = await db.client
     .from('trader_positions')
-    .select('coin');
-  
-  const positions = (result.data || []) as PositionRecord[];
-  const uniqueCoins = new Set(positions.map(p => p.coin));
-  
+    .select('coin, value_usd');
+
+  if (!positions || positions.length === 0) {
+    return { totalPositions: 0, uniqueCoins: 0, totalValue: 0 };
+  }
+
+  const uniqueCoins = new Set(positions.map(p => p.coin)).size;
+  const totalValue = positions.reduce((sum, p) => sum + (p.value_usd || 0), 0);
+
   return {
     totalPositions: positions.length,
-    uniqueCoins: uniqueCoins.size,
+    uniqueCoins,
+    totalValue,
   };
 }
 
-export default { startPositionTracker, stopPositionTracker, getPositionStats };
+export async function getPositionsForCoin(coin: string): Promise<TrackedPosition[]> {
+  const { data } = await db.client
+    .from('trader_positions')
+    .select('*')
+    .eq('coin', coin);
+
+  return data || [];
+}

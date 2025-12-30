@@ -1,16 +1,10 @@
 // Collectors index - Export all collectors
-
-export { 
-  startLeaderboardFetcher, 
-  stopLeaderboardFetcher, 
+export {
+  startLeaderboardFetcher,
+  stopLeaderboardFetcher,
   getLeaderboardWallets,
-  refreshLeaderboard 
+  refreshLeaderboard
 } from './leaderboard-fetcher.js';
-
-export { 
-  startPositionTracker, 
-  stopPositionTracker
-} from './position-tracker.js';
 
 // Legacy exports (can be removed later)
 export { startTradeStream, stopTradeStream } from './trade-stream.js';

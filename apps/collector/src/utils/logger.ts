@@ -1,53 +1,45 @@
 // Simple logger utility
 
-import CONFIG from '../config.js';
-
-type LogLevel = 'debug' | 'info' | 'warn' | 'error';
-
-const LOG_LEVELS: Record<LogLevel, number> = {
+const LOG_LEVELS = {
   debug: 0,
   info: 1,
   warn: 2,
   error: 3,
 };
 
-const currentLevel = LOG_LEVELS[CONFIG.logLevel as LogLevel] ?? LOG_LEVELS.info;
+const currentLevel = LOG_LEVELS[process.env.LOG_LEVEL as keyof typeof LOG_LEVELS] || LOG_LEVELS.info;
 
-function formatMessage(level: LogLevel, context: string, message: string, data?: unknown): string {
-  const timestamp = new Date().toISOString();
-  const dataStr = data ? ` ${JSON.stringify(data)}` : '';
-  return `[${timestamp}] [${level.toUpperCase()}] [${context}] ${message}${dataStr}`;
+function formatTimestamp(): string {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
-export function createLogger(context: string) {
+function formatMessage(level: string, module: string, message: string): string {
+  return `[${formatTimestamp()}] [${level.toUpperCase().padEnd(5)}] [${module}] ${message}`;
+}
+
+export function createLogger(module: string) {
   return {
-    debug(message: string, data?: unknown) {
+    debug: (message: string, ...args: unknown[]) => {
       if (currentLevel <= LOG_LEVELS.debug) {
-        console.debug(formatMessage('debug', context, message, data));
+        console.log(formatMessage('debug', module, message), ...args);
       }
     },
-    
-    info(message: string, data?: unknown) {
+    info: (message: string, ...args: unknown[]) => {
       if (currentLevel <= LOG_LEVELS.info) {
-        console.info(formatMessage('info', context, message, data));
+        console.log(formatMessage('info', module, message), ...args);
       }
     },
-    
-    warn(message: string, data?: unknown) {
+    warn: (message: string, ...args: unknown[]) => {
       if (currentLevel <= LOG_LEVELS.warn) {
-        console.warn(formatMessage('warn', context, message, data));
+        console.warn(formatMessage('warn', module, message), ...args);
       }
     },
-    
-    error(message: string, error?: unknown) {
+    error: (message: string, ...args: unknown[]) => {
       if (currentLevel <= LOG_LEVELS.error) {
-        const errorData = error instanceof Error 
-          ? { message: error.message, stack: error.stack }
-          : error;
-        console.error(formatMessage('error', context, message, errorData));
+        console.error(formatMessage('error', module, message), ...args);
       }
     },
   };
 }
 
-export const logger = createLogger('main');
+export default { createLogger };

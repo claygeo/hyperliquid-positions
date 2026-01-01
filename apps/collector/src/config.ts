@@ -1,6 +1,7 @@
-// Configuration for Quality Trader System V4
+// Configuration for Quality Trader System V5
 // Enhanced with WebSocket, conviction scoring, volatility stops, and funding context
 // Updated with ROI-based quality thresholds
+// V5: Less aggressive reeval to prevent wrongful demotions
 
 export const config = {
   // Supabase connection
@@ -160,11 +161,13 @@ export const config = {
   },
 
   // ============================================
-  // V4: URGENT RE-EVALUATION
+  // V5: URGENT RE-EVALUATION (LESS AGGRESSIVE)
   // ============================================
+  // Unrealized losses are normal for leveraged traders
+  // Only trigger urgent reeval for truly severe situations
   urgentReeval: {
-    severeDrawdownPct: -15,
-    eliteDrawdownPct: -10,
+    severeDrawdownPct: -30,      // Was -15, now -30 (only panic at 30% drawdown)
+    eliteDrawdownPct: -20,       // Was -10, now -20 (elite can handle more)
     processIntervalMs: 2 * 60 * 1000,
     maxPerCycle: 5,
   },
@@ -175,10 +178,10 @@ export const config = {
   signalTracking: {
     updateIntervalMs: 60000,
     priceUpdateIntervalMs: 30000,
-    closeOnTraderExit: true,
+    closeOnTraderExit: false,    // V5: Don't close just because traders exit
     closeOnStopHit: true,
     closeOnTargetHit: false,
-    maxSignalHours: 168,
+    maxSignalHours: 168,         // 7 days max
   },
 
   // ============================================
@@ -188,16 +191,16 @@ export const config = {
     fullReevalIntervalHours: 168,
     
     demoteEliteIf: {
-      pnl7dBelow: -5000,        // Allow small drawdowns
-      roi7dBelow: -10,          // -10% weekly
-      winRateBelow: 0.35,
-      profitFactorBelow: 1.0,
+      pnl7dBelow: -10000,        // Was -5000, now more lenient
+      roi7dBelow: -20,           // Was -10, now -20% weekly
+      winRateBelow: 0.30,        // Was 0.35, now 0.30
+      profitFactorBelow: 0.8,    // Was 1.0, now 0.8
     },
     
     demoteGoodIf: {
-      pnl7dBelow: -10000,
-      roi7dBelow: -15,          // -15% weekly
-      winRateBelow: 0.30,
+      pnl7dBelow: -15000,        // Was -10000
+      roi7dBelow: -25,           // Was -15, now -25% weekly
+      winRateBelow: 0.25,        // Was 0.30
     },
     
     keepHistoryDays: 90,
@@ -220,13 +223,13 @@ export const config = {
   },
 
   // ============================================
-  // RATE LIMITING
+  // RATE LIMITING (slightly more conservative)
   // ============================================
   rateLimit: {
-    requestsPerSecond: 2,
-    delayBetweenRequests: 500,
+    requestsPerSecond: 1.5,      // Was 2, now 1.5 to reduce 429s
+    delayBetweenRequests: 750,   // Was 500, now 750ms
     maxRetries: 3,
-    retryDelayMs: 1000,
+    retryDelayMs: 1500,          // Was 1000, now 1500ms
   },
 };
 

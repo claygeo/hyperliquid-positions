@@ -1,10 +1,12 @@
-// Signal Generator V4
+// Signal Generator V5
 // Enhanced with:
+// - Smarter signal persistence (don't close just because traders repositioned)
 // - Position conviction scoring (capped at 100%)
 // - Volatility-adjusted stop losses (uses cached ATR data)
 // - Funding rate context (favorable/unfavorable)
 // - Pending order awareness
 // - Real-time fill integration
+// - Grace period before invalidation
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -12,7 +14,7 @@ import { config } from '../config.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v4');
+const logger = createLogger('signal-generator-v5');
 
 // ============================================
 // Types
@@ -90,6 +92,25 @@ interface SignalCandidate {
   riskScore: number;
   confidence: number;
   signalStrength: 'strong' | 'medium';
+}
+
+interface ExistingSignal {
+  id: number;
+  coin: string;
+  direction: string;
+  elite_count: number;
+  good_count: number;
+  total_traders: number;
+  created_at: string;
+  entry_price: number;
+  stop_loss: number;
+  take_profit_1: number;
+  take_profit_2: number;
+  take_profit_3: number;
+  hit_stop: boolean;
+  hit_tp1: boolean;
+  hit_tp2: boolean;
+  hit_tp3: boolean;
 }
 
 // ============================================
@@ -361,6 +382,59 @@ function determineSignalStrength(eliteCount: number, goodCount: number): 'strong
   return 'medium';
 }
 
+/**
+ * V5: Check if an existing signal should be kept alive
+ * Signals persist if:
+ * 1. At least 1 quality trader still holds the position
+ * 2. OR signal hasn't hit stop/all TPs
+ * 3. OR signal is less than 1 hour old (grace period)
+ */
+async function shouldKeepSignalAlive(
+  existing: ExistingSignal,
+  currentTraderCount: number,
+  currentPrice: number
+): Promise<{ keep: boolean; reason?: string }> {
+  // Grace period: keep signals alive for at least 1 hour
+  const ageHours = (Date.now() - new Date(existing.created_at).getTime()) / (1000 * 60 * 60);
+  if (ageHours < 1) {
+    return { keep: true };
+  }
+
+  // If at least 1 trader still holds, keep alive
+  if (currentTraderCount >= 1) {
+    return { keep: true };
+  }
+
+  // Check if stop was hit
+  const direction = existing.direction as 'long' | 'short';
+  if (direction === 'long' && currentPrice <= existing.stop_loss) {
+    return { keep: false, reason: 'stop_loss_hit' };
+  }
+  if (direction === 'short' && currentPrice >= existing.stop_loss) {
+    return { keep: false, reason: 'stop_loss_hit' };
+  }
+
+  // Check if TP3 was hit (full exit)
+  if (direction === 'long' && currentPrice >= existing.take_profit_3) {
+    return { keep: false, reason: 'take_profit_3_hit' };
+  }
+  if (direction === 'short' && currentPrice <= existing.take_profit_3) {
+    return { keep: false, reason: 'take_profit_3_hit' };
+  }
+
+  // No traders left and no stop/TP hit - check majority exit
+  const originalTraders = existing.total_traders;
+  const exitRatio = 1 - (currentTraderCount / originalTraders);
+  
+  // If more than 80% of traders exited, close the signal
+  if (exitRatio >= 0.8) {
+    return { keep: false, reason: `majority_exit_${Math.round(exitRatio * 100)}pct` };
+  }
+
+  // Otherwise keep it alive
+  return { keep: true };
+}
+
 // ============================================
 // Main Signal Generation
 // ============================================
@@ -399,7 +473,21 @@ export async function generateSignals(): Promise<void> {
       positionsByCoin.set(pos.coin, existing);
     }
 
+    // Get existing active signals
+    const { data: existingSignals } = await db.client
+      .from('quality_signals')
+      .select('*')
+      .eq('is_active', true);
+
+    const existingSignalMap = new Map<string, ExistingSignal>();
+    if (existingSignals) {
+      for (const sig of existingSignals) {
+        existingSignalMap.set(`${sig.coin}-${sig.direction}`, sig as ExistingSignal);
+      }
+    }
+
     const validSignals: unknown[] = [];
+    const processedKeys = new Set<string>();
 
     for (const [coin, coinPositions] of positionsByCoin) {
       const longs = coinPositions.filter(p => p.direction === 'long');
@@ -558,6 +646,13 @@ export async function generateSignals(): Promise<void> {
 
       candidate.signalStrength = determineSignalStrength(eliteTraders.length, goodTraders.length);
 
+      const signalKey = `${coin}-${direction}`;
+      processedKeys.add(signalKey);
+
+      // Check if signal already exists - preserve entry_price if so
+      const existingSignal = existingSignalMap.get(signalKey);
+      const entryPrice = existingSignal?.entry_price || suggestedEntry;
+
       const signalData = {
         coin,
         direction,
@@ -578,6 +673,7 @@ export async function generateSignals(): Promise<void> {
         directional_agreement: agreement,
         opposing_traders: opposingCount,
         suggested_entry: suggestedEntry,
+        entry_price: entryPrice,  // Preserve original entry
         entry_range_low: entryRangeLow,
         entry_range_high: entryRangeHigh,
         stop_loss: stopData.stopLoss,
@@ -592,6 +688,7 @@ export async function generateSignals(): Promise<void> {
         current_funding_rate: fundingData.fundingRate,
         volatility_adjusted_stop: stopData.volatilityAdjustedStop,
         atr_multiple: stopData.atrMultiple,
+        current_price: currentPrice,
         is_active: true,
         expires_at: new Date(Date.now() + config.signals.expiryHours * 60 * 60 * 1000).toISOString(),
       };
@@ -613,29 +710,53 @@ export async function generateSignals(): Promise<void> {
       );
     }
 
-    const activeCoinDirections = new Set(validSignals.map((s: any) => `${s.coin}-${s.direction}`));
+    // V5: Handle existing signals that may no longer have qualifying positions
+    // Only invalidate if truly dead (majority exit + grace period)
+    for (const [key, existing] of existingSignalMap) {
+      if (processedKeys.has(key)) continue;
 
-    const { data: existingSignals } = await db.client
-      .from('quality_signals')
-      .select('id, coin, direction')
-      .eq('is_active', true);
+      // Signal wasn't regenerated - check if we should keep it alive
+      const currentPrice = await getCurrentPrice(existing.coin);
+      if (!currentPrice) continue;
 
-    if (existingSignals) {
-      for (const existing of existingSignals) {
-        const key = `${existing.coin}-${existing.direction}`;
-        if (!activeCoinDirections.has(key)) {
-          await db.client
-            .from('quality_signals')
-            .update({
-              is_active: false,
-              invalidated: true,
-              invalidation_reason: 'no_longer_qualifies',
-            })
-            .eq('id', existing.id);
-        }
+      // Count how many quality traders still hold this position
+      const coinPositions = positionsByCoin.get(existing.coin) || [];
+      const direction = existing.direction as 'long' | 'short';
+      const directionPositions = coinPositions.filter(p => p.direction === direction);
+      const qualityPositions = directionPositions.filter(p => {
+        const t = traderMap.get(p.address);
+        return t && (t.quality_tier === 'elite' || t.quality_tier === 'good');
+      });
+
+      const { keep, reason } = await shouldKeepSignalAlive(
+        existing,
+        qualityPositions.length,
+        currentPrice
+      );
+
+      if (!keep) {
+        // Invalidate the signal
+        await db.client
+          .from('quality_signals')
+          .update({
+            is_active: false,
+            invalidated: true,
+            invalidation_reason: reason || 'no_longer_qualifies',
+            current_price: currentPrice,
+          })
+          .eq('id', existing.id);
+
+        logger.info(`Signal closed: ${existing.coin} ${existing.direction} | Reason: ${reason}`);
+      } else {
+        // Update current price but keep alive
+        await db.client
+          .from('quality_signals')
+          .update({ current_price: currentPrice })
+          .eq('id', existing.id);
       }
     }
 
+    // Upsert valid signals
     for (const signal of validSignals) {
       await db.client
         .from('quality_signals')

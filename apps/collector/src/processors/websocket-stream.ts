@@ -1,5 +1,8 @@
 // WebSocket Stream V4 - Real-time fill tracking for quality traders
-// FIXED: Deduplication to prevent logging same fills multiple times
+// Enhanced with:
+// - Deduplication to prevent logging same fills multiple times
+// - Exit detection when traders close positions
+// - Latency tracking with explicit detected_at timestamp
 
 import WebSocket from 'ws';
 import { createLogger } from '../utils/logger.js';
@@ -72,6 +75,118 @@ export interface RealtimeFill {
   fillTime: Date;
   txHash: string;
   qualityTier?: 'elite' | 'good';
+  isExit?: boolean;
+}
+
+// ============================================
+// Exit Detection
+// ============================================
+
+/**
+ * Detect if this fill represents a position exit/reduction
+ * and link it to any active signal
+ */
+async function processTraderExit(fill: RealtimeFill): Promise<void> {
+  try {
+    // Only process if there's closed PnL (indicates position reduction/close)
+    if (fill.closedPnl === 0) return;
+
+    // Determine exit direction based on side
+    // If trader bought to close, they were short; if sold to close, they were long
+    const exitDirection = fill.side === 'buy' ? 'short' : 'long';
+
+    // Find matching active signal
+    const { data: signal } = await db.client
+      .from('quality_signals')
+      .select('id, coin, direction, traders')
+      .eq('coin', fill.coin)
+      .eq('direction', exitDirection)
+      .eq('is_active', true)
+      .single();
+
+    if (!signal) return;
+
+    // Check if this trader was part of the signal
+    const traders = signal.traders as Array<{ address: string }> || [];
+    const wasInSignal = traders.some(t => 
+      t.address.toLowerCase() === fill.address.toLowerCase()
+    );
+
+    if (!wasInSignal) return;
+
+    // Record the exit
+    await db.client.from('signal_trader_exits').insert({
+      signal_id: signal.id,
+      address: fill.address,
+      coin: fill.coin,
+      direction: exitDirection,
+      exit_price: fill.price,
+      exit_size: fill.size,
+      exit_pnl: fill.closedPnl,
+      exit_time: fill.fillTime.toISOString(),
+      quality_tier: fill.qualityTier,
+    });
+
+    const pnlEmoji = fill.closedPnl >= 0 ? '💰' : '📉';
+    const tierTag = fill.qualityTier ? `[${fill.qualityTier.toUpperCase()}]` : '';
+    
+    logger.info(
+      `${pnlEmoji} TRADER EXIT ${tierTag}: ${fill.address.slice(0, 10)}... ` +
+      `closed ${fill.size.toFixed(2)} ${fill.coin} ${exitDirection.toUpperCase()} ` +
+      `@ $${fill.price.toFixed(4)} | PnL: ${fill.closedPnl >= 0 ? '+' : ''}$${fill.closedPnl.toFixed(2)}`
+    );
+
+    // Check if we should close the signal (majority of traders exited)
+    await checkSignalForClose(signal.id);
+
+  } catch (error) {
+    // Don't log errors for normal cases
+  }
+}
+
+/**
+ * Check if a signal should be closed due to traders exiting
+ */
+async function checkSignalForClose(signalId: number): Promise<void> {
+  try {
+    // Get signal details
+    const { data: signal } = await db.client
+      .from('quality_signals')
+      .select('coin, direction, elite_count, good_count, total_traders')
+      .eq('id', signalId)
+      .single();
+
+    if (!signal) return;
+
+    // Count exits for this signal
+    const { count: exitCount } = await db.client
+      .from('signal_trader_exits')
+      .select('id', { count: 'exact' })
+      .eq('signal_id', signalId);
+
+    const totalTraders = signal.elite_count + signal.good_count;
+    const exitRatio = (exitCount || 0) / totalTraders;
+
+    // If more than 50% of traders have exited, close the signal
+    if (exitRatio >= 0.5) {
+      logger.warn(
+        `⚠️ MAJORITY EXIT: ${signal.coin} ${signal.direction.toUpperCase()} | ` +
+        `${exitCount}/${totalTraders} traders exited (${(exitRatio * 100).toFixed(0)}%)`
+      );
+
+      // The signal will be closed by signal-tracker when it detects is_active = false
+      // We just invalidate it here
+      await db.client
+        .from('quality_signals')
+        .update({
+          invalidated: true,
+          invalidation_reason: `majority_exit_${exitCount}_of_${totalTraders}`,
+        })
+        .eq('id', signalId);
+    }
+  } catch (error) {
+    logger.error('checkSignalForClose failed', error);
+  }
 }
 
 // ============================================
@@ -111,8 +226,9 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
     return;
   }
 
+  const detectedAt = new Date();
   fillsReceived++;
-  lastFillTime = new Date();
+  lastFillTime = detectedAt;
 
   const realtimeFill: RealtimeFill = {
     address: address.toLowerCase(),
@@ -125,6 +241,7 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
     isLiquidation: fill.liquidation || false,
     fillTime: new Date(fill.time),
     txHash: fill.hash,
+    isExit: parseFloat(fill.closedPnl || '0') !== 0,
   };
 
   // Get trader quality tier
@@ -138,7 +255,7 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
     realtimeFill.qualityTier = trader.quality_tier;
   }
 
-  // Save to realtime_fills table
+  // Save to realtime_fills table with explicit detected_at
   try {
     await db.client.from('realtime_fills').upsert({
       address: realtimeFill.address,
@@ -151,6 +268,7 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
       is_liquidation: realtimeFill.isLiquidation,
       fill_time: realtimeFill.fillTime.toISOString(),
       tx_hash: realtimeFill.txHash,
+      detected_at: detectedAt.toISOString(),
       processed: false,
     }, { onConflict: 'tx_hash' });
   } catch (error) {
@@ -166,12 +284,18 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
     const pnlTag = realtimeFill.closedPnl !== 0 
       ? ` | PnL: ${realtimeFill.closedPnl >= 0 ? '+' : ''}$${realtimeFill.closedPnl.toFixed(0)}` 
       : '';
+    const exitTag = realtimeFill.isExit ? ' [EXIT]' : '';
     
     logger.info(
-      `${tierTag} FILL: ${address.slice(0, 8)}... ${realtimeFill.side.toUpperCase()} ` +
+      `${tierTag} FILL${exitTag}: ${address.slice(0, 8)}... ${realtimeFill.side.toUpperCase()} ` +
       `${realtimeFill.size.toFixed(2)} ${realtimeFill.coin} @ $${realtimeFill.price.toFixed(2)} ` +
       `($${value.toFixed(0)})${pnlTag}`
     );
+  }
+
+  // Process exit if this is a position close
+  if (realtimeFill.isExit && realtimeFill.qualityTier) {
+    await processTraderExit(realtimeFill);
   }
 
   // Call registered handlers
@@ -341,7 +465,7 @@ function connect(): void {
 // ============================================
 
 export function startWebSocketStream(): void {
-  logger.info('Starting WebSocket stream for quality traders...');
+  logger.info('Starting WebSocket stream V4 with exit detection...');
   connect();
   
   // Refresh subscriptions every 5 minutes

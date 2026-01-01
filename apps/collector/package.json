@@ -10,7 +10,8 @@
     "dev": "tsx watch src/index.ts",
     "sync-holders": "tsx src/scripts/sync-hype-holders.ts",
     "analyze": "tsx src/scripts/analyze-traders.ts",
-    "setup": "npm run sync-holders && npm run analyze"
+    "setup": "npm run sync-holders && npm run analyze",
+    "backtest": "tsx src/scripts/backtest-signals.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

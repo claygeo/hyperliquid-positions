@@ -1,5 +1,6 @@
 // Configuration for Quality Trader System V4
 // Enhanced with WebSocket, conviction scoring, volatility stops, and funding context
+// Updated with ROI-based quality thresholds
 
 export const config = {
   // Supabase connection
@@ -27,17 +28,44 @@ export const config = {
   },
 
   // ============================================
-  // QUALITY TIER THRESHOLDS
+  // QUALITY TIER THRESHOLDS (ROI-based)
   // ============================================
+  // Uses OR logic: qualifies if ROI% > threshold OR absolute PnL > alt threshold
+  // This catches both small account killers AND profitable whales
   quality: {
     elite: {
+      // ROI-based (primary) - catches small accounts with huge % returns
+      minRoi7dPct: 15,          // 15% weekly return
+      // Absolute PnL (alternative) - catches whales with lower % but big $ 
+      minPnl7dAlt: 50000,       // $50k absolute profit
+      // Other requirements
+      minWinRate: 0.40,         // 40% - accepts trend followers who win big
+      minTrades: 15,            // Enough sample size
+      minProfitFactor: 2.0,     // Strong edge requirement
+      // Data quality
+      minAccountValue: 1000,    // Filter out stale/withdrawn accounts
+    },
+    good: {
+      // ROI-based (primary)
+      minRoi7dPct: 5,           // 5% weekly return
+      // Absolute PnL (alternative)
+      minPnl7dAlt: 10000,       // $10k absolute profit
+      // Other requirements
+      minWinRate: 0.35,         // 35% - very accepting of different styles
+      minTrades: 8,             // Moderate sample size
+      minProfitFactor: 1.5,     // Must show positive edge
+      // Data quality
+      minAccountValue: 500,     // Filter out dust accounts
+    },
+    // Legacy thresholds (kept for reference, not used)
+    legacyElite: {
       minPnl7d: 25000,
       minPnl30d: 25000,
       minWinRate: 0.50,
       minTrades: 15,
       minProfitFactor: 1.5,
     },
-    good: {
+    legacyGood: {
       minPnl7d: 5000,
       minPnl30d: 5000,
       minWinRate: 0.48,
@@ -67,7 +95,7 @@ export const config = {
 
     // Minimum combined metrics
     minCombinedPnl7d: 10000,
-    minAvgWinRate: 0.50,
+    minAvgWinRate: 0.45,        // Lowered to match new thresholds
     minAvgProfitFactor: 1.3,
 
     // Signal expiry
@@ -90,7 +118,7 @@ export const config = {
     minStopPct: 1,
     maxStopPct: 10,
     
-    // Update interval (ms) - every 2 hours
+    // Update interval (ms) - every 4 hours
     updateIntervalMs: 4 * 60 * 60 * 1000,
   },
 
@@ -160,14 +188,16 @@ export const config = {
     fullReevalIntervalHours: 168,
     
     demoteEliteIf: {
-      pnl7dBelow: 0,
-      winRateBelow: 0.45,
+      pnl7dBelow: -5000,        // Allow small drawdowns
+      roi7dBelow: -10,          // -10% weekly
+      winRateBelow: 0.35,
       profitFactorBelow: 1.0,
     },
     
     demoteGoodIf: {
-      pnl7dBelow: -5000,
-      winRateBelow: 0.40,
+      pnl7dBelow: -10000,
+      roi7dBelow: -15,          // -15% weekly
+      winRateBelow: 0.30,
     },
     
     keepHistoryDays: 90,
@@ -190,7 +220,7 @@ export const config = {
   },
 
   // ============================================
-  // RATE LIMITING - FIXED FOR 429 ERRORS
+  // RATE LIMITING
   // ============================================
   rateLimit: {
     requestsPerSecond: 2,

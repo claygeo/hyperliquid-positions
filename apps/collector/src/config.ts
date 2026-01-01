@@ -90,8 +90,8 @@ export const config = {
     minStopPct: 1,
     maxStopPct: 10,
     
-    // Update interval (ms)
-    updateIntervalMs: 2 * 60 * 60 * 1000, // 2 hours
+    // Update interval (ms) - every 2 hours
+    updateIntervalMs: 2 * 60 * 60 * 1000,
   },
 
   // ============================================
@@ -113,43 +113,31 @@ export const config = {
   // ============================================
   funding: {
     // Threshold for favorable/unfavorable (per 8h)
-    favorableThreshold: -0.0001, // -0.01% = you get paid
-    unfavorableThreshold: 0.0001, // +0.01% = you pay
+    favorableThreshold: -0.0001,
+    unfavorableThreshold: 0.0001,
     
     // Update intervals
-    snapshotIntervalMs: 30 * 60 * 1000, // 30 minutes
-    traderExposureIntervalMs: 4 * 60 * 60 * 1000, // 4 hours
+    snapshotIntervalMs: 30 * 60 * 1000,
+    traderExposureIntervalMs: 4 * 60 * 60 * 1000,
   },
 
   // ============================================
   // V4: WEBSOCKET STREAMING
   // ============================================
   websocket: {
-    // Enable/disable WebSocket streaming
     enabled: true,
-    
-    // Reconnect delay
     reconnectDelayMs: 5000,
-    
-    // Heartbeat interval
     heartbeatIntervalMs: 30000,
-    
-    // Refresh subscriptions interval
-    refreshSubscriptionsMs: 5 * 60 * 1000, // 5 minutes
+    refreshSubscriptionsMs: 5 * 60 * 1000,
   },
 
   // ============================================
   // V4: URGENT RE-EVALUATION
   // ============================================
   urgentReeval: {
-    // Drawdown thresholds
-    severeDrawdownPct: -15, // Trigger immediate reeval
-    eliteDrawdownPct: -10, // Elite-specific threshold
-    
-    // Process queue interval
-    processIntervalMs: 2 * 60 * 1000, // 2 minutes
-    
-    // Max items to process per cycle
+    severeDrawdownPct: -15,
+    eliteDrawdownPct: -10,
+    processIntervalMs: 2 * 60 * 1000,
     maxPerCycle: 5,
   },
 
@@ -169,7 +157,7 @@ export const config = {
   // TRADER RE-EVALUATION
   // ============================================
   reeval: {
-    fullReevalIntervalHours: 168, // Weekly
+    fullReevalIntervalHours: 168,
     
     demoteEliteIf: {
       pnl7dBelow: 0,
@@ -201,10 +189,14 @@ export const config = {
     reanalyzeWeakHours: 24,
   },
 
-  // Rate limiting
+  // ============================================
+  // RATE LIMITING - FIXED FOR 429 ERRORS
+  // ============================================
   rateLimit: {
-    requestsPerSecond: 10,
-    delayBetweenRequests: 100,
+    requestsPerSecond: 2,
+    delayBetweenRequests: 500,
+    maxRetries: 3,
+    retryDelayMs: 1000,
   },
 };
 

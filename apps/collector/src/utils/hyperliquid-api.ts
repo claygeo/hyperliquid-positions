@@ -1,5 +1,5 @@
 // Hyperliquid API V4 - Comprehensive API Client
-// All endpoints in one place with proper typing
+// All endpoints in one place with proper typing and retry logic
 
 import { createLogger } from './logger.js';
 
@@ -13,7 +13,7 @@ const API_URL = 'https://api.hyperliquid.xyz/info';
 
 export interface Position {
   coin: string;
-  szi: string; // Signed size (negative = short)
+  szi: string;
   entryPx: string;
   positionValue: string;
   unrealizedPnl: string;
@@ -37,7 +37,7 @@ export interface ClearinghouseState {
 
 export interface OpenOrder {
   coin: string;
-  side: 'B' | 'A'; // B = buy, A = ask/sell
+  side: 'B' | 'A';
   limitPx: string;
   sz: string;
   oid: number;
@@ -103,13 +103,13 @@ export interface AssetContext {
 }
 
 export interface Candle {
-  t: number; // timestamp
-  o: string; // open
-  h: string; // high
-  l: string; // low
-  c: string; // close
-  v: string; // volume
-  n: number; // number of trades
+  t: number;
+  o: string;
+  h: string;
+  l: string;
+  c: string;
+  v: string;
+  n: number;
 }
 
 export interface L2Book {
@@ -124,7 +124,6 @@ export interface UserNonFundingLedgerUpdate {
   delta: {
     type: string;
     usdc: string;
-    // liquidation specific
     coin?: string;
     szi?: string;
     px?: string;
@@ -132,36 +131,45 @@ export interface UserNonFundingLedgerUpdate {
 }
 
 // ============================================
-// Core API Functions
+// Core API Functions with Retry Logic
 // ============================================
 
-async function apiCall<T>(body: object): Promise<T | null> {
-  try {
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+async function apiCall<T>(body: object, maxRetries = 3): Promise<T | null> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
 
-    if (!response.ok) {
-      logger.error(`API error: ${response.status} ${response.statusText}`);
-      return null;
+      if (response.status === 429) {
+        const delay = Math.pow(2, attempt) * 1000;
+        logger.warn(`Rate limited (attempt ${attempt + 1}/${maxRetries}), waiting ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      if (!response.ok) {
+        logger.error(`API error: ${response.status} ${response.statusText}`);
+        return null;
+      }
+
+      return await response.json() as T;
+    } catch (error) {
+      logger.error(`API call failed (attempt ${attempt + 1}/${maxRetries})`, error);
+      if (attempt < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
-
-    return await response.json() as T;
-  } catch (error) {
-    logger.error('API call failed', error);
-    return null;
   }
+  return null;
 }
 
 // ============================================
 // User Data Endpoints
 // ============================================
 
-/**
- * Get user's clearinghouse state (positions + account info)
- */
 export async function getClearinghouseState(address: string): Promise<ClearinghouseState | null> {
   return apiCall<ClearinghouseState>({
     type: 'clearinghouseState',
@@ -169,9 +177,6 @@ export async function getClearinghouseState(address: string): Promise<Clearingho
   });
 }
 
-/**
- * Get user's open orders
- */
 export async function getOpenOrders(address: string): Promise<OpenOrder[]> {
   const result = await apiCall<OpenOrder[]>({
     type: 'openOrders',
@@ -180,9 +185,6 @@ export async function getOpenOrders(address: string): Promise<OpenOrder[]> {
   return result || [];
 }
 
-/**
- * Get user's recent fills (trades)
- */
 export async function getUserFills(
   address: string,
   startTime?: number
@@ -197,9 +199,6 @@ export async function getUserFills(
   return result || [];
 }
 
-/**
- * Get user's funding payments
- */
 export async function getUserFunding(
   address: string,
   startTime?: number,
@@ -216,9 +215,6 @@ export async function getUserFunding(
   return result || [];
 }
 
-/**
- * Get user's non-funding ledger updates (deposits, withdrawals, liquidations)
- */
 export async function getUserLedgerUpdates(
   address: string,
   startTime?: number
@@ -237,41 +233,25 @@ export async function getUserLedgerUpdates(
 // Market Data Endpoints
 // ============================================
 
-/**
- * Get all mid prices
- */
 export async function getAllMids(): Promise<Record<string, string>> {
   const result = await apiCall<Record<string, string>>({ type: 'allMids' });
   return result || {};
 }
 
-/**
- * Get single mid price
- */
 export async function getMidPrice(coin: string): Promise<number | null> {
   const mids = await getAllMids();
   return mids[coin] ? parseFloat(mids[coin]) : null;
 }
 
-/**
- * Get market metadata
- */
 export async function getMeta(): Promise<Meta | null> {
   return apiCall<Meta>({ type: 'meta' });
 }
 
-/**
- * Get asset contexts (funding, OI, etc.)
- */
 export async function getAssetContexts(): Promise<AssetContext[]> {
-  // Returns [meta, contexts] tuple
   const result = await apiCall<[Meta, AssetContext[]]>({ type: 'metaAndAssetCtxs' });
   return result ? result[1] : [];
 }
 
-/**
- * Get funding history for a coin
- */
 export async function getFundingHistory(
   coin: string,
   startTime: number,
@@ -288,12 +268,9 @@ export async function getFundingHistory(
   return result || [];
 }
 
-/**
- * Get candlestick data
- */
 export async function getCandles(
   coin: string,
-  interval: string, // '1m', '5m', '15m', '1h', '4h', '1d'
+  interval: string,
   startTime: number,
   endTime?: number
 ): Promise<Candle[]> {
@@ -311,9 +288,6 @@ export async function getCandles(
   return result || [];
 }
 
-/**
- * Get L2 order book
- */
 export async function getL2Book(coin: string, nSigFigs?: number): Promise<L2Book | null> {
   return apiCall<L2Book>({
     type: 'l2Book',
@@ -326,15 +300,12 @@ export async function getL2Book(coin: string, nSigFigs?: number): Promise<L2Book
 // Derived/Calculated Functions
 // ============================================
 
-/**
- * Calculate ATR (Average True Range) from candles
- */
 export async function calculateATR(
   coin: string,
   period: number = 14
 ): Promise<{ atr: number; atrPct: number } | null> {
   const endTime = Date.now();
-  const startTime = endTime - (period + 5) * 24 * 60 * 60 * 1000; // Extra days for buffer
+  const startTime = endTime - (period + 5) * 24 * 60 * 60 * 1000;
   
   const candles = await getCandles(coin, '1d', startTime, endTime);
   
@@ -343,7 +314,6 @@ export async function calculateATR(
     return null;
   }
 
-  // Calculate True Range for each candle
   const trueRanges: number[] = [];
   
   for (let i = 1; i < candles.length; i++) {
@@ -360,20 +330,15 @@ export async function calculateATR(
     trueRanges.push(tr);
   }
 
-  // Calculate ATR (simple moving average of TR)
   const recentTRs = trueRanges.slice(-period);
   const atr = recentTRs.reduce((sum, tr) => sum + tr, 0) / period;
   
-  // Get current price for percentage
   const currentPrice = parseFloat(candles[candles.length - 1].c);
   const atrPct = (atr / currentPrice) * 100;
 
   return { atr, atrPct };
 }
 
-/**
- * Get comprehensive position data with open orders
- */
 export async function getFullPositionData(address: string): Promise<{
   positions: Position[];
   openOrders: OpenOrder[];
@@ -399,9 +364,6 @@ export async function getFullPositionData(address: string): Promise<{
   };
 }
 
-/**
- * Get current funding rates for all assets
- */
 export async function getCurrentFundingRates(): Promise<Map<string, {
   fundingRate: number;
   premium: number;
@@ -424,7 +386,6 @@ export async function getCurrentFundingRates(): Promise<Map<string, {
         fundingRate: parseFloat(ctx.funding),
         premium: parseFloat(ctx.premium),
         openInterest: parseFloat(ctx.openInterest),
-        // Funding happens every 8 hours
         nextFundingTime: new Date(Math.ceil(Date.now() / (8 * 60 * 60 * 1000)) * 8 * 60 * 60 * 1000),
       });
     }
@@ -433,9 +394,6 @@ export async function getCurrentFundingRates(): Promise<Map<string, {
   return rates;
 }
 
-/**
- * Calculate net funding for a user over a period
- */
 export async function calculateNetFunding(
   address: string,
   days: number
@@ -468,9 +426,6 @@ export async function calculateNetFunding(
   };
 }
 
-/**
- * Check if user was liquidated recently
- */
 export async function checkRecentLiquidations(
   address: string,
   hours: number = 24
@@ -486,9 +441,6 @@ export async function checkRecentLiquidations(
   };
 }
 
-/**
- * Get best bid/ask from order book
- */
 export async function getBestPrices(coin: string): Promise<{
   bestBid: number;
   bestAsk: number;
@@ -514,15 +466,12 @@ export async function getBestPrices(coin: string): Promise<{
 }
 
 export default {
-  // User data
   getClearinghouseState,
   getOpenOrders,
   getUserFills,
   getUserFunding,
   getUserLedgerUpdates,
   getFullPositionData,
-  
-  // Market data
   getAllMids,
   getMidPrice,
   getMeta,
@@ -532,8 +481,6 @@ export default {
   getL2Book,
   getCurrentFundingRates,
   getBestPrices,
-  
-  // Calculated
   calculateATR,
   calculateNetFunding,
   checkRecentLiquidations,

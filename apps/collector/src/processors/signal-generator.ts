@@ -1,7 +1,7 @@
 // Signal Generator V4
 // Enhanced with:
-// - Position conviction scoring (how much of their account is in this trade)
-// - Volatility-adjusted stop losses (ATR-based)
+// - Position conviction scoring (capped at 100%)
+// - Volatility-adjusted stop losses (uses cached ATR data)
 // - Funding rate context (favorable/unfavorable)
 // - Pending order awareness
 // - Real-time fill integration
@@ -11,7 +11,6 @@ import db from '../db/client.js';
 import { config } from '../config.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 import { getSignalFundingContext } from './funding-tracker.js';
-import { calculateVolatilityAdjustedStop, getVolatility } from './volatility-tracker.js';
 
 const logger = createLogger('signal-generator-v4');
 
@@ -54,61 +53,41 @@ interface TraderWithPosition {
   position_value: number;
   leverage: number;
   liquidation_price: number | null;
-  conviction_pct: number; // V4: position size relative to account
-  has_stop_order: boolean; // V4: trader has a stop set
+  conviction_pct: number;
+  has_stop_order: boolean;
 }
 
 interface SignalCandidate {
   coin: string;
   direction: 'long' | 'short';
-  
-  // Trader breakdown
   eliteTraders: TraderWithPosition[];
   goodTraders: TraderWithPosition[];
   opposingTraders: number;
-  
-  // Directional agreement
   directionalAgreement: number;
-  
-  // Combined metrics
   combinedPnl7d: number;
   combinedPnl30d: number;
   avgWinRate: number;
   avgProfitFactor: number;
   totalPositionValue: number;
-  
-  // V4: Conviction scoring
   avgConvictionPct: number;
   maxConvictionPct: number;
   tradersWithStops: number;
-  
-  // Entry/Exit levels
   suggestedEntry: number;
   entryRangeLow: number;
   entryRangeHigh: number;
-  
-  // V4: Volatility-adjusted stop
   stopLoss: number;
   stopDistancePct: number;
   volatilityAdjustedStop: number;
   atrMultiple: number;
   volatilityRank: number;
-  
-  // Take profits
   takeProfit1: number;
   takeProfit2: number;
   takeProfit3: number;
-  
-  // V4: Funding context
   fundingContext: 'favorable' | 'neutral' | 'unfavorable';
   currentFundingRate: number;
-  
-  // Risk metrics
   avgLeverage: number;
   suggestedLeverage: number;
   riskScore: number;
-  
-  // Confidence
   confidence: number;
   signalStrength: 'strong' | 'medium';
 }
@@ -136,7 +115,7 @@ function calculateDirectionalAgreement(
 }
 
 /**
- * V4: Enhanced stop loss calculation using volatility
+ * V4: Enhanced stop loss using CACHED volatility data (no API calls)
  */
 async function calculateEnhancedStopLoss(
   coin: string,
@@ -150,53 +129,58 @@ async function calculateEnhancedStopLoss(
   atrMultiple: number;
   volatilityRank: number;
 }> {
-  // Get volatility-based stop
-  const volStop = await calculateVolatilityAdjustedStop(
-    coin,
-    direction,
-    currentPrice,
-    1.5 // 1.5x ATR
-  );
+  // Use cached volatility only - NO API calls here
+  const { data: volData } = await db.client
+    .from('coin_volatility')
+    .select('*')
+    .eq('coin', coin)
+    .single();
 
-  // Also consider liquidation prices as a backstop
+  let stopDistancePct = 3; // Default 3%
+  let volatilityRank = 50;
+  
+  if (volData && volData.atr_14d && volData.last_price) {
+    const atrPct = (parseFloat(volData.atr_14d) / parseFloat(volData.last_price)) * 100;
+    stopDistancePct = Math.max(
+      config.volatility.minStopPct, 
+      Math.min(config.volatility.maxStopPct, atrPct * config.volatility.defaultAtrMultiple)
+    );
+    volatilityRank = volData.volatility_rank || 50;
+  }
+
+  // Consider liquidation prices as backstop
   const liqPrices = traders
     .map(t => t.liquidation_price)
     .filter((p): p is number => p !== null && p > 0);
 
-  let liquidationBasedStop = volStop.stopLoss;
+  let stopLoss: number;
   
-  if (liqPrices.length > 0) {
-    if (direction === 'long') {
-      const highestLiq = Math.max(...liqPrices);
-      liquidationBasedStop = highestLiq * 1.15; // 15% buffer above liq
-    } else {
-      const lowestLiq = Math.min(...liqPrices);
-      liquidationBasedStop = lowestLiq * 0.85; // 15% buffer below liq
-    }
-  }
-
-  // Use the tighter stop (closer to current price but not too tight)
-  let finalStop: number;
   if (direction === 'long') {
-    // For longs, take the higher (more protective) stop
-    finalStop = Math.max(volStop.stopLoss, liquidationBasedStop);
-    // But ensure it's at least 1% away
-    finalStop = Math.min(finalStop, currentPrice * 0.99);
+    stopLoss = currentPrice * (1 - stopDistancePct / 100);
+    if (liqPrices.length > 0) {
+      const liqBasedStop = Math.max(...liqPrices) * 1.15;
+      stopLoss = Math.max(stopLoss, liqBasedStop);
+    }
+    // Ensure at least 1% away
+    stopLoss = Math.min(stopLoss, currentPrice * 0.99);
   } else {
-    // For shorts, take the lower (more protective) stop
-    finalStop = Math.min(volStop.stopLoss, liquidationBasedStop);
-    // But ensure it's at least 1% away
-    finalStop = Math.max(finalStop, currentPrice * 1.01);
+    stopLoss = currentPrice * (1 + stopDistancePct / 100);
+    if (liqPrices.length > 0) {
+      const liqBasedStop = Math.min(...liqPrices) * 0.85;
+      stopLoss = Math.min(stopLoss, liqBasedStop);
+    }
+    // Ensure at least 1% away
+    stopLoss = Math.max(stopLoss, currentPrice * 1.01);
   }
 
-  const finalStopDistancePct = Math.abs(finalStop - currentPrice) / currentPrice * 100;
+  const finalStopDistancePct = Math.abs(stopLoss - currentPrice) / currentPrice * 100;
 
   return {
-    stopLoss: finalStop,
+    stopLoss,
     stopDistancePct: finalStopDistancePct,
-    volatilityAdjustedStop: volStop.stopLoss,
-    atrMultiple: 1.5,
-    volatilityRank: volStop.volatilityRank,
+    volatilityAdjustedStop: stopLoss,
+    atrMultiple: config.volatility.defaultAtrMultiple,
+    volatilityRank,
   };
 }
 
@@ -227,7 +211,7 @@ function calculateSuggestedLeverage(
   stopDistancePct: number
 ): number {
   const avgLeverage = traders.reduce((sum, t) => sum + t.leverage, 0) / traders.length;
-  const maxRiskPct = 0.02; // 2% account risk
+  const maxRiskPct = 0.02;
   const safeLeverage = (maxRiskPct * 100) / stopDistancePct;
   
   return Math.min(
@@ -236,9 +220,6 @@ function calculateSuggestedLeverage(
   );
 }
 
-/**
- * V4: Enhanced confidence calculation with conviction
- */
 function calculateConfidence(
   eliteCount: number,
   goodCount: number,
@@ -292,10 +273,9 @@ function calculateConfidence(
   // V4: Funding context (0-5)
   if (fundingContext === 'favorable') confidence += 5;
   else if (fundingContext === 'neutral') confidence += 2;
-  // Unfavorable: no bonus
 
   // V4: Traders with stop orders (0-5)
-  const stopRatio = tradersWithStops / totalTraders;
+  const stopRatio = totalTraders > 0 ? tradersWithStops / totalTraders : 0;
   if (stopRatio >= 0.5) confidence += 5;
   else if (stopRatio >= 0.25) confidence += 2;
 
@@ -311,33 +291,27 @@ function calculateRiskScore(
   volatilityRank: number,
   fundingContext: string
 ): number {
-  let risk = 50; // Start at medium
+  let risk = 50;
 
-  // Lower risk with more elite traders
   risk -= eliteCount * 5;
 
-  // Higher agreement = lower risk
   if (agreement >= 0.9) risk -= 15;
   else if (agreement >= 0.8) risk -= 10;
   else if (agreement >= 0.7) risk -= 5;
 
-  // Better metrics = lower risk
   if (avgProfitFactor >= 2.0) risk -= 10;
   else if (avgProfitFactor >= 1.5) risk -= 5;
 
   if (avgWinRate >= 0.6) risk -= 10;
   else if (avgWinRate >= 0.55) risk -= 5;
 
-  // Wider stops = higher risk (more room to lose)
   if (stopDistancePct > 5) risk += 10;
   else if (stopDistancePct > 3) risk += 5;
 
-  // V4: High volatility = higher risk
   if (volatilityRank >= 80) risk += 15;
   else if (volatilityRank >= 60) risk += 10;
   else if (volatilityRank >= 40) risk += 5;
 
-  // V4: Unfavorable funding = higher risk
   if (fundingContext === 'unfavorable') risk += 10;
 
   return Math.max(0, Math.min(100, risk));
@@ -348,7 +322,6 @@ function meetsSignalRequirements(candidate: SignalCandidate): boolean {
   const eliteCount = candidate.eliteTraders.length;
   const goodCount = candidate.goodTraders.length;
 
-  // Check minimum trader requirements
   const hasMinElite = eliteCount >= signals.minEliteForSignal;
   const hasMinGood = goodCount >= signals.minGoodForSignal;
   const hasMinMixed = eliteCount >= signals.minMixedForSignal.elite && 
@@ -358,12 +331,10 @@ function meetsSignalRequirements(candidate: SignalCandidate): boolean {
     return false;
   }
 
-  // Check directional agreement
   if (candidate.directionalAgreement < signals.minDirectionalAgreement) {
     return false;
   }
 
-  // Check combined metrics
   if (candidate.combinedPnl7d < signals.minCombinedPnl7d) {
     return false;
   }
@@ -396,7 +367,6 @@ function determineSignalStrength(eliteCount: number, goodCount: number): 'strong
 
 export async function generateSignals(): Promise<void> {
   try {
-    // Get all positions from tracked traders
     const { data: positions, error: posError } = await db.client
       .from('trader_positions')
       .select('*');
@@ -406,7 +376,6 @@ export async function generateSignals(): Promise<void> {
       return;
     }
 
-    // Get trader quality data
     const { data: traders, error: traderError } = await db.client
       .from('trader_quality')
       .select('address, quality_tier, pnl_7d, pnl_30d, win_rate, profit_factor, account_value')
@@ -423,7 +392,6 @@ export async function generateSignals(): Promise<void> {
       traderMap.set(t.address, t as TraderQuality);
     }
 
-    // Group positions by coin
     const positionsByCoin = new Map<string, TraderPosition[]>();
     for (const pos of positions) {
       const existing = positionsByCoin.get(pos.coin) || [];
@@ -433,13 +401,10 @@ export async function generateSignals(): Promise<void> {
 
     const validSignals: unknown[] = [];
 
-    // Process each coin
     for (const [coin, coinPositions] of positionsByCoin) {
-      // Separate by direction
       const longs = coinPositions.filter(p => p.direction === 'long');
       const shorts = coinPositions.filter(p => p.direction === 'short');
 
-      // Filter to quality traders only
       const longQuality = longs.filter(p => {
         const t = traderMap.get(p.address);
         return t && (t.quality_tier === 'elite' || t.quality_tier === 'good');
@@ -449,7 +414,6 @@ export async function generateSignals(): Promise<void> {
         return t && (t.quality_tier === 'elite' || t.quality_tier === 'good');
       });
 
-      // Calculate directional agreement
       const { direction, agreement } = calculateDirectionalAgreement(
         longQuality.length,
         shortQuality.length
@@ -459,11 +423,9 @@ export async function generateSignals(): Promise<void> {
         continue;
       }
 
-      // Get dominant side
       const dominantPositions = direction === 'long' ? longQuality : shortQuality;
       const opposingCount = direction === 'long' ? shortQuality.length : longQuality.length;
 
-      // Build trader lists with conviction
       const eliteTraders: TraderWithPosition[] = [];
       const goodTraders: TraderWithPosition[] = [];
 
@@ -471,10 +433,11 @@ export async function generateSignals(): Promise<void> {
         const trader = traderMap.get(pos.address);
         if (!trader) continue;
 
-        // Calculate conviction
-        const convictionPct = trader.account_value > 0
+        // FIX: Cap conviction at 100%
+        const rawConviction = trader.account_value > 0
           ? (pos.value_usd / trader.account_value) * 100
           : 0;
+        const convictionPct = Math.min(100, rawConviction);
 
         const traderWithPos: TraderWithPosition = {
           address: pos.address,
@@ -501,7 +464,6 @@ export async function generateSignals(): Promise<void> {
       const allTraders = [...eliteTraders, ...goodTraders];
       if (allTraders.length === 0) continue;
 
-      // Calculate metrics
       const combinedPnl7d = allTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
       const combinedPnl30d = allTraders.reduce((sum, t) => sum + t.pnl_30d, 0);
       const avgWinRate = allTraders.reduce((sum, t) => sum + t.win_rate, 0) / allTraders.length;
@@ -509,34 +471,29 @@ export async function generateSignals(): Promise<void> {
       const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
       const avgLeverage = allTraders.reduce((sum, t) => sum + t.leverage, 0) / allTraders.length;
 
-      // V4: Conviction metrics
+      // V4: Conviction metrics (already capped at 100%)
       const avgConvictionPct = allTraders.reduce((sum, t) => sum + t.conviction_pct, 0) / allTraders.length;
       const maxConvictionPct = Math.max(...allTraders.map(t => t.conviction_pct));
       const tradersWithStops = allTraders.filter(t => t.has_stop_order).length;
 
-      // Get current price
       const currentPrice = await getCurrentPrice(coin);
       if (!currentPrice) continue;
 
-      // Entry range
       const entryPrices = allTraders.map(t => t.entry_price).filter(p => p > 0);
       const suggestedEntry = currentPrice;
       const entryRangeLow = entryPrices.length > 0 ? Math.min(...entryPrices) : currentPrice * 0.99;
       const entryRangeHigh = entryPrices.length > 0 ? Math.max(...entryPrices) : currentPrice * 1.01;
 
-      // V4: Enhanced stop loss with volatility
+      // V4: Enhanced stop loss using CACHED volatility (no API calls)
       const stopData = await calculateEnhancedStopLoss(coin, direction, allTraders, currentPrice);
 
-      // Take profits
       const { tp1, tp2, tp3 } = calculateTakeProfits(direction, suggestedEntry, stopData.stopLoss);
 
-      // Suggested leverage
       const suggestedLeverage = calculateSuggestedLeverage(allTraders, stopData.stopDistancePct);
 
       // V4: Get funding context
       const fundingData = await getSignalFundingContext(coin, direction);
 
-      // Build candidate
       const candidate: SignalCandidate = {
         coin,
         direction,
@@ -572,12 +529,10 @@ export async function generateSignals(): Promise<void> {
         signalStrength: 'medium',
       };
 
-      // Check requirements
       if (!meetsSignalRequirements(candidate)) {
         continue;
       }
 
-      // Calculate risk score
       candidate.riskScore = calculateRiskScore(
         agreement,
         avgProfitFactor,
@@ -588,7 +543,6 @@ export async function generateSignals(): Promise<void> {
         fundingData.context
       );
 
-      // Calculate confidence
       candidate.confidence = calculateConfidence(
         eliteTraders.length,
         goodTraders.length,
@@ -602,10 +556,8 @@ export async function generateSignals(): Promise<void> {
         allTraders.length
       );
 
-      // Determine strength
       candidate.signalStrength = determineSignalStrength(eliteTraders.length, goodTraders.length);
 
-      // Prepare for database
       const signalData = {
         coin,
         direction,
@@ -635,7 +587,6 @@ export async function generateSignals(): Promise<void> {
         take_profit_3: tp3,
         suggested_leverage: suggestedLeverage,
         risk_score: candidate.riskScore,
-        // V4 fields
         avg_conviction_pct: avgConvictionPct,
         funding_context: fundingData.context,
         current_funding_rate: fundingData.fundingRate,
@@ -647,7 +598,6 @@ export async function generateSignals(): Promise<void> {
 
       validSignals.push(signalData);
 
-      // Log signal
       const fundingTag = fundingData.context === 'favorable' ? '✅' : 
                         fundingData.context === 'unfavorable' ? '⚠️' : '';
       const convictionTag = avgConvictionPct >= 20 ? '💪' : '';
@@ -663,7 +613,6 @@ export async function generateSignals(): Promise<void> {
       );
     }
 
-    // Deactivate old signals
     const activeCoinDirections = new Set(validSignals.map((s: any) => `${s.coin}-${s.direction}`));
 
     const { data: existingSignals } = await db.client
@@ -687,7 +636,6 @@ export async function generateSignals(): Promise<void> {
       }
     }
 
-    // Upsert valid signals
     for (const signal of validSignals) {
       await db.client
         .from('quality_signals')

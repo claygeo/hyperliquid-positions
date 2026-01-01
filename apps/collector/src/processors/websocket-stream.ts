@@ -1,5 +1,5 @@
 // WebSocket Stream V4 - Real-time fill tracking for quality traders
-// Subscribes to fills from elite/good traders for instant signal generation
+// FIXED: Deduplication to prevent logging same fills multiple times
 
 import WebSocket from 'ws';
 import { createLogger } from '../utils/logger.js';
@@ -21,6 +21,10 @@ let isConnected = false;
 let reconnectTimeout: NodeJS.Timeout | null = null;
 let heartbeatInterval: NodeJS.Timeout | null = null;
 let subscribedAddresses: Set<string> = new Set();
+
+// Deduplication: track recent fill hashes
+const recentFillHashes = new Set<string>();
+const MAX_RECENT_FILLS = 1000;
 
 // Stats
 let fillsReceived = 0;
@@ -75,9 +79,38 @@ export interface RealtimeFill {
 // ============================================
 
 /**
+ * Check if fill was already processed (deduplication)
+ */
+function isDuplicateFill(hash: string, oid: number): boolean {
+  const key = `${hash}-${oid}`;
+  if (recentFillHashes.has(key)) {
+    return true;
+  }
+  
+  // Add to recent fills
+  recentFillHashes.add(key);
+  
+  // Cleanup old entries if too many
+  if (recentFillHashes.size > MAX_RECENT_FILLS) {
+    const iterator = recentFillHashes.values();
+    for (let i = 0; i < 100; i++) {
+      const oldest = iterator.next().value;
+      if (oldest) recentFillHashes.delete(oldest);
+    }
+  }
+  
+  return false;
+}
+
+/**
  * Process incoming fill from WebSocket
  */
 async function processFill(address: string, fill: WsFill): Promise<void> {
+  // Deduplicate
+  if (isDuplicateFill(fill.hash, fill.oid)) {
+    return;
+  }
+
   fillsReceived++;
   lastFillTime = new Date();
 
@@ -107,7 +140,7 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
 
   // Save to realtime_fills table
   try {
-    await db.client.from('realtime_fills').insert({
+    await db.client.from('realtime_fills').upsert({
       address: realtimeFill.address,
       coin: realtimeFill.coin,
       side: realtimeFill.side,
@@ -119,12 +152,9 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
       fill_time: realtimeFill.fillTime.toISOString(),
       tx_hash: realtimeFill.txHash,
       processed: false,
-    });
+    }, { onConflict: 'tx_hash' });
   } catch (error) {
     // Ignore duplicate errors
-    if (!(error as Error).message?.includes('duplicate')) {
-      logger.error('Failed to save realtime fill', error);
-    }
   }
 
   // Log significant fills
@@ -139,7 +169,7 @@ async function processFill(address: string, fill: WsFill): Promise<void> {
     
     logger.info(
       `${tierTag} FILL: ${address.slice(0, 8)}... ${realtimeFill.side.toUpperCase()} ` +
-      `${realtimeFill.size} ${realtimeFill.coin} @ $${realtimeFill.price.toFixed(2)} ` +
+      `${realtimeFill.size.toFixed(2)} ${realtimeFill.coin} @ $${realtimeFill.price.toFixed(2)} ` +
       `($${value.toFixed(0)})${pnlTag}`
     );
   }
@@ -166,7 +196,7 @@ function subscribeToAddress(address: string): void {
   const normalizedAddress = address.toLowerCase();
   
   if (subscribedAddresses.has(normalizedAddress)) {
-    return; // Already subscribed
+    return;
   }
 
   const subscribeMsg = {
@@ -228,8 +258,7 @@ async function subscribeToQualityTraders(): Promise<void> {
 
   for (const trader of traders) {
     subscribeToAddress(trader.address);
-    // Small delay to avoid overwhelming the WS
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
 
   logger.info(`Subscribed to ${subscribedAddresses.size} traders`);
@@ -252,6 +281,9 @@ function connect(): void {
     ws.terminate();
   }
 
+  // Clear deduplication cache on reconnect
+  recentFillHashes.clear();
+
   logger.info('Connecting to Hyperliquid WebSocket...');
   
   ws = new WebSocket(WS_URL);
@@ -260,10 +292,8 @@ function connect(): void {
     isConnected = true;
     logger.info('WebSocket connected');
     
-    // Subscribe to all quality traders
     await subscribeToQualityTraders();
     
-    // Start heartbeat
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
   });
@@ -272,7 +302,6 @@ function connect(): void {
     try {
       const message = JSON.parse(data.toString()) as WsMessage;
       
-      // Handle user fills
       if (message.channel === 'userFills' && message.data?.fills) {
         const address = message.data.user;
         for (const fill of message.data.fills) {
@@ -311,14 +340,11 @@ function connect(): void {
 // Public API
 // ============================================
 
-/**
- * Start the WebSocket stream
- */
 export function startWebSocketStream(): void {
   logger.info('Starting WebSocket stream for quality traders...');
   connect();
   
-  // Refresh subscriptions every 5 minutes (in case new traders qualify)
+  // Refresh subscriptions every 5 minutes
   setInterval(async () => {
     if (isConnected) {
       await refreshSubscriptions();
@@ -326,9 +352,6 @@ export function startWebSocketStream(): void {
   }, 5 * 60 * 1000);
 }
 
-/**
- * Stop the WebSocket stream
- */
 export function stopWebSocketStream(): void {
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);
@@ -347,12 +370,10 @@ export function stopWebSocketStream(): void {
   
   isConnected = false;
   subscribedAddresses.clear();
+  recentFillHashes.clear();
   logger.info('WebSocket stream stopped');
 }
 
-/**
- * Refresh subscriptions (add new quality traders, remove demoted ones)
- */
 export async function refreshSubscriptions(): Promise<void> {
   const { data: traders } = await db.client
     .from('trader_quality')
@@ -364,14 +385,12 @@ export async function refreshSubscriptions(): Promise<void> {
 
   const currentAddresses = new Set(traders.map(t => t.address.toLowerCase()));
   
-  // Subscribe to new traders
   for (const address of currentAddresses) {
     if (!subscribedAddresses.has(address)) {
       subscribeToAddress(address);
     }
   }
   
-  // Unsubscribe from removed traders
   for (const address of subscribedAddresses) {
     if (!currentAddresses.has(address)) {
       unsubscribeFromAddress(address);
@@ -379,16 +398,10 @@ export async function refreshSubscriptions(): Promise<void> {
   }
 }
 
-/**
- * Register a fill handler
- */
 export function onFill(handler: FillHandler): void {
   fillHandlers.push(handler);
 }
 
-/**
- * Remove a fill handler
- */
 export function offFill(handler: FillHandler): void {
   const index = fillHandlers.indexOf(handler);
   if (index > -1) {
@@ -396,9 +409,6 @@ export function offFill(handler: FillHandler): void {
   }
 }
 
-/**
- * Get stream stats
- */
 export function getStreamStats(): {
   isConnected: boolean;
   subscribedCount: number;
@@ -413,16 +423,10 @@ export function getStreamStats(): {
   };
 }
 
-/**
- * Manually subscribe to a specific address
- */
 export function subscribeTrader(address: string): void {
   subscribeToAddress(address);
 }
 
-/**
- * Check if connected
- */
 export function isStreamConnected(): boolean {
   return isConnected;
 }

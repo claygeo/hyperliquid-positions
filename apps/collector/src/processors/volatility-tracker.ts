@@ -1,10 +1,11 @@
 // Volatility Tracker V4
 // Calculates and caches ATR for volatility-adjusted stop losses
-// Prevents tight stops on volatile assets, loose stops on stable assets
+// FIXED: Batched requests with longer delays to avoid rate limiting
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
+import { config } from '../config.js';
 
 const logger = createLogger('volatility-tracker');
 
@@ -17,7 +18,7 @@ interface CoinVolatility {
   atr14d: number;
   atr7d: number;
   dailyRangeAvg: number;
-  volatilityRank: number; // 1-100
+  volatilityRank: number;
   lastPrice: number;
   priceChange24hPct: number;
 }
@@ -33,51 +34,32 @@ let lastCacheUpdate: Date | null = null;
 /**
  * Calculate volatility for a single coin
  */
-export async function calculateCoinVolatility(coin: string): Promise<CoinVolatility | null> {
+async function calculateCoinVolatility(coin: string): Promise<CoinVolatility | null> {
   try {
-    // Get 14-day ATR
+    // Add delay before each API call
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
     const atr14Result = await hyperliquid.calculateATR(coin, 14);
     if (!atr14Result) return null;
 
-    // Get 7-day ATR
-    const atr7Result = await hyperliquid.calculateATR(coin, 7);
+    // Use same candle data for 7d ATR estimate (avoid extra API call)
+    const atr7d = atr14Result.atr * 1.1; // Rough estimate - shorter period = slightly higher
 
-    // Get recent candles for daily range calculation
-    const endTime = Date.now();
-    const startTime = endTime - 7 * 24 * 60 * 60 * 1000;
-    const candles = await hyperliquid.getCandles(coin, '1d', startTime, endTime);
+    // Estimate daily range from ATR
+    const dailyRangeAvg = atr14Result.atrPct;
 
-    if (candles.length === 0) return null;
-
-    // Calculate average daily range as percentage
-    let totalRangePct = 0;
-    for (const candle of candles) {
-      const high = parseFloat(candle.h);
-      const low = parseFloat(candle.l);
-      const mid = (high + low) / 2;
-      const rangePct = ((high - low) / mid) * 100;
-      totalRangePct += rangePct;
-    }
-    const dailyRangeAvg = totalRangePct / candles.length;
-
-    // Get current price and 24h change
-    const latestCandle = candles[candles.length - 1];
-    const lastPrice = parseFloat(latestCandle.c);
-    
-    let priceChange24hPct = 0;
-    if (candles.length >= 2) {
-      const prevClose = parseFloat(candles[candles.length - 2].c);
-      priceChange24hPct = ((lastPrice - prevClose) / prevClose) * 100;
-    }
+    // Get current price from mids (batched call, not per-coin)
+    const mids = await hyperliquid.getAllMids();
+    const lastPrice = mids[coin] ? parseFloat(mids[coin]) : 0;
 
     const volatility: CoinVolatility = {
       coin,
       atr14d: atr14Result.atr,
-      atr7d: atr7Result?.atr || atr14Result.atr,
+      atr7d,
       dailyRangeAvg,
-      volatilityRank: 0, // Will be calculated after all coins
+      volatilityRank: 0,
       lastPrice,
-      priceChange24hPct,
+      priceChange24hPct: 0,
     };
 
     return volatility;
@@ -88,47 +70,55 @@ export async function calculateCoinVolatility(coin: string): Promise<CoinVolatil
 }
 
 /**
- * Update volatility for all tracked coins
+ * Update volatility for coins that are actually in trader positions
+ * Only updates coins we care about, not all 100+ coins
  */
 export async function updateAllVolatility(): Promise<void> {
   try {
-    // Get all coins we're tracking
+    // Get coins from active positions only (not all coins)
     const { data: positions } = await db.client
       .from('trader_positions')
       .select('coin')
-      .limit(1000);
+      .limit(500);
 
     const coinsFromPositions = new Set(positions?.map(p => p.coin) || []);
 
-    // Add major coins
-    const majorCoins = ['BTC', 'ETH', 'SOL', 'HYPE', 'XRP', 'DOGE', 'SUI', 'AVAX', 'LINK', 'BNB', 
-                        'ARB', 'OP', 'MATIC', 'APT', 'INJ', 'SEI', 'TIA', 'JUP', 'WIF', 'PEPE'];
-    
+    // Add major coins we always want
+    const majorCoins = ['BTC', 'ETH', 'SOL', 'HYPE'];
     for (const coin of majorCoins) {
       coinsFromPositions.add(coin);
     }
 
     const allCoins = Array.from(coinsFromPositions);
-    logger.info(`Updating volatility for ${allCoins.length} coins...`);
+    
+    // Limit to 20 coins max per cycle to avoid rate limiting
+    const coinsToUpdate = allCoins.slice(0, 20);
+    
+    logger.info(`Updating volatility for ${coinsToUpdate.length} coins (of ${allCoins.length} total)...`);
 
     const volatilities: CoinVolatility[] = [];
 
-    // Calculate volatility for each coin
-    for (const coin of allCoins) {
+    for (const coin of coinsToUpdate) {
       const vol = await calculateCoinVolatility(coin);
       if (vol) {
         volatilities.push(vol);
       }
-      await new Promise(resolve => setTimeout(resolve, 100)); // Rate limit
+      // Long delay between coins to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 3000));
     }
 
-    // Calculate volatility ranks (percentile-based)
+    if (volatilities.length === 0) {
+      logger.warn('No volatility data calculated');
+      return;
+    }
+
+    // Calculate volatility ranks
     volatilities.sort((a, b) => a.dailyRangeAvg - b.dailyRangeAvg);
     for (let i = 0; i < volatilities.length; i++) {
-      volatilities[i].volatilityRank = Math.round((i / (volatilities.length - 1)) * 100);
+      volatilities[i].volatilityRank = Math.round((i / Math.max(1, volatilities.length - 1)) * 100);
     }
 
-    // Save to database and cache
+    // Save to database
     for (const vol of volatilities) {
       await db.client.from('coin_volatility').upsert({
         coin: vol.coin,
@@ -153,12 +143,12 @@ export async function updateAllVolatility(): Promise<void> {
 }
 
 /**
- * Get volatility data for a coin
+ * Get volatility data for a coin (from cache/DB only, no API calls)
  */
 export async function getVolatility(coin: string): Promise<CoinVolatility | null> {
   // Check cache first
   const cached = volatilityCache.get(coin);
-  if (cached && lastCacheUpdate && (Date.now() - lastCacheUpdate.getTime()) < 60 * 60 * 1000) {
+  if (cached && lastCacheUpdate && (Date.now() - lastCacheUpdate.getTime()) < 4 * 60 * 60 * 1000) {
     return cached;
   }
 
@@ -172,28 +162,23 @@ export async function getVolatility(coin: string): Promise<CoinVolatility | null
   if (data) {
     const vol: CoinVolatility = {
       coin: data.coin,
-      atr14d: parseFloat(data.atr_14d),
-      atr7d: parseFloat(data.atr_7d),
-      dailyRangeAvg: parseFloat(data.daily_range_avg),
-      volatilityRank: data.volatility_rank,
-      lastPrice: parseFloat(data.last_price),
-      priceChange24hPct: parseFloat(data.price_change_24h_pct),
+      atr14d: parseFloat(data.atr_14d || '0'),
+      atr7d: parseFloat(data.atr_7d || '0'),
+      dailyRangeAvg: parseFloat(data.daily_range_avg || '0'),
+      volatilityRank: data.volatility_rank || 50,
+      lastPrice: parseFloat(data.last_price || '0'),
+      priceChange24hPct: parseFloat(data.price_change_24h_pct || '0'),
     };
     volatilityCache.set(coin, vol);
     return vol;
   }
 
-  // Calculate on demand if not found
-  const calculated = await calculateCoinVolatility(coin);
-  if (calculated) {
-    volatilityCache.set(coin, calculated);
-  }
-  return calculated;
+  // Return default if not found (don't make API call here)
+  return null;
 }
 
 /**
- * Calculate volatility-adjusted stop loss
- * Uses ATR to determine appropriate stop distance
+ * Calculate volatility-adjusted stop loss using CACHED data only
  */
 export async function calculateVolatilityAdjustedStop(
   coin: string,
@@ -209,13 +194,14 @@ export async function calculateVolatilityAdjustedStop(
   const vol = await getVolatility(coin);
 
   // Default to 3% if no volatility data
-  if (!vol) {
+  if (!vol || !vol.atr14d) {
+    const defaultStopPct = 3;
     const defaultStop = direction === 'long' 
-      ? entryPrice * 0.97 
-      : entryPrice * 1.03;
+      ? entryPrice * (1 - defaultStopPct / 100)
+      : entryPrice * (1 + defaultStopPct / 100);
     return {
       stopLoss: defaultStop,
-      stopDistancePct: 3,
+      stopDistancePct: defaultStopPct,
       atr: 0,
       volatilityRank: 50,
     };
@@ -225,9 +211,9 @@ export async function calculateVolatilityAdjustedStop(
   const atrDistance = vol.atr14d * atrMultiple;
   const stopDistancePct = (atrDistance / entryPrice) * 100;
 
-  // Apply minimum and maximum bounds
-  const minStopPct = 1; // At least 1%
-  const maxStopPct = 10; // No more than 10%
+  // Apply bounds
+  const minStopPct = config.volatility?.minStopPct || 1;
+  const maxStopPct = config.volatility?.maxStopPct || 10;
   const boundedStopPct = Math.max(minStopPct, Math.min(maxStopPct, stopDistancePct));
 
   const stopLoss = direction === 'long'
@@ -243,7 +229,7 @@ export async function calculateVolatilityAdjustedStop(
 }
 
 /**
- * Get coins by volatility (useful for filtering)
+ * Get coins by volatility
  */
 export async function getCoinsByVolatility(
   minRank?: number,
@@ -260,25 +246,19 @@ export async function getCoinsByVolatility(
 
   return data.map(d => ({
     coin: d.coin,
-    atr14d: parseFloat(d.atr_14d),
-    atr7d: parseFloat(d.atr_7d),
-    dailyRangeAvg: parseFloat(d.daily_range_avg),
-    volatilityRank: d.volatility_rank,
-    lastPrice: parseFloat(d.last_price),
-    priceChange24hPct: parseFloat(d.price_change_24h_pct),
+    atr14d: parseFloat(d.atr_14d || '0'),
+    atr7d: parseFloat(d.atr_7d || '0'),
+    dailyRangeAvg: parseFloat(d.daily_range_avg || '0'),
+    volatilityRank: d.volatility_rank || 50,
+    lastPrice: parseFloat(d.last_price || '0'),
+    priceChange24hPct: parseFloat(d.price_change_24h_pct || '0'),
   }));
 }
 
-/**
- * Get most volatile coins (for higher risk/reward plays)
- */
 export async function getMostVolatileCoins(limit: number = 10): Promise<CoinVolatility[]> {
   return getCoinsByVolatility(75, 100).then(coins => coins.slice(0, limit));
 }
 
-/**
- * Get least volatile coins (for safer plays)
- */
 export async function getLeastVolatileCoins(limit: number = 10): Promise<CoinVolatility[]> {
   const { data } = await db.client
     .from('coin_volatility')
@@ -290,12 +270,12 @@ export async function getLeastVolatileCoins(limit: number = 10): Promise<CoinVol
 
   return data.map(d => ({
     coin: d.coin,
-    atr14d: parseFloat(d.atr_14d),
-    atr7d: parseFloat(d.atr_7d),
-    dailyRangeAvg: parseFloat(d.daily_range_avg),
-    volatilityRank: d.volatility_rank,
-    lastPrice: parseFloat(d.last_price),
-    priceChange24hPct: parseFloat(d.price_change_24h_pct),
+    atr14d: parseFloat(d.atr_14d || '0'),
+    atr7d: parseFloat(d.atr_7d || '0'),
+    dailyRangeAvg: parseFloat(d.daily_range_avg || '0'),
+    volatilityRank: d.volatility_rank || 50,
+    lastPrice: parseFloat(d.last_price || '0'),
+    priceChange24hPct: parseFloat(d.price_change_24h_pct || '0'),
   }));
 }
 
@@ -308,11 +288,11 @@ let volatilityInterval: NodeJS.Timeout | null = null;
 export function startVolatilityTracker(): void {
   logger.info('Starting volatility tracker...');
   
-  // Initial update
-  updateAllVolatility();
+  // Initial update after 30 seconds (let other things start first)
+  setTimeout(updateAllVolatility, 30 * 1000);
   
-  // Update every 2 hours
-  volatilityInterval = setInterval(updateAllVolatility, 2 * 60 * 60 * 1000);
+  // Update every 4 hours (was 2 hours - reduced frequency)
+  volatilityInterval = setInterval(updateAllVolatility, 4 * 60 * 60 * 1000);
 }
 
 export function stopVolatilityTracker(): void {

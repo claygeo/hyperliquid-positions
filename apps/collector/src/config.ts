@@ -91,7 +91,7 @@ export const config = {
     maxStopPct: 10,
     
     // Update interval (ms) - every 2 hours
-    updateIntervalMs: 2 * 60 * 60 * 1000,
+    updateIntervalMs: 4 * 60 * 60 * 1000,
   },
 
   // ============================================

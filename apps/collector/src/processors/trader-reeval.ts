@@ -1,13 +1,14 @@
-// Trader Re-evaluation V3
+// Trader Re-evaluation V4
 // - Weekly full re-evaluation of all tracked traders
 // - Demotion/promotion logic based on recent performance
 // - Historical performance tracking
+// - ROI-based demotion checks
 // - Can be run manually or on a schedule
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import { config } from '../config.js';
-import { analyzeTrader, saveTraderAnalysis } from './pnl-analyzer.js';
+import { analyzeTrader, saveTraderAnalysis, TraderAnalysis } from './pnl-analyzer.js';
 
 const logger = createLogger('trader-reeval');
 
@@ -19,10 +20,11 @@ interface TraderHistoryEntry {
   address: string;
   pnl_7d: number;
   pnl_30d: number;
+  roi_7d_pct: number;
+  roi_30d_pct: number;
   win_rate: number;
   profit_factor: number;
-  trades_30d: number;
-  quality_score: number;
+  total_trades: number;
   quality_tier: string;
   previous_tier: string | null;
   tier_changed: boolean;
@@ -45,20 +47,29 @@ interface ReEvalStats {
 
 /**
  * Check if elite trader should be demoted
+ * Uses both absolute PnL and ROI% thresholds
  */
-function shouldDemoteElite(trader: { pnl_7d?: number; win_rate?: number; profit_factor?: number }): { demote: boolean; reason: string } {
+function shouldDemoteElite(trader: TraderAnalysis): { demote: boolean; reason: string } {
   const { demoteEliteIf } = config.reeval;
   
-  if ((trader.pnl_7d || 0) < demoteEliteIf.pnl7dBelow) {
-    return { demote: true, reason: `7d PnL below $${demoteEliteIf.pnl7dBelow}` };
+  // Check absolute PnL
+  if (trader.pnl_7d < demoteEliteIf.pnl7dBelow) {
+    return { demote: true, reason: `7d PnL $${trader.pnl_7d.toFixed(0)} below $${demoteEliteIf.pnl7dBelow}` };
   }
   
-  if ((trader.win_rate || 0) < demoteEliteIf.winRateBelow) {
-    return { demote: true, reason: `Win rate below ${(demoteEliteIf.winRateBelow * 100).toFixed(0)}%` };
+  // Check ROI% if threshold exists
+  if (demoteEliteIf.roi7dBelow !== undefined && trader.roi_7d_pct < demoteEliteIf.roi7dBelow) {
+    return { demote: true, reason: `7d ROI ${trader.roi_7d_pct.toFixed(1)}% below ${demoteEliteIf.roi7dBelow}%` };
   }
   
-  if ((trader.profit_factor || 0) < demoteEliteIf.profitFactorBelow) {
-    return { demote: true, reason: `Profit factor below ${demoteEliteIf.profitFactorBelow}` };
+  // Check win rate
+  if (trader.win_rate < demoteEliteIf.winRateBelow) {
+    return { demote: true, reason: `Win rate ${(trader.win_rate * 100).toFixed(0)}% below ${(demoteEliteIf.winRateBelow * 100).toFixed(0)}%` };
+  }
+  
+  // Check profit factor
+  if (trader.profit_factor < demoteEliteIf.profitFactorBelow) {
+    return { demote: true, reason: `Profit factor ${trader.profit_factor.toFixed(2)} below ${demoteEliteIf.profitFactorBelow}` };
   }
   
   return { demote: false, reason: '' };
@@ -66,16 +77,24 @@ function shouldDemoteElite(trader: { pnl_7d?: number; win_rate?: number; profit_
 
 /**
  * Check if good trader should be demoted
+ * Uses both absolute PnL and ROI% thresholds
  */
-function shouldDemoteGood(trader: { pnl_7d?: number; win_rate?: number }): { demote: boolean; reason: string } {
+function shouldDemoteGood(trader: TraderAnalysis): { demote: boolean; reason: string } {
   const { demoteGoodIf } = config.reeval;
   
-  if ((trader.pnl_7d || 0) < demoteGoodIf.pnl7dBelow) {
-    return { demote: true, reason: `7d PnL below $${demoteGoodIf.pnl7dBelow}` };
+  // Check absolute PnL
+  if (trader.pnl_7d < demoteGoodIf.pnl7dBelow) {
+    return { demote: true, reason: `7d PnL $${trader.pnl_7d.toFixed(0)} below $${demoteGoodIf.pnl7dBelow}` };
   }
   
-  if ((trader.win_rate || 0) < demoteGoodIf.winRateBelow) {
-    return { demote: true, reason: `Win rate below ${(demoteGoodIf.winRateBelow * 100).toFixed(0)}%` };
+  // Check ROI% if threshold exists
+  if (demoteGoodIf.roi7dBelow !== undefined && trader.roi_7d_pct < demoteGoodIf.roi7dBelow) {
+    return { demote: true, reason: `7d ROI ${trader.roi_7d_pct.toFixed(1)}% below ${demoteGoodIf.roi7dBelow}%` };
+  }
+  
+  // Check win rate
+  if (trader.win_rate < demoteGoodIf.winRateBelow) {
+    return { demote: true, reason: `Win rate ${(trader.win_rate * 100).toFixed(0)}% below ${(demoteGoodIf.winRateBelow * 100).toFixed(0)}%` };
   }
   
   return { demote: false, reason: '' };
@@ -92,10 +111,11 @@ async function saveTraderHistory(entry: TraderHistoryEntry): Promise<void> {
         address: entry.address,
         pnl_7d: entry.pnl_7d,
         pnl_30d: entry.pnl_30d,
+        roi_7d_pct: entry.roi_7d_pct,
+        roi_30d_pct: entry.roi_30d_pct,
         win_rate: entry.win_rate,
         profit_factor: entry.profit_factor,
-        trades_30d: entry.trades_30d,
-        quality_score: entry.quality_score,
+        total_trades: entry.total_trades,
         quality_tier: entry.quality_tier,
         previous_tier: entry.previous_tier,
         tier_changed: entry.tier_changed,
@@ -147,7 +167,7 @@ async function updateTierChangeTracking(
 export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
   logger.info('');
   logger.info('='.repeat(60));
-  logger.info('TRADER RE-EVALUATION');
+  logger.info('TRADER RE-EVALUATION V4');
   logger.info('='.repeat(60));
   logger.info('');
   
@@ -202,10 +222,11 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
           address: trader.address,
           pnl_7d: 0,
           pnl_30d: 0,
+          roi_7d_pct: 0,
+          roi_30d_pct: 0,
           win_rate: 0,
           profit_factor: 0,
-          trades_30d: 0,
-          quality_score: 0,
+          total_trades: 0,
           quality_tier: 'inactive',
           previous_tier: previousTier,
           tier_changed: true,
@@ -262,19 +283,14 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
       const isTracked = finalTier === 'elite' || finalTier === 'good';
       
       // Update the analysis object for saving
-      const updatedAnalysis = {
+      const updatedAnalysis: TraderAnalysis = {
         ...analysis,
-        quality_tier: finalTier,
+        quality_tier: finalTier as 'elite' | 'good' | 'weak',
+        is_tracked: isTracked,
       };
       
       // Save the updated analysis
       await saveTraderAnalysis(updatedAnalysis);
-      
-      // Also update is_tracked separately since it might not be in the analysis
-      await db.client
-        .from('trader_quality')
-        .update({ is_tracked: isTracked })
-        .eq('address', trader.address);
       
       // Update tier change tracking
       await updateTierChangeTracking(trader.address, finalTier, previousTier);
@@ -283,11 +299,12 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
       await saveTraderHistory({
         address: trader.address,
         pnl_7d: analysis.pnl_7d,
-        pnl_30d: analysis.pnl_30d || 0,
+        pnl_30d: analysis.pnl_30d,
+        roi_7d_pct: analysis.roi_7d_pct,
+        roi_30d_pct: analysis.roi_30d_pct,
         win_rate: analysis.win_rate,
-        profit_factor: analysis.profit_factor || 1,
-        trades_30d: analysis.trades_30d || 0,
-        quality_score: analysis.quality_score,
+        profit_factor: analysis.profit_factor,
+        total_trades: analysis.total_trades,
         quality_tier: finalTier,
         previous_tier: previousTier,
         tier_changed: finalTier !== previousTier,
@@ -315,12 +332,6 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
         
         if (analysis && (analysis.quality_tier === 'elite' || analysis.quality_tier === 'good')) {
           await saveTraderAnalysis(analysis);
-          
-          // Also update is_tracked
-          await db.client
-            .from('trader_quality')
-            .update({ is_tracked: true })
-            .eq('address', potential.address);
           
           if (analysis.quality_tier === 'elite') {
             stats.newElite++;
@@ -398,10 +409,17 @@ export async function getTraderHistory(address: string, limit: number = 10): Pro
 export async function getVolatileTraders(limit: number = 10): Promise<unknown[]> {
   const { data } = await db.client
     .from('trader_quality')
-    .select('address, quality_tier, tier_change_count, pnl_7d, win_rate')
+    .select('address, quality_tier, tier_change_count, pnl_7d, roi_7d_pct, win_rate')
     .gt('tier_change_count', 0)
     .order('tier_change_count', { ascending: false })
     .limit(limit);
   
   return data || [];
 }
+
+export default {
+  reEvaluateAllTraders,
+  cleanupOldHistory,
+  getTraderHistory,
+  getVolatileTraders,
+};

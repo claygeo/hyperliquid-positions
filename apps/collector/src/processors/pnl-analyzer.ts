@@ -503,10 +503,15 @@ async function saveEquitySnapshot(address: string, accountValue: number): Promis
       address: address,
       snapshot_date: today,
       account_value: accountValue,
-      updated_at: new Date().toISOString(),
+      peak_value: accountValue,
+      drawdown_pct: 0,
+      daily_pnl: 0,
+      daily_roi_pct: 0,
+      trades_count: 0,
+      wins_count: 0,
+      losses_count: 0,
     }, { 
       onConflict: 'address,snapshot_date',
-      ignoreDuplicates: false 
     });
     
     if (error) {

@@ -1,35 +1,40 @@
-// Bootstrap Equity Snapshots
-// 
-// This script saves today's equity snapshot for all tracked traders.
-// Run this daily (via cron or manually) to build up history.
-// After 7+ days, P&L calculations will use equity change instead of realized sum.
-//
-// Run with: npm run bootstrap-equity
+// Bootstrap Equity Snapshots - DEBUG VERSION
+// Shows actual error messages
 
+import 'dotenv/config';
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 
 const logger = createLogger('bootstrap-equity');
 
-async function saveSnapshot(address: string, accountValue: number): Promise<boolean> {
+async function saveSnapshot(address: string, accountValue: number): Promise<{ success: boolean; error?: string }> {
   const today = new Date().toISOString().split('T')[0];
   
-  const { error } = await db.client.from('trader_equity_history').upsert({
+  const { data, error } = await db.client.from('trader_equity_history').upsert({
     address: address.toLowerCase(),
     snapshot_date: today,
     account_value: accountValue,
-    updated_at: new Date().toISOString(),
+    peak_value: accountValue,
+    drawdown_pct: 0,
+    daily_pnl: 0,
+    daily_roi_pct: 0,
+    trades_count: 0,
+    wins_count: 0,
+    losses_count: 0,
   }, { 
     onConflict: 'address,snapshot_date',
   });
   
-  return !error;
+  if (error) {
+    return { success: false, error: error.message };
+  }
+  return { success: true };
 }
 
 async function bootstrapEquitySnapshots() {
   console.log('='.repeat(60));
-  console.log('BOOTSTRAPPING EQUITY SNAPSHOTS');
+  console.log('BOOTSTRAPPING EQUITY SNAPSHOTS (DEBUG)');
   console.log('='.repeat(60));
   console.log(`Date: ${new Date().toISOString().split('T')[0]}`);
   console.log('');
@@ -50,7 +55,7 @@ async function bootstrapEquitySnapshots() {
 
   let saved = 0;
   let failed = 0;
-  let updated = 0;
+  const errors: string[] = [];
 
   for (let i = 0; i < traders.length; i++) {
     const trader = traders[i];
@@ -60,32 +65,21 @@ async function bootstrapEquitySnapshots() {
     
     if (state) {
       const accountValue = parseFloat(state.marginSummary.accountValue);
-      const success = await saveSnapshot(trader.address, accountValue);
+      const result = await saveSnapshot(trader.address, accountValue);
       
-      if (success) {
+      if (result.success) {
         saved++;
-        // Check if value changed significantly
-        const change = accountValue - (trader.account_value || 0);
-        const changePct = trader.account_value ? (change / trader.account_value * 100) : 0;
-        
-        if (Math.abs(changePct) > 5) {
-          console.log(
-            `  ${trader.address.slice(0, 10)}... | ` +
-            `$${accountValue.toFixed(0).padStart(8)} | ` +
-            `${changePct >= 0 ? '+' : ''}${changePct.toFixed(1)}% change`
-          );
-          updated++;
-        }
+        console.log(`  ✓ ${trader.address.slice(0, 10)}... | $${accountValue.toFixed(0)}`);
       } else {
         failed++;
+        if (!errors.includes(result.error || '')) {
+          errors.push(result.error || 'Unknown error');
+        }
+        console.log(`  ✗ ${trader.address.slice(0, 10)}... | ERROR: ${result.error}`);
       }
     } else {
       failed++;
-    }
-
-    // Progress
-    if ((i + 1) % 10 === 0) {
-      console.log(`  Progress: ${i + 1}/${traders.length}`);
+      console.log(`  ✗ ${trader.address.slice(0, 10)}... | ERROR: Could not get account state`);
     }
 
     // Rate limit
@@ -97,34 +91,17 @@ async function bootstrapEquitySnapshots() {
   console.log('RESULTS');
   console.log('='.repeat(60));
   console.log(`  Snapshots saved: ${saved}`);
-  console.log(`  Significant changes: ${updated}`);
   console.log(`  Failed: ${failed}`);
-  console.log('');
-
-  // Check how many days of history we have
-  const { data: historyCount } = await db.client
-    .from('trader_equity_history')
-    .select('snapshot_date')
-    .limit(1000);
-
-  if (historyCount) {
-    const uniqueDates = new Set(historyCount.map(h => h.snapshot_date));
-    console.log(`  Total unique snapshot dates: ${uniqueDates.size}`);
-    
-    if (uniqueDates.size < 7) {
-      console.log('');
-      console.log('  ⚠️  Need 7+ days of snapshots for accurate P&L calculation');
-      console.log('  Run this script daily to build history');
-    } else {
-      console.log('');
-      console.log('  ✅ Have enough history for equity-based P&L!');
-    }
+  
+  if (errors.length > 0) {
+    console.log('');
+    console.log('Unique errors encountered:');
+    errors.forEach(e => console.log(`  - ${e}`));
   }
 
   console.log('');
   console.log('Done!');
   
-  // Exit cleanly
   process.exit(0);
 }
 

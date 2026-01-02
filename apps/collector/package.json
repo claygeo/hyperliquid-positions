@@ -11,7 +11,10 @@
     "sync-holders": "tsx src/scripts/sync-hype-holders.ts",
     "analyze": "tsx src/scripts/analyze-traders.ts",
     "setup": "npm run sync-holders && npm run analyze",
-    "backtest": "tsx src/scripts/backtest-signals.ts"
+    "backtest": "tsx src/scripts/backtest-signals.ts",
+    "backtest-6m": "tsx src/scripts/backtest-signals.ts --days=180",
+    "backtest-3m": "tsx src/scripts/backtest-signals.ts --days=90",
+    "backtest-1m": "tsx src/scripts/backtest-signals.ts --days=30"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

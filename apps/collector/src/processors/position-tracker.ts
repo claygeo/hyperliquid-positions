@@ -1,9 +1,10 @@
-// Position Tracker V4
+// Position Tracker V5
 // Enhanced with:
-// - Open order awareness (see entries before they fill)
-// - Urgent re-evaluation triggers (rapid demotion on blowups)
-// - Position conviction scoring
-// - Real-time fill integration
+// - Position history tracking (entry timing detection)
+// - Position age weighting (fresh positions > stale)
+// - Change detection (open, increase, decrease, close, flip)
+// - Urgent re-evaluation with drawdown metrics
+// - Open order awareness
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -11,7 +12,7 @@ import { config } from '../config.js';
 import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
 import { generateSignals } from './signal-generator.js';
 
-const logger = createLogger('position-tracker-v4');
+const logger = createLogger('position-tracker-v5');
 
 // ============================================
 // Types
@@ -34,6 +35,41 @@ interface TrackedPosition {
   has_stop_order: boolean;
   has_tp_order: boolean;
   pending_order_price: number | null;
+  // V5 additions
+  opened_at: Date | null;
+  position_age_hours: number;
+  last_size_change_at: Date | null;
+  peak_unrealized_pnl: number;
+  trough_unrealized_pnl: number;
+}
+
+interface PositionChange {
+  address: string;
+  coin: string;
+  event_type: 'open' | 'increase' | 'decrease' | 'close' | 'flip';
+  direction: 'long' | 'short';
+  prev_size: number;
+  prev_entry_price: number;
+  prev_value_usd: number;
+  new_size: number;
+  new_entry_price: number;
+  new_value_usd: number;
+  size_change: number;
+  price_at_event: number;
+  leverage: number;
+  unrealized_pnl: number;
+}
+
+interface PreviousPositionState {
+  address: string;
+  coin: string;
+  direction: string;
+  size: number;
+  entry_price: number;
+  value_usd: number;
+  opened_at: Date | null;
+  peak_unrealized_pnl: number;
+  trough_unrealized_pnl: number;
 }
 
 interface TrackedOpenOrder {
@@ -53,6 +89,190 @@ interface UrgentReevalTrigger {
   reason: string;
   priority: number;
   currentDrawdownPct: number;
+}
+
+// In-memory cache of previous positions for change detection
+const previousPositions = new Map<string, PreviousPositionState>();
+
+// ============================================
+// Position Change Detection
+// ============================================
+
+function detectPositionChange(
+  address: string,
+  current: TrackedPosition | null,
+  currentPrice: number
+): PositionChange | null {
+  const key = `${address}-${current?.coin || 'unknown'}`;
+  const prev = previousPositions.get(key);
+
+  // No previous position
+  if (!prev && current) {
+    return {
+      address,
+      coin: current.coin,
+      event_type: 'open',
+      direction: current.direction,
+      prev_size: 0,
+      prev_entry_price: 0,
+      prev_value_usd: 0,
+      new_size: current.size,
+      new_entry_price: current.entry_price,
+      new_value_usd: current.value_usd,
+      size_change: current.size,
+      price_at_event: currentPrice,
+      leverage: current.leverage,
+      unrealized_pnl: current.unrealized_pnl,
+    };
+  }
+
+  // Position closed
+  if (prev && !current) {
+    return {
+      address,
+      coin: prev.coin,
+      event_type: 'close',
+      direction: prev.direction as 'long' | 'short',
+      prev_size: prev.size,
+      prev_entry_price: prev.entry_price,
+      prev_value_usd: prev.value_usd,
+      new_size: 0,
+      new_entry_price: 0,
+      new_value_usd: 0,
+      size_change: -prev.size,
+      price_at_event: currentPrice,
+      leverage: 1,
+      unrealized_pnl: 0,
+    };
+  }
+
+  // Both exist - check for changes
+  if (prev && current) {
+    // Direction flip (rare but important)
+    if (prev.direction !== current.direction) {
+      return {
+        address,
+        coin: current.coin,
+        event_type: 'flip',
+        direction: current.direction,
+        prev_size: prev.size,
+        prev_entry_price: prev.entry_price,
+        prev_value_usd: prev.value_usd,
+        new_size: current.size,
+        new_entry_price: current.entry_price,
+        new_value_usd: current.value_usd,
+        size_change: current.size + prev.size, // Total change
+        price_at_event: currentPrice,
+        leverage: current.leverage,
+        unrealized_pnl: current.unrealized_pnl,
+      };
+    }
+
+    // Size increase
+    if (current.size > prev.size * 1.05) { // 5% threshold to filter noise
+      return {
+        address,
+        coin: current.coin,
+        event_type: 'increase',
+        direction: current.direction,
+        prev_size: prev.size,
+        prev_entry_price: prev.entry_price,
+        prev_value_usd: prev.value_usd,
+        new_size: current.size,
+        new_entry_price: current.entry_price,
+        new_value_usd: current.value_usd,
+        size_change: current.size - prev.size,
+        price_at_event: currentPrice,
+        leverage: current.leverage,
+        unrealized_pnl: current.unrealized_pnl,
+      };
+    }
+
+    // Size decrease (partial close)
+    if (current.size < prev.size * 0.95) {
+      return {
+        address,
+        coin: current.coin,
+        event_type: 'decrease',
+        direction: current.direction,
+        prev_size: prev.size,
+        prev_entry_price: prev.entry_price,
+        prev_value_usd: prev.value_usd,
+        new_size: current.size,
+        new_entry_price: current.entry_price,
+        new_value_usd: current.value_usd,
+        size_change: prev.size - current.size,
+        price_at_event: currentPrice,
+        leverage: current.leverage,
+        unrealized_pnl: current.unrealized_pnl,
+      };
+    }
+  }
+
+  return null;
+}
+
+async function savePositionChange(change: PositionChange): Promise<void> {
+  try {
+    await db.client.from('position_history').insert({
+      address: change.address,
+      coin: change.coin,
+      event_type: change.event_type,
+      direction: change.direction,
+      prev_size: change.prev_size,
+      prev_entry_price: change.prev_entry_price,
+      prev_value_usd: change.prev_value_usd,
+      new_size: change.new_size,
+      new_entry_price: change.new_entry_price,
+      new_value_usd: change.new_value_usd,
+      size_change: change.size_change,
+      price_at_event: change.price_at_event,
+      leverage: change.leverage,
+      unrealized_pnl: change.unrealized_pnl,
+      detected_at: new Date().toISOString(),
+    });
+
+    const emoji = {
+      open: '🟢',
+      increase: '⬆️',
+      decrease: '⬇️',
+      close: '🔴',
+      flip: '🔄',
+    }[change.event_type];
+
+    logger.info(
+      `${emoji} POSITION ${change.event_type.toUpperCase()}: ` +
+      `${change.address.slice(0, 8)}... ${change.coin} ${change.direction.toUpperCase()} | ` +
+      `Size: ${change.prev_size.toFixed(2)} → ${change.new_size.toFixed(2)} | ` +
+      `$${change.new_value_usd.toFixed(0)}`
+    );
+  } catch (error) {
+    // Table might not exist yet
+    logger.debug('Could not save position history', error);
+  }
+}
+
+function updatePreviousPositionCache(
+  address: string,
+  position: TrackedPosition | null
+): void {
+  const key = `${address}-${position?.coin || 'unknown'}`;
+  
+  if (position) {
+    previousPositions.set(key, {
+      address,
+      coin: position.coin,
+      direction: position.direction,
+      size: position.size,
+      entry_price: position.entry_price,
+      value_usd: position.value_usd,
+      opened_at: position.opened_at,
+      peak_unrealized_pnl: position.peak_unrealized_pnl,
+      trough_unrealized_pnl: position.trough_unrealized_pnl,
+    });
+  } else {
+    previousPositions.delete(key);
+  }
 }
 
 // ============================================
@@ -133,14 +353,18 @@ async function checkForUrgentReeval(
 
   const triggers: UrgentReevalTrigger[] = [];
 
-  if (drawdownPct < -15) {
+  // Use V5 config thresholds (less aggressive)
+  const severeThreshold = config.urgentReeval?.severeDrawdownPct || -30;
+  const eliteThreshold = config.urgentReeval?.eliteDrawdownPct || -20;
+
+  if (drawdownPct < severeThreshold) {
     triggers.push({
       address,
       reason: `severe_drawdown_${Math.abs(drawdownPct).toFixed(1)}pct`,
       priority: 1,
       currentDrawdownPct: drawdownPct,
     });
-  } else if (tier === 'elite' && drawdownPct < -10) {
+  } else if (tier === 'elite' && drawdownPct < eliteThreshold) {
     triggers.push({
       address,
       reason: `elite_drawdown_${Math.abs(drawdownPct).toFixed(1)}pct`,
@@ -149,6 +373,7 @@ async function checkForUrgentReeval(
     });
   }
 
+  // Check for recent liquidations
   const { wasLiquidated } = await hyperliquid.checkRecentLiquidations(address, 24);
   if (wasLiquidated) {
     triggers.push({
@@ -204,9 +429,10 @@ function processPositions(
       const size = parseFloat(p.szi);
       const coin = p.coin;
       const positionValue = Math.abs(parseFloat(p.positionValue));
+      const unrealizedPnl = parseFloat(p.unrealizedPnl || '0');
 
       const convictionPct = accountValue > 0 
-        ? (positionValue / accountValue) * 100 
+        ? Math.min(100, (positionValue / accountValue) * 100)
         : 0;
 
       const relatedOrders = orders.filter(o => o.coin === coin);
@@ -224,6 +450,30 @@ function processPositions(
         ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
         : null;
 
+      // Get previous state for age and P&L tracking
+      const key = `${address}-${coin}`;
+      const prev = previousPositions.get(key);
+      
+      // Determine opened_at
+      let openedAt = prev?.opened_at || null;
+      if (!prev || prev.direction !== (size > 0 ? 'long' : 'short')) {
+        // New position or direction changed
+        openedAt = new Date();
+      }
+
+      // Calculate position age
+      const positionAgeHours = openedAt 
+        ? (Date.now() - openedAt.getTime()) / (1000 * 60 * 60)
+        : 0;
+
+      // Track peak/trough unrealized P&L
+      const peakUnrealizedPnl = prev 
+        ? Math.max(prev.peak_unrealized_pnl || unrealizedPnl, unrealizedPnl)
+        : unrealizedPnl;
+      const troughUnrealizedPnl = prev 
+        ? Math.min(prev.trough_unrealized_pnl || unrealizedPnl, unrealizedPnl)
+        : unrealizedPnl;
+
       return {
         address,
         coin,
@@ -232,7 +482,7 @@ function processPositions(
         entry_price: parseFloat(p.entryPx),
         value_usd: positionValue,
         leverage: p.leverage?.value || 1,
-        unrealized_pnl: parseFloat(p.unrealizedPnl || '0'),
+        unrealized_pnl: unrealizedPnl,
         margin_used: parseFloat(p.marginUsed || '0'),
         liquidation_price: p.liquidationPx ? parseFloat(p.liquidationPx) : null,
         conviction_pct: convictionPct,
@@ -240,6 +490,11 @@ function processPositions(
         has_stop_order: hasStopOrder,
         has_tp_order: hasTpOrder,
         pending_order_price: pendingOrderPrice,
+        opened_at: openedAt,
+        position_age_hours: positionAgeHours,
+        last_size_change_at: new Date(), // Will be updated on actual changes
+        peak_unrealized_pnl: peakUnrealizedPnl,
+        trough_unrealized_pnl: troughUnrealizedPnl,
       } as TrackedPosition;
     });
 }
@@ -283,6 +538,11 @@ async function savePositions(positions: TrackedPosition[]): Promise<void> {
             has_stop_order: p.has_stop_order,
             has_tp_order: p.has_tp_order,
             pending_order_price: p.pending_order_price,
+            opened_at: p.opened_at?.toISOString(),
+            position_age_hours: p.position_age_hours,
+            last_size_change_at: p.last_size_change_at?.toISOString(),
+            peak_unrealized_pnl: p.peak_unrealized_pnl,
+            trough_unrealized_pnl: p.trough_unrealized_pnl,
             updated_at: new Date().toISOString(),
           }))
         );
@@ -318,11 +578,13 @@ async function pollPositions(): Promise<void> {
       return;
     }
 
-    logger.info(`Polling ${trackedTraders.length} quality traders...`);
-
     const allPositions: TrackedPosition[] = [];
     const allOpenOrders: TrackedOpenOrder[] = [];
+    const positionChanges: PositionChange[] = [];
     let urgentReevals = 0;
+
+    // Get current prices once
+    const allMids = await hyperliquid.getAllMids();
 
     for (const trader of trackedTraders) {
       const data = await hyperliquid.getFullPositionData(trader.address);
@@ -338,6 +600,40 @@ async function pollPositions(): Promise<void> {
         data.openOrders,
         data.accountValue
       );
+
+      // Detect position changes for each position
+      const currentCoins = new Set(processed.map(p => p.coin));
+      
+      // Check for changes in existing positions
+      for (const position of processed) {
+        const currentPrice = parseFloat(allMids[position.coin] || '0');
+        const change = detectPositionChange(trader.address, position, currentPrice);
+        
+        if (change) {
+          positionChanges.push(change);
+          await savePositionChange(change);
+        }
+        
+        // Update cache
+        updatePreviousPositionCache(trader.address, position);
+      }
+
+      // Check for closed positions (positions that existed before but don't now)
+      for (const [key, prev] of previousPositions) {
+        if (key.startsWith(trader.address) && !currentCoins.has(prev.coin)) {
+          const currentPrice = parseFloat(allMids[prev.coin] || '0');
+          const change = detectPositionChange(trader.address, null, currentPrice);
+          
+          if (change) {
+            positionChanges.push(change);
+            await savePositionChange(change);
+          }
+          
+          // Remove from cache
+          previousPositions.delete(key);
+        }
+      }
+
       allPositions.push(...processed);
 
       const orders = await processOpenOrders(trader.address, data.openOrders);
@@ -368,6 +664,7 @@ async function pollPositions(): Promise<void> {
 
     logger.info(
       `Updated ${allPositions.length} positions, ${allOpenOrders.length} open orders` +
+      (positionChanges.length > 0 ? `, ${positionChanges.length} changes` : '') +
       (urgentReevals > 0 ? `, ${urgentReevals} urgent reevals` : '')
     );
 
@@ -391,7 +688,7 @@ async function processUrgentReevals(): Promise<void> {
       .select('*')
       .is('processed_at', null)
       .order('priority', { ascending: true })
-      .limit(5);
+      .limit(config.urgentReeval?.maxPerCycle || 5);
 
     if (!queue || queue.length === 0) return;
 
@@ -432,17 +729,62 @@ async function processUrgentReevals(): Promise<void> {
 }
 
 // ============================================
+// Position Age Utilities
+// ============================================
+
+export async function getFreshPositions(maxAgeHours: number = 4): Promise<TrackedPosition[]> {
+  const { data } = await db.client
+    .from('trader_positions')
+    .select('*')
+    .gte('opened_at', new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString())
+    .order('opened_at', { ascending: false });
+
+  return (data || []) as TrackedPosition[];
+}
+
+export async function getRecentPositionChanges(hours: number = 24): Promise<PositionChange[]> {
+  const { data } = await db.client
+    .from('position_history')
+    .select('*')
+    .gte('detected_at', new Date(Date.now() - hours * 60 * 60 * 1000).toISOString())
+    .order('detected_at', { ascending: false });
+
+  return (data || []) as PositionChange[];
+}
+
+export async function getPositionAgeStats(): Promise<{
+  avgAgeHours: number;
+  freshCount: number;
+  staleCount: number;
+}> {
+  const { data: positions } = await db.client
+    .from('trader_positions')
+    .select('position_age_hours');
+
+  if (!positions || positions.length === 0) {
+    return { avgAgeHours: 0, freshCount: 0, staleCount: 0 };
+  }
+
+  const ages = positions.map(p => p.position_age_hours || 0);
+  const avgAgeHours = ages.reduce((sum, a) => sum + a, 0) / ages.length;
+  const freshCount = ages.filter(a => a < 4).length;
+  const staleCount = ages.filter(a => a > 168).length; // 1 week
+
+  return { avgAgeHours, freshCount, staleCount };
+}
+
+// ============================================
 // Exports
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V4 starting...');
+  logger.info('Position tracker V5 starting...');
   
   pollPositions();
   
   pollInterval = setInterval(pollPositions, config.positions.pollIntervalMs);
   
-  setInterval(processUrgentReevals, 2 * 60 * 1000);
+  setInterval(processUrgentReevals, config.urgentReeval?.processIntervalMs || 2 * 60 * 1000);
 }
 
 export function stopPositionTracker(): void {
@@ -459,10 +801,11 @@ export async function getPositionStats(): Promise<{
   totalValue: number;
   avgConviction: number;
   withStopOrders: number;
+  avgPositionAge: number;
 }> {
   const { data: positions } = await db.client
     .from('trader_positions')
-    .select('coin, value_usd, has_stop_order');
+    .select('coin, value_usd, has_stop_order, position_age_hours');
 
   if (!positions || positions.length === 0) {
     return { 
@@ -471,12 +814,14 @@ export async function getPositionStats(): Promise<{
       totalValue: 0,
       avgConviction: 0,
       withStopOrders: 0,
+      avgPositionAge: 0,
     };
   }
 
   const uniqueCoins = new Set(positions.map(p => p.coin)).size;
   const totalValue = positions.reduce((sum, p) => sum + (p.value_usd || 0), 0);
   const withStopOrders = positions.filter(p => p.has_stop_order).length;
+  const avgAge = positions.reduce((sum, p) => sum + (p.position_age_hours || 0), 0) / positions.length;
 
   return {
     totalPositions: positions.length,
@@ -484,6 +829,7 @@ export async function getPositionStats(): Promise<{
     totalValue,
     avgConviction: 0,
     withStopOrders,
+    avgPositionAge: avgAge,
   };
 }
 
@@ -523,4 +869,7 @@ export default {
   getPositionsForCoin,
   getPendingEntriesForCoin,
   getUrgentReevalQueue,
+  getFreshPositions,
+  getRecentPositionChanges,
+  getPositionAgeStats,
 };

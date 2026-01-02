@@ -1,10 +1,11 @@
-// Collector Entry Point V4 - Quality Trader Signal System
+// Collector Entry Point V5 - Quality Trader Signal System
 // Enhanced with:
 // - Real-time WebSocket fill detection
 // - Conviction scoring
 // - Volatility-adjusted stops
 // - Funding context awareness
 // - Urgent re-evaluation triggers
+// - Daily equity snapshots (built-in scheduler)
 
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -21,7 +22,7 @@ import { startVolatilityTracker, stopVolatilityTracker } from './processors/vola
 import db from './db/client.js';
 import { config } from './config.js';
 
-const logger = createLogger('main-v4');
+const logger = createLogger('main-v5');
 
 // ============================================
 // Real-time Fill Handler
@@ -72,6 +73,149 @@ async function handleRealtimeFill(fill: {
     } catch (error) {
       // Ignore errors
     }
+  }
+}
+
+// ============================================
+// Daily Equity Snapshot Scheduler
+// ============================================
+
+let lastEquitySnapshotDate = '';
+
+/**
+ * Check if we need to run daily equity snapshots
+ * Runs once per day at first check after midnight UTC
+ */
+async function checkDailyEquitySnapshot(): Promise<void> {
+  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  
+  // Already ran today
+  if (lastEquitySnapshotDate === today) return;
+  
+  // Check if we already have snapshots for today in the database
+  const { data: existingSnapshots } = await db.client
+    .from('trader_equity_history')
+    .select('id')
+    .eq('snapshot_date', today)
+    .limit(1);
+  
+  if (existingSnapshots && existingSnapshots.length > 0) {
+    logger.info(`📊 Equity snapshots already exist for ${today}, skipping`);
+    lastEquitySnapshotDate = today;
+    return;
+  }
+  
+  // Run the snapshot
+  logger.info('');
+  logger.info('='.repeat(50));
+  logger.info(`📊 DAILY EQUITY SNAPSHOT - ${today}`);
+  logger.info('='.repeat(50));
+  
+  await saveAllEquitySnapshots();
+  lastEquitySnapshotDate = today;
+}
+
+/**
+ * Save equity snapshots for all tracked traders
+ */
+async function saveAllEquitySnapshots(): Promise<void> {
+  try {
+    // Get all tracked traders
+    const { data: traders, error: tradersError } = await db.client
+      .from('trader_quality')
+      .select('address')
+      .eq('is_tracked', true);
+    
+    if (tradersError || !traders) {
+      logger.error('Failed to fetch traders:', tradersError);
+      return;
+    }
+    
+    logger.info(`Processing ${traders.length} tracked traders...`);
+    
+    const today = new Date().toISOString().split('T')[0];
+    let saved = 0;
+    let failed = 0;
+    
+    for (const trader of traders) {
+      try {
+        // Fetch current account state from Hyperliquid
+        const response = await fetch('https://api.hyperliquid.xyz/info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'clearinghouseState',
+            user: trader.address
+          })
+        });
+        
+        if (!response.ok) {
+          failed++;
+          continue;
+        }
+        
+        const state = await response.json();
+        const marginSummary = state.marginSummary as Record<string, string>;
+        const accountValue = parseFloat(marginSummary?.accountValue || '0');
+        
+        if (accountValue <= 0) {
+          continue; // Skip empty accounts
+        }
+        
+        // Save snapshot with all required fields
+        const { error: insertError } = await db.client
+          .from('trader_equity_history')
+          .upsert({
+            address: trader.address,
+            snapshot_date: today,
+            account_value: accountValue,
+            peak_value: accountValue,
+            drawdown_pct: 0,
+            daily_pnl: 0,
+            daily_roi_pct: 0,
+            trades_count: 0,
+            wins_count: 0,
+            losses_count: 0,
+          }, {
+            onConflict: 'address,snapshot_date'
+          });
+        
+        if (insertError) {
+          logger.error(`Failed to save snapshot for ${trader.address.slice(0, 8)}:`, insertError);
+          failed++;
+        } else {
+          saved++;
+        }
+        
+        // Rate limit
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+      } catch (err) {
+        failed++;
+      }
+    }
+    
+    logger.info(`✅ Equity snapshots complete: ${saved} saved, ${failed} failed`);
+    
+    // Log how many days of history we have
+    const { data: dateCount } = await db.client
+      .from('trader_equity_history')
+      .select('snapshot_date')
+      .limit(1000);
+    
+    if (dateCount) {
+      const uniqueDates = new Set(dateCount.map(d => d.snapshot_date));
+      logger.info(`📈 Total equity history: ${uniqueDates.size} days`);
+      
+      if (uniqueDates.size < 7) {
+        logger.info(`⏳ Need ${7 - uniqueDates.size} more days for accurate P&L calculation`);
+      } else {
+        logger.info(`✅ Equity-based P&L calculation is now active!`);
+      }
+    }
+    
+  } catch (error) {
+    logger.error('Equity snapshot failed:', error);
   }
 }
 
@@ -128,7 +272,7 @@ async function logStatusUpdate(): Promise<void> {
 
     logger.info('');
     logger.info('-'.repeat(70));
-    logger.info('STATUS UPDATE V4');
+    logger.info('STATUS UPDATE V5');
     logger.info('-'.repeat(70));
     
     // Quality traders
@@ -224,16 +368,18 @@ async function checkWeeklyReeval(): Promise<void> {
 async function main(): Promise<void> {
   logger.info('');
   logger.info('='.repeat(70));
-  logger.info('QUALITY TRADER SIGNAL SYSTEM V4');
+  logger.info('QUALITY TRADER SIGNAL SYSTEM V5');
   logger.info('='.repeat(70));
   logger.info('');
-  logger.info('New V4 Features:');
+  logger.info('V5 Features:');
   logger.info('  ✓ Real-time WebSocket fill detection');
   logger.info('  ✓ Position conviction scoring (% of account)');
   logger.info('  ✓ Volatility-adjusted stops (ATR-based)');
   logger.info('  ✓ Funding rate context (favorable/unfavorable)');
   logger.info('  ✓ Open order awareness (see entries before fills)');
   logger.info('  ✓ Urgent re-evaluation triggers (rapid demotion)');
+  logger.info('  ✓ Daily equity snapshots (automatic)');
+  logger.info('  ✓ Equity-based P&L calculation (after 7 days)');
   logger.info('');
 
   // Validate environment
@@ -280,7 +426,7 @@ async function main(): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 3000));
 
     // 3. Start position tracker
-    logger.info('Starting position tracker V4...');
+    logger.info('Starting position tracker V5...');
     startPositionTracker();
 
     // 4. Start signal performance tracker
@@ -306,6 +452,13 @@ async function main(): Promise<void> {
 
     // 8. Status logging every 5 minutes
     setInterval(logStatusUpdate, 5 * 60 * 1000);
+
+    // 9. Daily equity snapshot checker (runs every hour, triggers once per day)
+    logger.info('Starting daily equity snapshot scheduler...');
+    setInterval(checkDailyEquitySnapshot, 60 * 60 * 1000); // Check every hour
+    
+    // Run equity snapshot check immediately on startup
+    await checkDailyEquitySnapshot();
 
     logger.info('');
     logger.info('System fully operational!');

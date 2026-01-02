@@ -1,12 +1,8 @@
-// Signal Generator V5
-// Enhanced with:
-// - Smarter signal persistence (don't close just because traders repositioned)
-// - Position conviction scoring (capped at 100%)
-// - Volatility-adjusted stop losses (uses cached ATR data)
-// - Funding rate context (favorable/unfavorable)
-// - Pending order awareness
-// - Real-time fill integration
-// - Grace period before invalidation
+// Signal Generator V6
+// Enhanced from V5 with:
+// - Automatic deactivation when outcome != 'open'
+// - Conflict detection (prevents opposing signals on same coin)
+// - Better signal lifecycle management
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -14,7 +10,7 @@ import { config } from '../config.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v5');
+const logger = createLogger('signal-generator-v6');
 
 // ============================================
 // Types
@@ -111,6 +107,9 @@ interface ExistingSignal {
   hit_tp1: boolean;
   hit_tp2: boolean;
   hit_tp3: boolean;
+  outcome: string;
+  is_active: boolean;
+  confidence: number;
 }
 
 // ============================================
@@ -135,9 +134,6 @@ function calculateDirectionalAgreement(
   }
 }
 
-/**
- * V4: Enhanced stop loss using CACHED volatility data (no API calls)
- */
 async function calculateEnhancedStopLoss(
   coin: string,
   direction: 'long' | 'short',
@@ -150,14 +146,13 @@ async function calculateEnhancedStopLoss(
   atrMultiple: number;
   volatilityRank: number;
 }> {
-  // Use cached volatility only - NO API calls here
   const { data: volData } = await db.client
     .from('coin_volatility')
     .select('*')
     .eq('coin', coin)
     .single();
 
-  let stopDistancePct = 3; // Default 3%
+  let stopDistancePct = 3;
   let volatilityRank = 50;
   
   if (volData && volData.atr_14d && volData.last_price) {
@@ -169,7 +164,6 @@ async function calculateEnhancedStopLoss(
     volatilityRank = volData.volatility_rank || 50;
   }
 
-  // Consider liquidation prices as backstop
   const liqPrices = traders
     .map(t => t.liquidation_price)
     .filter((p): p is number => p !== null && p > 0);
@@ -182,7 +176,6 @@ async function calculateEnhancedStopLoss(
       const liqBasedStop = Math.max(...liqPrices) * 1.15;
       stopLoss = Math.max(stopLoss, liqBasedStop);
     }
-    // Ensure at least 1% away
     stopLoss = Math.min(stopLoss, currentPrice * 0.99);
   } else {
     stopLoss = currentPrice * (1 + stopDistancePct / 100);
@@ -190,7 +183,6 @@ async function calculateEnhancedStopLoss(
       const liqBasedStop = Math.min(...liqPrices) * 0.85;
       stopLoss = Math.min(stopLoss, liqBasedStop);
     }
-    // Ensure at least 1% away
     stopLoss = Math.max(stopLoss, currentPrice * 1.01);
   }
 
@@ -255,47 +247,39 @@ function calculateConfidence(
 ): number {
   let confidence = 0;
 
-  // Trader count (0-25)
   if (eliteCount >= 3) confidence += 25;
   else if (eliteCount >= 2) confidence += 20;
   else if (eliteCount >= 1) confidence += 15;
   else if (goodCount >= 4) confidence += 12;
   else if (goodCount >= 3) confidence += 8;
 
-  // Directional agreement (0-20)
   if (agreement >= 0.9) confidence += 20;
   else if (agreement >= 0.8) confidence += 15;
   else if (agreement >= 0.7) confidence += 10;
   else confidence += 5;
 
-  // Win rate (0-15)
   if (avgWinRate >= 0.6) confidence += 15;
   else if (avgWinRate >= 0.55) confidence += 12;
   else if (avgWinRate >= 0.5) confidence += 8;
   else confidence += 4;
 
-  // Profit factor (0-10)
   if (avgProfitFactor >= 2.0) confidence += 10;
   else if (avgProfitFactor >= 1.5) confidence += 7;
   else if (avgProfitFactor >= 1.2) confidence += 4;
 
-  // Combined PnL (0-10)
   if (combinedPnl7d >= 100000) confidence += 10;
   else if (combinedPnl7d >= 50000) confidence += 7;
   else if (combinedPnl7d >= 25000) confidence += 5;
   else if (combinedPnl7d >= 10000) confidence += 3;
 
-  // V4: Conviction scoring (0-10)
   if (avgConvictionPct >= 30) confidence += 10;
   else if (avgConvictionPct >= 20) confidence += 7;
   else if (avgConvictionPct >= 10) confidence += 4;
   else if (avgConvictionPct >= 5) confidence += 2;
 
-  // V4: Funding context (0-5)
   if (fundingContext === 'favorable') confidence += 5;
   else if (fundingContext === 'neutral') confidence += 2;
 
-  // V4: Traders with stop orders (0-5)
   const stopRatio = totalTraders > 0 ? tradersWithStops / totalTraders : 0;
   if (stopRatio >= 0.5) confidence += 5;
   else if (stopRatio >= 0.25) confidence += 2;
@@ -382,30 +366,25 @@ function determineSignalStrength(eliteCount: number, goodCount: number): 'strong
   return 'medium';
 }
 
-/**
- * V5: Check if an existing signal should be kept alive
- * Signals persist if:
- * 1. At least 1 quality trader still holds the position
- * 2. OR signal hasn't hit stop/all TPs
- * 3. OR signal is less than 1 hour old (grace period)
- */
 async function shouldKeepSignalAlive(
   existing: ExistingSignal,
   currentTraderCount: number,
   currentPrice: number
 ): Promise<{ keep: boolean; reason?: string }> {
-  // Grace period: keep signals alive for at least 1 hour
+  // V6: Check outcome first - if not 'open', signal is done
+  if (existing.outcome && existing.outcome !== 'open') {
+    return { keep: false, reason: `outcome_${existing.outcome}` };
+  }
+
   const ageHours = (Date.now() - new Date(existing.created_at).getTime()) / (1000 * 60 * 60);
   if (ageHours < 1) {
     return { keep: true };
   }
 
-  // If at least 1 trader still holds, keep alive
   if (currentTraderCount >= 1) {
     return { keep: true };
   }
 
-  // Check if stop was hit
   const direction = existing.direction as 'long' | 'short';
   if (direction === 'long' && currentPrice <= existing.stop_loss) {
     return { keep: false, reason: 'stop_loss_hit' };
@@ -414,7 +393,6 @@ async function shouldKeepSignalAlive(
     return { keep: false, reason: 'stop_loss_hit' };
   }
 
-  // Check if TP3 was hit (full exit)
   if (direction === 'long' && currentPrice >= existing.take_profit_3) {
     return { keep: false, reason: 'take_profit_3_hit' };
   }
@@ -422,17 +400,140 @@ async function shouldKeepSignalAlive(
     return { keep: false, reason: 'take_profit_3_hit' };
   }
 
-  // No traders left and no stop/TP hit - check majority exit
   const originalTraders = existing.total_traders;
   const exitRatio = 1 - (currentTraderCount / originalTraders);
   
-  // If more than 80% of traders exited, close the signal
   if (exitRatio >= 0.8) {
     return { keep: false, reason: `majority_exit_${Math.round(exitRatio * 100)}pct` };
   }
 
-  // Otherwise keep it alive
   return { keep: true };
+}
+
+/**
+ * V6: Deactivate signals with non-open outcomes
+ */
+async function deactivateClosedSignals(): Promise<number> {
+  const { data, error } = await db.client
+    .from('quality_signals')
+    .update({ 
+      is_active: false,
+      invalidation_reason: 'outcome_closed'
+    })
+    .eq('is_active', true)
+    .neq('outcome', 'open')
+    .select('id, coin, direction, outcome');
+
+  if (error) {
+    logger.error('Failed to deactivate closed signals', error);
+    return 0;
+  }
+
+  if (data && data.length > 0) {
+    for (const sig of data) {
+      logger.info(`Auto-deactivated: ${sig.coin} ${sig.direction} | outcome: ${sig.outcome}`);
+    }
+  }
+
+  return data?.length || 0;
+}
+
+/**
+ * V6: Check for and resolve conflicting signals
+ */
+async function resolveConflictingSignals(): Promise<number> {
+  const { data: activeSignals } = await db.client
+    .from('quality_signals')
+    .select('*')
+    .eq('is_active', true);
+
+  if (!activeSignals || activeSignals.length === 0) return 0;
+
+  const byCoin = new Map<string, ExistingSignal[]>();
+  for (const sig of activeSignals) {
+    const existing = byCoin.get(sig.coin) || [];
+    existing.push(sig as ExistingSignal);
+    byCoin.set(sig.coin, existing);
+  }
+
+  let resolved = 0;
+
+  for (const [coin, signals] of byCoin) {
+    if (signals.length < 2) continue;
+
+    const longSignals = signals.filter(s => s.direction === 'long');
+    const shortSignals = signals.filter(s => s.direction === 'short');
+
+    if (longSignals.length > 0 && shortSignals.length > 0) {
+      const bestLong = longSignals.reduce((best, s) => 
+        s.confidence > best.confidence ? s : best
+      );
+      const bestShort = shortSignals.reduce((best, s) => 
+        s.confidence > best.confidence ? s : best
+      );
+
+      let toKeep: ExistingSignal;
+      let toInvalidate: ExistingSignal[];
+
+      if (bestLong.confidence > bestShort.confidence) {
+        toKeep = bestLong;
+        toInvalidate = shortSignals;
+      } else if (bestShort.confidence > bestLong.confidence) {
+        toKeep = bestShort;
+        toInvalidate = longSignals;
+      } else {
+        const longTime = new Date(bestLong.created_at).getTime();
+        const shortTime = new Date(bestShort.created_at).getTime();
+        if (longTime > shortTime) {
+          toKeep = bestLong;
+          toInvalidate = shortSignals;
+        } else {
+          toKeep = bestShort;
+          toInvalidate = longSignals;
+        }
+      }
+
+      for (const sig of toInvalidate) {
+        await db.client
+          .from('quality_signals')
+          .update({
+            is_active: false,
+            invalidated: true,
+            invalidation_reason: `conflict_resolved_kept_${toKeep.direction}`,
+          })
+          .eq('id', sig.id);
+
+        logger.info(
+          `Conflict resolved: ${coin} | ` +
+          `Kept ${toKeep.direction.toUpperCase()} (${toKeep.confidence}%), ` +
+          `Invalidated ${sig.direction.toUpperCase()} (${sig.confidence}%)`
+        );
+        resolved++;
+      }
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * V6: Check if creating a new signal would conflict
+ */
+async function hasConflictingActiveSignal(
+  coin: string,
+  direction: 'long' | 'short'
+): Promise<ExistingSignal | null> {
+  const oppositeDirection = direction === 'long' ? 'short' : 'long';
+  
+  const { data } = await db.client
+    .from('quality_signals')
+    .select('*')
+    .eq('coin', coin)
+    .eq('direction', oppositeDirection)
+    .eq('is_active', true)
+    .single();
+
+  return data as ExistingSignal | null;
 }
 
 // ============================================
@@ -441,6 +542,18 @@ async function shouldKeepSignalAlive(
 
 export async function generateSignals(): Promise<void> {
   try {
+    // V6: Clean up closed signals first
+    const deactivated = await deactivateClosedSignals();
+    if (deactivated > 0) {
+      logger.info(`Deactivated ${deactivated} closed signals`);
+    }
+
+    // V6: Resolve any existing conflicts
+    const conflictsResolved = await resolveConflictingSignals();
+    if (conflictsResolved > 0) {
+      logger.info(`Resolved ${conflictsResolved} conflicting signals`);
+    }
+
     const { data: positions, error: posError } = await db.client
       .from('trader_positions')
       .select('*');
@@ -473,7 +586,6 @@ export async function generateSignals(): Promise<void> {
       positionsByCoin.set(pos.coin, existing);
     }
 
-    // Get existing active signals
     const { data: existingSignals } = await db.client
       .from('quality_signals')
       .select('*')
@@ -521,7 +633,6 @@ export async function generateSignals(): Promise<void> {
         const trader = traderMap.get(pos.address);
         if (!trader) continue;
 
-        // FIX: Cap conviction at 100%
         const rawConviction = trader.account_value > 0
           ? (pos.value_usd / trader.account_value) * 100
           : 0;
@@ -559,7 +670,6 @@ export async function generateSignals(): Promise<void> {
       const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
       const avgLeverage = allTraders.reduce((sum, t) => sum + t.leverage, 0) / allTraders.length;
 
-      // V4: Conviction metrics (already capped at 100%)
       const avgConvictionPct = allTraders.reduce((sum, t) => sum + t.conviction_pct, 0) / allTraders.length;
       const maxConvictionPct = Math.max(...allTraders.map(t => t.conviction_pct));
       const tradersWithStops = allTraders.filter(t => t.has_stop_order).length;
@@ -572,14 +682,9 @@ export async function generateSignals(): Promise<void> {
       const entryRangeLow = entryPrices.length > 0 ? Math.min(...entryPrices) : currentPrice * 0.99;
       const entryRangeHigh = entryPrices.length > 0 ? Math.max(...entryPrices) : currentPrice * 1.01;
 
-      // V4: Enhanced stop loss using CACHED volatility (no API calls)
       const stopData = await calculateEnhancedStopLoss(coin, direction, allTraders, currentPrice);
-
       const { tp1, tp2, tp3 } = calculateTakeProfits(direction, suggestedEntry, stopData.stopLoss);
-
       const suggestedLeverage = calculateSuggestedLeverage(allTraders, stopData.stopDistancePct);
-
-      // V4: Get funding context
       const fundingData = await getSignalFundingContext(coin, direction);
 
       const candidate: SignalCandidate = {
@@ -649,8 +754,33 @@ export async function generateSignals(): Promise<void> {
       const signalKey = `${coin}-${direction}`;
       processedKeys.add(signalKey);
 
-      // Check if signal already exists - preserve entry_price if so
+      // V6: Check for conflicting signal before creating
       const existingSignal = existingSignalMap.get(signalKey);
+      const conflicting = await hasConflictingActiveSignal(coin, direction);
+      
+      if (conflicting && !existingSignal) {
+        if (candidate.confidence > conflicting.confidence) {
+          await db.client
+            .from('quality_signals')
+            .update({
+              is_active: false,
+              invalidated: true,
+              invalidation_reason: `replaced_by_${direction}_signal`,
+            })
+            .eq('id', conflicting.id);
+          
+          logger.info(
+            `Replaced ${conflicting.direction} with ${direction} for ${coin} ` +
+            `(${candidate.confidence}% > ${conflicting.confidence}%)`
+          );
+        } else {
+          logger.debug(
+            `Skipped ${coin} ${direction} - existing ${conflicting.direction} signal is stronger`
+          );
+          continue;
+        }
+      }
+
       const entryPrice = existingSignal?.entry_price || suggestedEntry;
 
       const signalData = {
@@ -673,7 +803,7 @@ export async function generateSignals(): Promise<void> {
         directional_agreement: agreement,
         opposing_traders: opposingCount,
         suggested_entry: suggestedEntry,
-        entry_price: entryPrice,  // Preserve original entry
+        entry_price: entryPrice,
         entry_range_low: entryRangeLow,
         entry_range_high: entryRangeHigh,
         stop_loss: stopData.stopLoss,
@@ -690,6 +820,7 @@ export async function generateSignals(): Promise<void> {
         atr_multiple: stopData.atrMultiple,
         current_price: currentPrice,
         is_active: true,
+        outcome: 'open',
         expires_at: new Date(Date.now() + config.signals.expiryHours * 60 * 60 * 1000).toISOString(),
       };
 
@@ -710,16 +841,13 @@ export async function generateSignals(): Promise<void> {
       );
     }
 
-    // V5: Handle existing signals that may no longer have qualifying positions
-    // Only invalidate if truly dead (majority exit + grace period)
+    // Handle existing signals that may no longer have qualifying positions
     for (const [key, existing] of existingSignalMap) {
       if (processedKeys.has(key)) continue;
 
-      // Signal wasn't regenerated - check if we should keep it alive
       const currentPrice = await getCurrentPrice(existing.coin);
       if (!currentPrice) continue;
 
-      // Count how many quality traders still hold this position
       const coinPositions = positionsByCoin.get(existing.coin) || [];
       const direction = existing.direction as 'long' | 'short';
       const directionPositions = coinPositions.filter(p => p.direction === direction);
@@ -735,7 +863,6 @@ export async function generateSignals(): Promise<void> {
       );
 
       if (!keep) {
-        // Invalidate the signal
         await db.client
           .from('quality_signals')
           .update({
@@ -748,7 +875,6 @@ export async function generateSignals(): Promise<void> {
 
         logger.info(`Signal closed: ${existing.coin} ${existing.direction} | Reason: ${reason}`);
       } else {
-        // Update current price but keep alive
         await db.client
           .from('quality_signals')
           .update({ current_price: currentPrice })
@@ -756,7 +882,6 @@ export async function generateSignals(): Promise<void> {
       }
     }
 
-    // Upsert valid signals
     for (const signal of validSignals) {
       await db.client
         .from('quality_signals')

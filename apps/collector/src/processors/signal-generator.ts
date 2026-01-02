@@ -1,9 +1,8 @@
-// Signal Generator V7
-// Enhanced from V6 with:
-// - BUGFIX: TPs now calculated from preserved entry_price, not current price
-// - BUGFIX: Stop/TP levels locked after signal creation (no recalculation)
-// - Minimum stop distance floor (2%)
-// - Better validation of TP directions
+// Signal Generator V8
+// Enhanced from V7 with:
+// - Volatility percentile-based dynamic stops
+// - Smarter minimum/maximum stop distances per volatility tier
+// - No more tight stops getting wicked out
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -11,10 +10,39 @@ import { config } from '../config.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v7');
+const logger = createLogger('signal-generator-v8');
 
-// Minimum stop distance to avoid getting wicked out
-const MIN_STOP_DISTANCE_PCT = 2.0;
+// ============================================
+// V8: Volatility-Based Stop Configuration
+// ============================================
+
+/**
+ * Calculate dynamic stop based on volatility percentile
+ * Higher volatility = wider stops to avoid wicking
+ */
+function calculateDynamicStopDistance(
+  atrPct: number,
+  volatilityRank: number
+): { minStop: number; maxStop: number; multiplier: number } {
+  // volatilityRank is 0-100 (percentile vs all coins)
+  
+  if (volatilityRank >= 80) {
+    // Top 20% most volatile (memecoins, small caps)
+    return { minStop: 10, maxStop: 25, multiplier: 2.5 };
+  } else if (volatilityRank >= 60) {
+    // High volatility (HYPE, newer alts)
+    return { minStop: 7, maxStop: 15, multiplier: 2.0 };
+  } else if (volatilityRank >= 40) {
+    // Medium volatility (SOL, AVAX, mid-caps)
+    return { minStop: 5, maxStop: 12, multiplier: 2.0 };
+  } else if (volatilityRank >= 20) {
+    // Low-medium volatility (ETH)
+    return { minStop: 4, maxStop: 10, multiplier: 1.75 };
+  } else {
+    // Lowest volatility (BTC, stables)
+    return { minStop: 3, maxStop: 8, multiplier: 1.5 };
+  }
+}
 
 // ============================================
 // Types
@@ -114,6 +142,7 @@ interface ExistingSignal {
   outcome: string;
   is_active: boolean;
   confidence: number;
+  expires_at?: string;
 }
 
 // ============================================
@@ -156,20 +185,28 @@ async function calculateEnhancedStopLoss(
     .eq('coin', coin)
     .single();
 
-  let stopDistancePct = 3;
-  let volatilityRank = 50;
+  let atrPct = 5; // Default 5% if no data
+  let volatilityRank = 50; // Default medium
   
   if (volData && volData.atr_14d && volData.last_price) {
-    const atrPct = (parseFloat(volData.atr_14d) / parseFloat(volData.last_price)) * 100;
-    stopDistancePct = Math.max(
-      config.volatility.minStopPct, 
-      Math.min(config.volatility.maxStopPct, atrPct * config.volatility.defaultAtrMultiple)
-    );
+    atrPct = (parseFloat(volData.atr_14d) / parseFloat(volData.last_price)) * 100;
     volatilityRank = volData.volatility_rank || 50;
   }
 
-  // V7: Enforce minimum stop distance
-  stopDistancePct = Math.max(stopDistancePct, MIN_STOP_DISTANCE_PCT);
+  // V8: Get dynamic stop parameters based on volatility
+  const stopConfig = calculateDynamicStopDistance(atrPct, volatilityRank);
+  
+  // Calculate stop distance: ATR * multiplier, clamped to min/max
+  let stopDistancePct = atrPct * stopConfig.multiplier;
+  stopDistancePct = Math.max(stopConfig.minStop, Math.min(stopConfig.maxStop, stopDistancePct));
+
+  logger.debug(
+    `${coin} stop calc: ATR=${atrPct.toFixed(2)}%, ` +
+    `volRank=${volatilityRank}, ` +
+    `mult=${stopConfig.multiplier}, ` +
+    `range=[${stopConfig.minStop}-${stopConfig.maxStop}%], ` +
+    `final=${stopDistancePct.toFixed(2)}%`
+  );
 
   const liqPrices = traders
     .map(t => t.liquidation_price)
@@ -184,7 +221,7 @@ async function calculateEnhancedStopLoss(
       stopLoss = Math.max(stopLoss, liqBasedStop);
     }
     // Ensure stop is below entry for longs
-    stopLoss = Math.min(stopLoss, entryPrice * (1 - MIN_STOP_DISTANCE_PCT / 100));
+    stopLoss = Math.min(stopLoss, entryPrice * (1 - stopConfig.minStop / 100));
   } else {
     stopLoss = entryPrice * (1 + stopDistancePct / 100);
     if (liqPrices.length > 0) {
@@ -192,7 +229,7 @@ async function calculateEnhancedStopLoss(
       stopLoss = Math.min(stopLoss, liqBasedStop);
     }
     // Ensure stop is above entry for shorts
-    stopLoss = Math.max(stopLoss, entryPrice * (1 + MIN_STOP_DISTANCE_PCT / 100));
+    stopLoss = Math.max(stopLoss, entryPrice * (1 + stopConfig.minStop / 100));
   }
 
   const finalStopDistancePct = Math.abs(stopLoss - entryPrice) / entryPrice * 100;
@@ -201,7 +238,7 @@ async function calculateEnhancedStopLoss(
     stopLoss,
     stopDistancePct: finalStopDistancePct,
     volatilityAdjustedStop: stopLoss,
-    atrMultiple: config.volatility.defaultAtrMultiple,
+    atrMultiple: stopConfig.multiplier,
     volatilityRank,
   };
 }
@@ -220,26 +257,24 @@ function calculateTakeProfits(
     tp2 = entry + riskDistance * 2;
     tp3 = entry + riskDistance * 3;
     
-    // V7: Validate TPs are above entry for longs
+    // Validate TPs are above entry for longs
     if (tp1 <= entry || tp2 <= entry || tp3 <= entry) {
       logger.error(`TP calculation error for LONG: entry=${entry}, stop=${stopLoss}, tp1=${tp1}`);
-      // Force correct direction
-      tp1 = entry * 1.01;
-      tp2 = entry * 1.02;
-      tp3 = entry * 1.03;
+      tp1 = entry * 1.02;
+      tp2 = entry * 1.04;
+      tp3 = entry * 1.06;
     }
   } else {
     tp1 = entry - riskDistance * 1;
     tp2 = entry - riskDistance * 2;
     tp3 = entry - riskDistance * 3;
     
-    // V7: Validate TPs are below entry for shorts
+    // Validate TPs are below entry for shorts
     if (tp1 >= entry || tp2 >= entry || tp3 >= entry) {
       logger.error(`TP calculation error for SHORT: entry=${entry}, stop=${stopLoss}, tp1=${tp1}`);
-      // Force correct direction
-      tp1 = entry * 0.99;
-      tp2 = entry * 0.98;
-      tp3 = entry * 0.97;
+      tp1 = entry * 0.98;
+      tp2 = entry * 0.96;
+      tp3 = entry * 0.94;
     }
   }
   
@@ -337,8 +372,9 @@ function calculateRiskScore(
   if (avgWinRate >= 0.6) risk -= 10;
   else if (avgWinRate >= 0.55) risk -= 5;
 
-  if (stopDistancePct > 5) risk += 10;
-  else if (stopDistancePct > 3) risk += 5;
+  if (stopDistancePct > 15) risk += 15;
+  else if (stopDistancePct > 10) risk += 10;
+  else if (stopDistancePct > 5) risk += 5;
 
   if (volatilityRank >= 80) risk += 15;
   else if (volatilityRank >= 60) risk += 10;
@@ -398,7 +434,6 @@ async function shouldKeepSignalAlive(
   currentTraderCount: number,
   currentPrice: number
 ): Promise<{ keep: boolean; reason?: string }> {
-  // V6/V7: Check outcome first - if not 'open', signal is done
   if (existing.outcome && existing.outcome !== 'open') {
     return { keep: false, reason: `outcome_${existing.outcome}` };
   }
@@ -437,9 +472,6 @@ async function shouldKeepSignalAlive(
   return { keep: true };
 }
 
-/**
- * V6: Deactivate signals with non-open outcomes
- */
 async function deactivateClosedSignals(): Promise<number> {
   const { data, error } = await db.client
     .from('quality_signals')
@@ -465,9 +497,6 @@ async function deactivateClosedSignals(): Promise<number> {
   return data?.length || 0;
 }
 
-/**
- * V6: Check for and resolve conflicting signals
- */
 async function resolveConflictingSignals(): Promise<number> {
   const { data: activeSignals } = await db.client
     .from('quality_signals')
@@ -543,9 +572,6 @@ async function resolveConflictingSignals(): Promise<number> {
   return resolved;
 }
 
-/**
- * V6: Check if creating a new signal would conflict
- */
 async function hasConflictingActiveSignal(
   coin: string,
   direction: 'long' | 'short'
@@ -569,13 +595,11 @@ async function hasConflictingActiveSignal(
 
 export async function generateSignals(): Promise<void> {
   try {
-    // V6: Clean up closed signals first
     const deactivated = await deactivateClosedSignals();
     if (deactivated > 0) {
       logger.info(`Deactivated ${deactivated} closed signals`);
     }
 
-    // V6: Resolve any existing conflicts
     const conflictsResolved = await resolveConflictingSignals();
     if (conflictsResolved > 0) {
       logger.info(`Resolved ${conflictsResolved} conflicting signals`);
@@ -708,11 +732,9 @@ export async function generateSignals(): Promise<void> {
       processedKeys.add(signalKey);
       
       const existingSignal = existingSignalMap.get(signalKey);
-
-      // V7: Check for conflicting signal before creating
       const conflicting = await hasConflictingActiveSignal(coin, direction);
       
-      // V7: CRITICAL - Use existing entry/stop/TPs if signal exists, don't recalculate
+      // Use existing entry/stop/TPs if signal exists, don't recalculate
       let entryPrice: number;
       let stopLoss: number;
       let stopDistancePct: number;
@@ -721,17 +743,16 @@ export async function generateSignals(): Promise<void> {
       let atrMultiple: number;
 
       if (existingSignal) {
-        // Preserve original levels - don't recalculate!
         entryPrice = existingSignal.entry_price;
         stopLoss = existingSignal.stop_loss;
         tp1 = existingSignal.take_profit_1;
         tp2 = existingSignal.take_profit_2;
         tp3 = existingSignal.take_profit_3;
         stopDistancePct = Math.abs(stopLoss - entryPrice) / entryPrice * 100;
-        volatilityRank = 50; // Default, not critical for existing signals
-        atrMultiple = config.volatility.defaultAtrMultiple;
+        volatilityRank = 50;
+        atrMultiple = 2.0;
         
-        // V7: Validate existing TPs are in correct direction
+        // Validate existing TPs are in correct direction
         const tpValid = direction === 'long' 
           ? (tp1 > entryPrice && tp2 > entryPrice && tp3 > entryPrice)
           : (tp1 < entryPrice && tp2 < entryPrice && tp3 < entryPrice);
@@ -747,7 +768,6 @@ export async function generateSignals(): Promise<void> {
           tp3 = newTps.tp3;
         }
       } else {
-        // New signal - calculate fresh levels from current price
         entryPrice = currentPrice;
         const stopData = await calculateEnhancedStopLoss(coin, direction, allTraders, entryPrice);
         const tps = calculateTakeProfits(direction, entryPrice, stopData.stopLoss);
@@ -759,7 +779,6 @@ export async function generateSignals(): Promise<void> {
         tp2 = tps.tp2;
         tp3 = tps.tp3;
         
-        // Handle conflict with opposite direction signal
         if (conflicting) {
           const newConfidence = calculateConfidence(
             eliteTraders.length, goodTraders.length, agreement, avgWinRate,
@@ -905,15 +924,13 @@ export async function generateSignals(): Promise<void> {
       validSignals.push(signalData);
 
       const isNew = !existingSignal;
-      const fundingTag = fundingData.context === 'favorable' ? '✅' : 
-                        fundingData.context === 'unfavorable' ? '⚠️' : '';
-      const convictionTag = avgConvictionPct >= 20 ? '💪' : '';
       
       if (isNew) {
         logger.info(
           `NEW Signal: ${coin} ${direction.toUpperCase()} | ` +
           `${eliteTraders.length}E + ${goodTraders.length}G | ` +
           `Entry: $${entryPrice.toFixed(2)} | Stop: ${stopDistancePct.toFixed(1)}% | ` +
+          `VolRank: ${volatilityRank} | ` +
           `${candidate.signalStrength.toUpperCase()} (${candidate.confidence}%)`
         );
       }

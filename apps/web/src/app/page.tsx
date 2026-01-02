@@ -8,8 +8,6 @@ import {
   ChevronUp, 
   Copy, 
   Check,
-  TrendingUp,
-  TrendingDown,
   Zap,
   Clock,
   ExternalLink
@@ -52,7 +50,7 @@ interface QualitySignal {
   current_price: number;
   current_pnl_pct: number;
   stop_distance_pct: number;
-  avg_entry_price: number;  // Trader average entry
+  avg_entry_price: number;
   created_at: string;
   updated_at: string;
 }
@@ -110,7 +108,7 @@ function formatTimeAgo(dateString: string): string {
 }
 
 function getTraderUrl(address: string): string {
-  return `https://app.hyperliquid.xyz/explorer/address/${address}`;
+  return `https://legacy.hyperdash.io/trader/${address}`;
 }
 
 // ============================================
@@ -124,16 +122,16 @@ function SignalPerformanceSummary({ stats }: { stats: SignalStats | null }) {
   if (closedCount === 0) return null;
   
   return (
-    <div className="flex items-center gap-4 text-sm bg-muted/30 rounded-lg px-4 py-2 mb-6">
-      <span className="text-muted-foreground">Signal Track Record:</span>
+    <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-sm bg-muted/30 rounded-lg px-3 sm:px-4 py-2 mb-4 sm:mb-6">
+      <span className="text-muted-foreground">Track Record:</span>
       <span className="font-medium">{closedCount} closed</span>
-      <span className="text-muted-foreground">·</span>
+      <span className="text-muted-foreground hidden sm:inline">·</span>
       <span className={stats.win_rate >= 50 ? 'text-green-500 font-medium' : 'text-red-500 font-medium'}>
         {stats.win_rate.toFixed(0)}% win rate
       </span>
-      <span className="text-muted-foreground">·</span>
-      <span className="text-green-500">{stats.wins} TP hit</span>
-      <span className="text-muted-foreground">·</span>
+      <span className="text-muted-foreground hidden sm:inline">·</span>
+      <span className="text-green-500">{stats.wins} TP</span>
+      <span className="text-muted-foreground hidden sm:inline">·</span>
       <span className="text-red-500">{stats.stopped} stopped</span>
     </div>
   );
@@ -147,7 +145,7 @@ function CopyTradeButton({ signal }: { signal: QualitySignal }) {
   const [copied, setCopied] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
 
-  const copyValue = async (value: string | number, label: string) => {
+  const copyValue = async (value: string | number) => {
     await navigator.clipboard.writeText(String(value));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -160,31 +158,32 @@ function CopyTradeButton({ signal }: { signal: QualitySignal }) {
     <div className="relative">
       <button
         onClick={() => setShowDropdown(!showDropdown)}
-        className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors text-sm font-medium"
+        className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors text-sm font-medium"
       >
         {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-        {copied ? 'Copied!' : 'Copy Trade'}
+        <span className="hidden sm:inline">{copied ? 'Copied!' : 'Copy Trade'}</span>
+        <span className="sm:hidden">{copied ? 'Copied!' : 'Copy'}</span>
         <ChevronDown className={`h-4 w-4 transition-transform ${showDropdown ? 'rotate-180' : ''}`} />
       </button>
       
       {showDropdown && (
         <div className="absolute right-0 mt-2 w-48 bg-popover border border-border rounded-lg shadow-lg z-10 py-1">
           <button
-            onClick={() => copyValue(entryPrice, 'entry')}
+            onClick={() => copyValue(entryPrice)}
             className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between"
           >
             <span>Entry Price</span>
             <span className="text-muted-foreground font-mono">{formatPrice(entryPrice)}</span>
           </button>
           <button
-            onClick={() => copyValue(signal.stop_loss, 'stop')}
+            onClick={() => copyValue(signal.stop_loss)}
             className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between"
           >
             <span>Stop Loss</span>
             <span className="text-red-500 font-mono">{formatPrice(signal.stop_loss)}</span>
           </button>
           <button
-            onClick={() => copyValue(signal.take_profit_1, 'tp1')}
+            onClick={() => copyValue(signal.take_profit_1)}
             className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between"
           >
             <span>Take Profit 1</span>
@@ -192,14 +191,14 @@ function CopyTradeButton({ signal }: { signal: QualitySignal }) {
           </button>
           <div className="border-t border-border my-1" />
           <button
-            onClick={() => copyValue(signal.take_profit_2, 'tp2')}
+            onClick={() => copyValue(signal.take_profit_2)}
             className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between text-muted-foreground"
           >
             <span>Take Profit 2</span>
             <span className="font-mono">{formatPrice(signal.take_profit_2)}</span>
           </button>
           <button
-            onClick={() => copyValue(signal.take_profit_3, 'tp3')}
+            onClick={() => copyValue(signal.take_profit_3)}
             className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between text-muted-foreground"
           >
             <span>Take Profit 3</span>
@@ -218,7 +217,6 @@ function CopyTradeButton({ signal }: { signal: QualitySignal }) {
 function SignalStory({ signal }: { signal: QualitySignal }) {
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   
-  // Find the lead trader (highest PnL elite, or highest PnL good if no elite)
   const eliteTraders = traders.filter(t => t.tier === 'elite');
   const goodTraders = traders.filter(t => t.tier === 'good');
   
@@ -231,21 +229,18 @@ function SignalStory({ signal }: { signal: QualitySignal }) {
   const isLong = signal.direction === 'long';
   const actionWord = isLong ? 'going long on' : 'shorting';
   
-  // Build the conviction part
   const leadConviction = leadTrader?.conviction_pct;
   const convictionText = leadConviction && leadConviction >= 20 
     ? ` with ${leadConviction.toFixed(0)}% of their account`
     : '';
 
-  // Count supporting traders
   const otherElite = signal.elite_count - (leadTrader?.tier === 'elite' ? 1 : 0);
   const otherGood = signal.good_count - (leadTrader?.tier === 'good' ? 1 : 0);
 
   return (
     <div className="space-y-1">
-      {/* Lead trader story */}
       {leadTrader && (
-        <p className="text-sm">
+        <p className="text-sm leading-relaxed">
           <span className={leadTrader.tier === 'elite' ? 'text-green-500 font-semibold' : 'text-blue-500 font-semibold'}>
             {leadTrader.tier === 'elite' ? 'An Elite' : 'A Good'} trader
           </span>
@@ -260,7 +255,6 @@ function SignalStory({ signal }: { signal: QualitySignal }) {
         </p>
       )}
       
-      {/* Supporting traders */}
       {(otherElite > 0 || otherGood > 0) && (
         <p className="text-sm text-muted-foreground">
           {otherElite > 0 && (
@@ -278,39 +272,6 @@ function SignalStory({ signal }: { signal: QualitySignal }) {
 }
 
 // ============================================
-// ENTRY TIMING INDICATOR
-// ============================================
-
-function EntryTiming({ signal }: { signal: QualitySignal & { avg_entry_price?: number } }) {
-  const signalEntry = signal.entry_price || signal.current_price;
-  const traderAvgEntry = signal.avg_entry_price || signalEntry;
-  
-  if (!traderAvgEntry || traderAvgEntry === signalEntry) return null;
-  
-  const lagPct = ((signalEntry - traderAvgEntry) / traderAvgEntry) * 100;
-  const isLong = signal.direction === 'long';
-  
-  // For longs: if signal entry > trader entry, we're late (chasing)
-  // For shorts: if signal entry < trader entry, we're late (chasing)
-  const isChasing = isLong ? lagPct > 0.5 : lagPct < -0.5;
-  const isEarly = isLong ? lagPct < -0.3 : lagPct > 0.3;
-  
-  if (Math.abs(lagPct) < 0.3) return null; // Don't show if negligible
-  
-  return (
-    <span className={`text-xs px-2 py-0.5 rounded ${
-      isChasing 
-        ? 'bg-yellow-500/20 text-yellow-500' 
-        : isEarly 
-        ? 'bg-green-500/20 text-green-500'
-        : 'bg-muted text-muted-foreground'
-    }`}>
-      {isChasing ? `⚠️ ${Math.abs(lagPct).toFixed(1)}% behind avg entry` : `✅ ${Math.abs(lagPct).toFixed(1)}% ahead`}
-    </span>
-  );
-}
-
-// ============================================
 // PRICE DISPLAY
 // ============================================
 
@@ -318,16 +279,15 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
   const entry = signal.entry_price || signal.current_price;
   const current = signal.current_price;
   const pnlPct = signal.current_pnl_pct || 0;
-  const isLong = signal.direction === 'long';
   const isProfit = pnlPct > 0;
   
   return (
-    <div className="flex items-center gap-4 text-sm">
+    <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 text-sm">
       <div className="flex items-center gap-2">
         <span className="text-muted-foreground">Entry</span>
         <span className="font-mono font-medium">{formatPrice(entry)}</span>
+        <span className="text-muted-foreground hidden sm:inline">→</span>
       </div>
-      <span className="text-muted-foreground">→</span>
       <div className="flex items-center gap-2">
         <span className="text-muted-foreground">Now</span>
         <span className="font-mono font-medium">{formatPrice(current)}</span>
@@ -355,17 +315,17 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   return (
     <Card className="overflow-hidden">
       <CardContent className="p-0">
-        {/* Collapsed View - Always Visible */}
+        {/* Collapsed View */}
         <div 
-          className="p-4 cursor-pointer hover:bg-muted/30 transition-colors"
+          className="p-3 sm:p-4 cursor-pointer hover:bg-muted/30 transition-colors"
           onClick={onToggle}
         >
           {/* Header row */}
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-3">
+          <div className="flex items-start sm:items-center justify-between mb-3 gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {/* Coin + Direction */}
               <div className="flex items-center gap-2">
-                <span className="text-xl font-bold">{signal.coin}</span>
+                <span className="text-lg sm:text-xl font-bold">{signal.coin}</span>
                 <span className={`text-xs font-bold px-2 py-0.5 rounded ${
                   isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
                 }`}>
@@ -373,29 +333,21 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                 </span>
               </div>
               
-              {/* Strength badge */}
-              {signal.signal_strength === 'strong' && (
-                <span className="text-xs font-medium px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
-                  🔥 STRONG
-                </span>
-              )}
-              
               {/* Funding context */}
               {signal.funding_context === 'favorable' && (
                 <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
                   <Zap className="h-3 w-3" />
-                  Funding pays you
+                  <span className="hidden sm:inline">Funding pays you</span>
+                  <span className="sm:hidden">Favorable</span>
                 </span>
               )}
-              
-              {/* Entry timing */}
-              <EntryTiming signal={signal} />
             </div>
             
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 sm:gap-3 shrink-0">
               <span className="text-xs text-muted-foreground flex items-center gap-1">
                 <Clock className="h-3 w-3" />
-                {formatTimeAgo(signal.updated_at || signal.created_at)}
+                <span className="hidden sm:inline">{formatTimeAgo(signal.updated_at || signal.created_at)}</span>
+                <span className="sm:hidden">{formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}</span>
               </span>
               {isExpanded ? (
                 <ChevronUp className="h-5 w-5 text-muted-foreground" />
@@ -409,7 +361,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
           <SignalStory signal={signal} />
           
           {/* Price + Stop */}
-          <div className="mt-4 flex items-center justify-between">
+          <div className="mt-3 sm:mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <PriceDisplay signal={signal} />
             <div className="text-sm">
               <span className="text-muted-foreground">Stop: </span>
@@ -423,30 +375,30 @@ function SignalCard({ signal, isExpanded, onToggle }: {
         
         {/* Expanded View */}
         {isExpanded && (
-          <div className="border-t border-border bg-muted/20 p-4 space-y-4">
+          <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-4">
             {/* Copy Trade Button */}
             <div className="flex justify-end">
               <CopyTradeButton signal={signal} />
             </div>
             
             {/* Take Profit Levels */}
-            <div className="grid grid-cols-3 gap-4 text-sm">
-              <div className="bg-background rounded-lg p-3 text-center">
-                <div className="text-green-400 text-xs mb-1">TP1 (1:1 R:R)</div>
-                <div className="font-mono font-medium text-green-400">{formatPrice(signal.take_profit_1)}</div>
+            <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
+              <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
+                <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
+                <div className="font-mono font-medium text-green-400 text-xs sm:text-sm">{formatPrice(signal.take_profit_1)}</div>
               </div>
-              <div className="bg-background rounded-lg p-3 text-center">
-                <div className="text-green-500 text-xs mb-1">TP2 (2:1 R:R)</div>
-                <div className="font-mono font-medium text-green-500">{formatPrice(signal.take_profit_2)}</div>
+              <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
+                <div className="text-green-500 text-xs mb-1">TP2 (2:1)</div>
+                <div className="font-mono font-medium text-green-500 text-xs sm:text-sm">{formatPrice(signal.take_profit_2)}</div>
               </div>
-              <div className="bg-background rounded-lg p-3 text-center">
-                <div className="text-green-600 text-xs mb-1">TP3 (3:1 R:R)</div>
-                <div className="font-mono font-medium text-green-600">{formatPrice(signal.take_profit_3)}</div>
+              <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
+                <div className="text-green-600 text-xs mb-1">TP3 (3:1)</div>
+                <div className="font-mono font-medium text-green-600 text-xs sm:text-sm">{formatPrice(signal.take_profit_3)}</div>
               </div>
             </div>
             
             {/* Signal Stats */}
-            <div className="grid grid-cols-3 gap-4 text-sm">
+            <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
               <div>
                 <div className="text-muted-foreground text-xs">Combined 7d P&L</div>
                 <div className={`font-medium ${(signal.combined_pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
@@ -487,15 +439,15 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                         </span>
                         <ExternalLink className="h-3 w-3 text-muted-foreground" />
                       </div>
-                      <div className="flex items-center gap-4 text-xs">
+                      <div className="flex items-center gap-2 sm:gap-4 text-xs">
                         <span className={(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}>
                           {formatPnl(trader.pnl_7d || 0)}
                         </span>
-                        <span className="text-muted-foreground">
+                        <span className="text-muted-foreground hidden sm:inline">
                           {((trader.win_rate || 0) * 100).toFixed(0)}% WR
                         </span>
                         {trader.conviction_pct && trader.conviction_pct > 0 && (
-                          <span className="text-muted-foreground">
+                          <span className="text-muted-foreground hidden sm:inline">
                             {trader.conviction_pct.toFixed(0)}% conv
                           </span>
                         )}
@@ -592,7 +544,6 @@ export default function SignalsPage() {
     fetchStats();
     fetchSignalStats();
 
-    // Auto-refresh every 30 seconds
     const interval = setInterval(fetchSignals, 30000);
     return () => clearInterval(interval);
   }, [fetchSignals, fetchStats, fetchSignalStats]);
@@ -613,7 +564,7 @@ export default function SignalsPage() {
 
   if (!mounted) {
     return (
-      <div className="min-h-screen bg-background">
+      <div className="min-h-screen bg-background font-sans">
         <header className="border-b border-border">
           <div className="max-w-3xl mx-auto px-4 py-4">
             <h1 className="text-xl font-semibold">Quality Signals</h1>
@@ -625,20 +576,20 @@ export default function SignalsPage() {
   }
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background font-sans">
       {/* Header */}
-      <header className="border-b border-border">
-        <div className="max-w-3xl mx-auto px-4 py-4">
+      <header className="border-b border-border sticky top-0 bg-background z-20">
+        <div className="max-w-3xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-xl font-semibold">Quality Signals</h1>
-              <p className="text-sm text-muted-foreground">
-                Following {stats?.tracked_count || 0} verified traders
+              <h1 className="text-lg sm:text-xl font-semibold">Quality Signals</h1>
+              <p className="text-xs sm:text-sm text-muted-foreground">
+                Following {stats?.tracked_count || 0} traders
               </p>
             </div>
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 sm:gap-4">
               {stats && (
-                <div className="text-sm">
+                <div className="text-xs sm:text-sm">
                   <span className="text-green-500 font-medium">{stats.elite_count} Elite</span>
                   <span className="text-muted-foreground mx-1">·</span>
                   <span className="text-blue-500 font-medium">{stats.good_count} Good</span>
@@ -647,7 +598,7 @@ export default function SignalsPage() {
               <button
                 onClick={handleRefresh}
                 disabled={isLoading}
-                className="px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 rounded-md transition-colors disabled:opacity-50"
+                className="px-2 sm:px-3 py-1.5 text-xs sm:text-sm bg-secondary hover:bg-secondary/80 rounded-md transition-colors disabled:opacity-50"
               >
                 Refresh
               </button>
@@ -656,17 +607,17 @@ export default function SignalsPage() {
         </div>
       </header>
 
-      <main className="max-w-3xl mx-auto px-4 py-6">
+      <main className="max-w-3xl mx-auto px-3 sm:px-4 py-4 sm:py-6">
         {/* Signal Performance Summary */}
         <SignalPerformanceSummary stats={signalStats} />
         
         {/* Filters */}
-        <div className="flex gap-2 mb-6">
+        <div className="flex gap-2 mb-4 sm:mb-6 overflow-x-auto pb-1">
           {(['all', 'strong', 'long', 'short'] as const).map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
-              className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
+              className={`px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap ${
                 filter === f 
                   ? f === 'long' ? 'bg-green-600 text-white'
                   : f === 'short' ? 'bg-red-600 text-white'
@@ -675,14 +626,14 @@ export default function SignalsPage() {
                   : 'bg-secondary hover:bg-secondary/80'
               }`}
             >
-              {f === 'all' ? 'All' : f === 'strong' ? '🔥 Strong' : f.charAt(0).toUpperCase() + f.slice(1) + 's'}
+              {f === 'all' ? 'All' : f === 'strong' ? 'Strong' : f.charAt(0).toUpperCase() + f.slice(1) + 's'}
             </button>
           ))}
         </div>
 
         {/* Signals */}
         {filteredSignals.length > 0 ? (
-          <div className="space-y-4">
+          <div className="space-y-3 sm:space-y-4">
             {filteredSignals.map((signal) => (
               <SignalCard 
                 key={signal.id} 
@@ -706,7 +657,7 @@ export default function SignalsPage() {
         )}
 
         {/* Footer */}
-        <div className="flex items-center justify-center gap-2 mt-6 text-sm text-muted-foreground">
+        <div className="flex items-center justify-center gap-2 mt-6 text-xs sm:text-sm text-muted-foreground">
           <span className="relative flex h-2 w-2">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
             <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>

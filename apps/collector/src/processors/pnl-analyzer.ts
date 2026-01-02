@@ -130,7 +130,9 @@ export async function analyzeTrader(address: string): Promise<TraderAnalysis | n
     }
 
     const accountValue = parseFloat(state.marginSummary.accountValue);
-    const unrealizedPnl = parseFloat(state.marginSummary.totalUnrealizedPnl || '0');
+    // Note: totalUnrealizedPnl may not exist on all API responses, access safely
+    const marginSummary = state.marginSummary as Record<string, string>;
+    const unrealizedPnl = parseFloat(marginSummary.totalUnrealizedPnl || '0');
 
     // Save today's equity snapshot (builds history over time)
     await saveEquitySnapshot(addrLower, accountValue);

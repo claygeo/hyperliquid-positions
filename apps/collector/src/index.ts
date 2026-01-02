@@ -25,6 +25,32 @@ import { config } from './config.js';
 const logger = createLogger('main-v5');
 
 // ============================================
+// Types
+// ============================================
+
+interface HyperliquidClearinghouseState {
+  marginSummary?: {
+    accountValue?: string;
+    totalMarginUsed?: string;
+    totalNtlPos?: string;
+    totalRawUsd?: string;
+  };
+  assetPositions?: Array<{
+    position: {
+      coin: string;
+      szi: string;
+      entryPx: string;
+      positionValue: string;
+      unrealizedPnl: string;
+      leverage: {
+        type: string;
+        value: number;
+      };
+    };
+  }>;
+}
+
+// ============================================
 // Real-time Fill Handler
 // ============================================
 
@@ -154,9 +180,9 @@ async function saveAllEquitySnapshots(): Promise<void> {
           continue;
         }
         
-        const state = await response.json();
-        const marginSummary = state.marginSummary as Record<string, string>;
-        const accountValue = parseFloat(marginSummary?.accountValue || '0');
+        // Type the response properly
+        const state = await response.json() as HyperliquidClearinghouseState;
+        const accountValue = parseFloat(state.marginSummary?.accountValue || '0');
         
         if (accountValue <= 0) {
           continue; // Skip empty accounts

@@ -133,7 +133,7 @@ function formatPositionAge(traders: TraderInfo[]): string | null {
 }
 
 function getTraderUrl(address: string): string {
-  return `https://legacy.hyperdash.io/trader/${address}`;
+  return `https://legacy.hyperdash.com/trader/${address}`;
 }
 
 // ============================================

@@ -3,6 +3,7 @@
 // - Volatility percentile-based dynamic stops
 // - Smarter minimum/maximum stop distances per volatility tier
 // - No more tight stops getting wicked out
+// - Position age tracking (opened_at) for frontend display
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -60,6 +61,7 @@ interface TraderPosition {
   liquidation_price: number | null;
   has_pending_entry: boolean;
   has_stop_order: boolean;
+  opened_at: string | null;
 }
 
 interface TraderQuality {
@@ -85,6 +87,7 @@ interface TraderWithPosition {
   liquidation_price: number | null;
   conviction_pct: number;
   has_stop_order: boolean;
+  opened_at: string | null;
 }
 
 interface SignalCandidate {
@@ -702,6 +705,7 @@ export async function generateSignals(): Promise<void> {
           liquidation_price: pos.liquidation_price,
           conviction_pct: convictionPct,
           has_stop_order: pos.has_stop_order || false,
+          opened_at: pos.opened_at || null,
         };
 
         if (trader.quality_tier === 'elite') {

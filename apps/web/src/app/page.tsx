@@ -25,6 +25,7 @@ interface TraderInfo {
   position_value: number;
   entry_price: number;
   conviction_pct?: number;
+  opened_at?: string | null;
 }
 
 interface QualitySignal {
@@ -98,6 +99,30 @@ function formatTimeAgo(dateString: string): string {
   const diffMins = Math.floor(diffMs / 60000);
   
   if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}d ago`;
+}
+
+function formatPositionAge(traders: TraderInfo[]): string | null {
+  // Get the most recent opened_at from all traders (freshest entry)
+  const openedDates = traders
+    .map(t => t.opened_at)
+    .filter((d): d is string => d !== null && d !== undefined)
+    .map(d => new Date(d).getTime());
+  
+  if (openedDates.length === 0) return null;
+  
+  // Use the most recent entry time
+  const mostRecent = Math.max(...openedDates);
+  const diffMs = Date.now() - mostRecent;
+  const diffMins = Math.floor(diffMs / 60000);
+  
+  if (diffMins < 1) return 'just now';
   if (diffMins < 60) return `${diffMins}m ago`;
   
   const diffHours = Math.floor(diffMins / 60);
@@ -281,11 +306,17 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
   const pnlPct = signal.current_pnl_pct || 0;
   const isProfit = pnlPct > 0;
   
+  const traders = Array.isArray(signal.traders) ? signal.traders : [];
+  const positionAge = formatPositionAge(traders);
+  
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 text-sm">
       <div className="flex items-center gap-2">
         <span className="text-muted-foreground">Entry</span>
         <span className="font-mono font-medium">{formatPrice(entry)}</span>
+        {positionAge && (
+          <span className="text-muted-foreground">({positionAge})</span>
+        )}
         <span className="text-muted-foreground hidden sm:inline">→</span>
       </div>
       <div className="flex items-center gap-2">

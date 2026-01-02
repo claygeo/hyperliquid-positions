@@ -52,6 +52,7 @@ interface QualitySignal {
   current_price: number;
   current_pnl_pct: number;
   stop_distance_pct: number;
+  avg_entry_price: number;  // Trader average entry
   created_at: string;
   updated_at: string;
 }
@@ -60,6 +61,14 @@ interface SystemStats {
   elite_count: number;
   good_count: number;
   tracked_count: number;
+}
+
+interface SignalStats {
+  total: number;
+  wins: number;
+  stopped: number;
+  open: number;
+  win_rate: number;
 }
 
 // ============================================
@@ -102,6 +111,32 @@ function formatTimeAgo(dateString: string): string {
 
 function getTraderUrl(address: string): string {
   return `https://app.hyperliquid.xyz/explorer/address/${address}`;
+}
+
+// ============================================
+// SIGNAL PERFORMANCE SUMMARY
+// ============================================
+
+function SignalPerformanceSummary({ stats }: { stats: SignalStats | null }) {
+  if (!stats || stats.total === 0) return null;
+  
+  const closedCount = stats.total - stats.open;
+  if (closedCount === 0) return null;
+  
+  return (
+    <div className="flex items-center gap-4 text-sm bg-muted/30 rounded-lg px-4 py-2 mb-6">
+      <span className="text-muted-foreground">Signal Track Record:</span>
+      <span className="font-medium">{closedCount} closed</span>
+      <span className="text-muted-foreground">·</span>
+      <span className={stats.win_rate >= 50 ? 'text-green-500 font-medium' : 'text-red-500 font-medium'}>
+        {stats.win_rate.toFixed(0)}% win rate
+      </span>
+      <span className="text-muted-foreground">·</span>
+      <span className="text-green-500">{stats.wins} TP hit</span>
+      <span className="text-muted-foreground">·</span>
+      <span className="text-red-500">{stats.stopped} stopped</span>
+    </div>
+  );
 }
 
 // ============================================
@@ -243,6 +278,39 @@ function SignalStory({ signal }: { signal: QualitySignal }) {
 }
 
 // ============================================
+// ENTRY TIMING INDICATOR
+// ============================================
+
+function EntryTiming({ signal }: { signal: QualitySignal & { avg_entry_price?: number } }) {
+  const signalEntry = signal.entry_price || signal.current_price;
+  const traderAvgEntry = signal.avg_entry_price || signalEntry;
+  
+  if (!traderAvgEntry || traderAvgEntry === signalEntry) return null;
+  
+  const lagPct = ((signalEntry - traderAvgEntry) / traderAvgEntry) * 100;
+  const isLong = signal.direction === 'long';
+  
+  // For longs: if signal entry > trader entry, we're late (chasing)
+  // For shorts: if signal entry < trader entry, we're late (chasing)
+  const isChasing = isLong ? lagPct > 0.5 : lagPct < -0.5;
+  const isEarly = isLong ? lagPct < -0.3 : lagPct > 0.3;
+  
+  if (Math.abs(lagPct) < 0.3) return null; // Don't show if negligible
+  
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded ${
+      isChasing 
+        ? 'bg-yellow-500/20 text-yellow-500' 
+        : isEarly 
+        ? 'bg-green-500/20 text-green-500'
+        : 'bg-muted text-muted-foreground'
+    }`}>
+      {isChasing ? `⚠️ ${Math.abs(lagPct).toFixed(1)}% behind avg entry` : `✅ ${Math.abs(lagPct).toFixed(1)}% ahead`}
+    </span>
+  );
+}
+
+// ============================================
 // PRICE DISPLAY
 // ============================================
 
@@ -319,6 +387,9 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                   Funding pays you
                 </span>
               )}
+              
+              {/* Entry timing */}
+              <EntryTiming signal={signal} />
             </div>
             
             <div className="flex items-center gap-3">
@@ -448,6 +519,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
 export default function SignalsPage() {
   const [signals, setSignals] = useState<QualitySignal[]>([]);
   const [stats, setStats] = useState<SystemStats | null>(null);
+  const [signalStats, setSignalStats] = useState<SignalStats | null>(null);
   const [filter, setFilter] = useState<'all' | 'strong' | 'long' | 'short'>('all');
   const [expandedSignal, setExpandedSignal] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -491,19 +563,44 @@ export default function SignalsPage() {
     }
   }, [supabase]);
 
+  const fetchSignalStats = useCallback(async () => {
+    const { data } = await supabase
+      .from('quality_signals')
+      .select('outcome')
+      .not('outcome', 'is', null);
+
+    if (data) {
+      const total = data.length;
+      const wins = data.filter(s => ['tp1', 'tp2', 'tp3'].includes(s.outcome)).length;
+      const stopped = data.filter(s => s.outcome === 'stopped').length;
+      const open = data.filter(s => s.outcome === 'open').length;
+      const closed = total - open;
+      
+      setSignalStats({
+        total,
+        wins,
+        stopped,
+        open,
+        win_rate: closed > 0 ? (wins / closed) * 100 : 0
+      });
+    }
+  }, [supabase]);
+
   useEffect(() => {
     setMounted(true);
     fetchSignals();
     fetchStats();
+    fetchSignalStats();
 
     // Auto-refresh every 30 seconds
     const interval = setInterval(fetchSignals, 30000);
     return () => clearInterval(interval);
-  }, [fetchSignals, fetchStats]);
+  }, [fetchSignals, fetchStats, fetchSignalStats]);
 
   const handleRefresh = () => {
     fetchSignals();
     fetchStats();
+    fetchSignalStats();
   };
 
   const filteredSignals = signals.filter((s) => {
@@ -560,6 +657,9 @@ export default function SignalsPage() {
       </header>
 
       <main className="max-w-3xl mx-auto px-4 py-6">
+        {/* Signal Performance Summary */}
+        <SignalPerformanceSummary stats={signalStats} />
+        
         {/* Filters */}
         <div className="flex gap-2 mb-6">
           {(['all', 'strong', 'long', 'short'] as const).map((f) => (

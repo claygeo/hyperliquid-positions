@@ -11,6 +11,7 @@ dotenvConfig();
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
+import { config } from '../config.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 
 const logger = createLogger('backtest-v2');

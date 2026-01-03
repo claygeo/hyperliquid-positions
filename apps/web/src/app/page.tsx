@@ -10,7 +10,8 @@ import {
   Check,
   Zap,
   Clock,
-  ExternalLink
+  ExternalLink,
+  AlertTriangle
 } from 'lucide-react';
 
 // ============================================
@@ -26,6 +27,9 @@ interface TraderInfo {
   entry_price: number;
   conviction_pct?: number;
   opened_at?: string | null;
+  // V9: Track unrealized P&L
+  unrealized_pnl?: number;
+  unrealized_pnl_pct?: number;
 }
 
 interface QualitySignal {
@@ -54,6 +58,8 @@ interface QualitySignal {
   avg_entry_price: number;
   created_at: string;
   updated_at: string;
+  // V9: Lead trader underwater percentage
+  lead_trader_underwater_pct?: number;
 }
 
 interface SystemStats {
@@ -109,7 +115,6 @@ function formatTimeAgo(dateString: string): string {
 }
 
 function formatPositionAge(traders: TraderInfo[]): string | null {
-  // Get the most recent opened_at from all traders (freshest entry)
   const openedDates = traders
     .map(t => t.opened_at)
     .filter((d): d is string => d !== null && d !== undefined)
@@ -117,7 +122,6 @@ function formatPositionAge(traders: TraderInfo[]): string | null {
   
   if (openedDates.length === 0) return null;
   
-  // Use the most recent entry time
   const mostRecent = Math.max(...openedDates);
   const diffMs = Date.now() - mostRecent;
   const diffMins = Math.floor(diffMs / 60000);
@@ -134,6 +138,48 @@ function formatPositionAge(traders: TraderInfo[]): string | null {
 
 function getTraderUrl(address: string): string {
   return `https://legacy.hyperdash.com/trader/${address}`;
+}
+
+// ============================================
+// V9: UNDERWATER WARNING BADGE
+// ============================================
+
+function UnderwaterWarning({ underwaterPct }: { underwaterPct: number }) {
+  if (!underwaterPct || underwaterPct < 5) return null;
+  
+  // Determine severity
+  let severity: 'warning' | 'danger' | 'critical';
+  let message: string;
+  
+  if (underwaterPct >= 50) {
+    severity = 'critical';
+    message = `Lead trader -${underwaterPct.toFixed(0)}% on this position`;
+  } else if (underwaterPct >= 25) {
+    severity = 'danger';
+    message = `Lead trader -${underwaterPct.toFixed(0)}% underwater`;
+  } else {
+    severity = 'warning';
+    message = `Lead trader -${underwaterPct.toFixed(0)}% on position`;
+  }
+  
+  const bgColor = severity === 'critical' 
+    ? 'bg-red-500/20 border-red-500/50' 
+    : severity === 'danger'
+    ? 'bg-orange-500/20 border-orange-500/50'
+    : 'bg-yellow-500/20 border-yellow-500/50';
+    
+  const textColor = severity === 'critical'
+    ? 'text-red-400'
+    : severity === 'danger'
+    ? 'text-orange-400'
+    : 'text-yellow-400';
+  
+  return (
+    <div className={`flex items-center gap-1.5 px-2 py-1 rounded border ${bgColor} ${textColor} text-xs`}>
+      <AlertTriangle className="h-3 w-3" />
+      <span>{message}</span>
+    </div>
+  );
 }
 
 // ============================================
@@ -342,6 +388,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   const isLong = signal.direction === 'long';
   const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
+  const underwaterPct = signal.lead_trader_underwater_pct || 0;
   
   return (
     <Card className="overflow-hidden">
@@ -388,6 +435,13 @@ function SignalCard({ signal, isExpanded, onToggle }: {
             </div>
           </div>
           
+          {/* V9: Underwater Warning */}
+          {underwaterPct >= 5 && (
+            <div className="mb-3">
+              <UnderwaterWarning underwaterPct={underwaterPct} />
+            </div>
+          )}
+          
           {/* Story */}
           <SignalStory signal={signal} />
           
@@ -411,6 +465,23 @@ function SignalCard({ signal, isExpanded, onToggle }: {
             <div className="flex justify-end">
               <CopyTradeButton signal={signal} />
             </div>
+            
+            {/* V9: More prominent underwater warning in expanded view */}
+            {underwaterPct >= 10 && (
+              <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="h-4 w-4 text-orange-400 mt-0.5 shrink-0" />
+                  <div className="text-sm">
+                    <p className="text-orange-400 font-medium">Lead trader is underwater</p>
+                    <p className="text-muted-foreground mt-1">
+                      The primary trader driving this signal is currently down {underwaterPct.toFixed(0)}% on this position. 
+                      While past performance is strong, this position is currently not working for them. 
+                      Consider this risk before entering.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
             
             {/* Take Profit Levels */}
             <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
@@ -451,40 +522,51 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               <div>
                 <div className="text-xs text-muted-foreground mb-2">Traders in this signal</div>
                 <div className="space-y-2">
-                  {traders.map((trader) => (
-                    <a
-                      key={trader.address}
-                      href={getTraderUrl(trader.address)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center justify-between p-2 bg-background rounded-lg hover:bg-muted/50 transition-colors"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                          trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
-                        }`}>
-                          {trader.tier === 'elite' ? 'Elite' : 'Good'}
-                        </span>
-                        <span className="font-mono text-xs text-muted-foreground">
-                          {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
-                        </span>
-                        <ExternalLink className="h-3 w-3 text-muted-foreground" />
-                      </div>
-                      <div className="flex items-center gap-2 sm:gap-4 text-xs">
-                        <span className={(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}>
-                          {formatPnl(trader.pnl_7d || 0)}
-                        </span>
-                        <span className="text-muted-foreground hidden sm:inline">
-                          {((trader.win_rate || 0) * 100).toFixed(0)}% WR
-                        </span>
-                        {trader.conviction_pct && trader.conviction_pct > 0 && (
-                          <span className="text-muted-foreground hidden sm:inline">
-                            {trader.conviction_pct.toFixed(0)}% conv
+                  {traders.map((trader) => {
+                    const traderUnderwater = (trader.unrealized_pnl_pct || 0) < 0;
+                    const traderUnderwaterPct = traderUnderwater ? Math.abs(trader.unrealized_pnl_pct || 0) : 0;
+                    
+                    return (
+                      <a
+                        key={trader.address}
+                        href={getTraderUrl(trader.address)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center justify-between p-2 bg-background rounded-lg hover:bg-muted/50 transition-colors"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                            trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
+                          }`}>
+                            {trader.tier === 'elite' ? 'Elite' : 'Good'}
                           </span>
-                        )}
-                      </div>
-                    </a>
-                  ))}
+                          <span className="font-mono text-xs text-muted-foreground">
+                            {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
+                          </span>
+                          <ExternalLink className="h-3 w-3 text-muted-foreground" />
+                        </div>
+                        <div className="flex items-center gap-2 sm:gap-4 text-xs">
+                          <span className={(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}>
+                            {formatPnl(trader.pnl_7d || 0)}
+                          </span>
+                          <span className="text-muted-foreground hidden sm:inline">
+                            {((trader.win_rate || 0) * 100).toFixed(0)}% WR
+                          </span>
+                          {trader.conviction_pct && trader.conviction_pct > 0 && (
+                            <span className="text-muted-foreground hidden sm:inline">
+                              {trader.conviction_pct.toFixed(0)}% conv
+                            </span>
+                          )}
+                          {/* V9: Show if individual trader is underwater */}
+                          {traderUnderwaterPct >= 5 && (
+                            <span className="text-orange-400 text-xs">
+                              -{traderUnderwaterPct.toFixed(0)}%
+                            </span>
+                          )}
+                        </div>
+                      </a>
+                    );
+                  })}
                 </div>
               </div>
             )}

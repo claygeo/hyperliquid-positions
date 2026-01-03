@@ -1,16 +1,17 @@
-// Trader Re-evaluation V4
-// - Weekly full re-evaluation of all tracked traders
-// - Demotion/promotion logic based on recent performance
-// - Historical performance tracking
-// - ROI-based demotion checks
-// - Can be run manually or on a schedule
+// Trader Re-evaluation V5
+// Enhanced from V4 with:
+// - Sustained unrealized drawdown demotion (>50% for >24 hours = demote)
+// - Track unrealized drawdown start time
+// - Factor current position health into re-evaluation
+// - More nuanced demotion for traders holding underwater positions
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import { config } from '../config.js';
 import { analyzeTrader, saveTraderAnalysis, TraderAnalysis } from './pnl-analyzer.js';
+import hyperliquid from '../utils/hyperliquid-api.js';
 
-const logger = createLogger('trader-reeval');
+const logger = createLogger('trader-reeval-v5');
 
 // ============================================
 // Types
@@ -39,6 +40,173 @@ interface ReEvalStats {
   newElite: number;
   newGood: number;
   removedFromTracking: number;
+  demotedForDrawdown: number;
+}
+
+interface TraderPositionSummary {
+  totalUnrealizedPnl: number;
+  totalPositionValue: number;
+  unrealizedPnlPct: number;
+  worstPositionPct: number;
+  positionCount: number;
+}
+
+// ============================================
+// V5: Unrealized Drawdown Functions
+// ============================================
+
+/**
+ * Get current unrealized P&L across all positions for a trader
+ */
+async function getTraderUnrealizedPnl(address: string): Promise<TraderPositionSummary | null> {
+  try {
+    const { data: positions, error } = await db.client
+      .from('trader_positions')
+      .select('unrealized_pnl, value_usd')
+      .eq('address', address.toLowerCase());
+    
+    if (error || !positions || positions.length === 0) {
+      return null;
+    }
+    
+    let totalUnrealizedPnl = 0;
+    let totalPositionValue = 0;
+    let worstPositionPct = 0;
+    
+    for (const pos of positions) {
+      const unrealizedPnl = parseFloat(pos.unrealized_pnl) || 0;
+      const valueUsd = parseFloat(pos.value_usd) || 0;
+      
+      totalUnrealizedPnl += unrealizedPnl;
+      totalPositionValue += valueUsd;
+      
+      // Track worst individual position
+      if (valueUsd > 0) {
+        const posPct = (unrealizedPnl / valueUsd) * 100;
+        if (posPct < worstPositionPct) {
+          worstPositionPct = posPct;
+        }
+      }
+    }
+    
+    const unrealizedPnlPct = totalPositionValue > 0 
+      ? (totalUnrealizedPnl / totalPositionValue) * 100 
+      : 0;
+    
+    return {
+      totalUnrealizedPnl,
+      totalPositionValue,
+      unrealizedPnlPct,
+      worstPositionPct,
+      positionCount: positions.length,
+    };
+  } catch (err) {
+    logger.error(`Failed to get unrealized P&L for ${address}`, err);
+    return null;
+  }
+}
+
+/**
+ * Update unrealized drawdown tracking in database
+ */
+async function updateUnrealizedDrawdownTracking(
+  address: string,
+  currentDrawdownPct: number
+): Promise<void> {
+  try {
+    const { data: trader } = await db.client
+      .from('trader_quality')
+      .select('max_unrealized_drawdown_pct, unrealized_drawdown_since')
+      .eq('address', address.toLowerCase())
+      .single();
+    
+    const now = new Date().toISOString();
+    const updates: Record<string, unknown> = {
+      current_unrealized_pnl_pct: -currentDrawdownPct, // Store as negative since it's a loss
+    };
+    
+    // If currently in drawdown
+    if (currentDrawdownPct > 0) {
+      // Update max if this is worse
+      if (!trader?.max_unrealized_drawdown_pct || currentDrawdownPct > trader.max_unrealized_drawdown_pct) {
+        updates.max_unrealized_drawdown_pct = currentDrawdownPct;
+      }
+      
+      // Start tracking if not already
+      if (!trader?.unrealized_drawdown_since) {
+        updates.unrealized_drawdown_since = now;
+        logger.debug(`${address.slice(0, 10)}... started drawdown tracking at ${currentDrawdownPct.toFixed(1)}%`);
+      }
+    } else {
+      // No longer in drawdown, reset tracking
+      updates.unrealized_drawdown_since = null;
+      // Keep max_unrealized_drawdown_pct for historical reference
+    }
+    
+    await db.client
+      .from('trader_quality')
+      .update(updates)
+      .eq('address', address.toLowerCase());
+      
+  } catch (err) {
+    logger.error(`Failed to update drawdown tracking for ${address}`, err);
+  }
+}
+
+/**
+ * Check if trader should be demoted due to sustained unrealized drawdown
+ */
+async function shouldDemoteForSustainedDrawdown(
+  address: string,
+  currentDrawdownPct: number
+): Promise<{ demote: boolean; reason: string }> {
+  try {
+    const { data: trader } = await db.client
+      .from('trader_quality')
+      .select('unrealized_drawdown_since, quality_tier')
+      .eq('address', address.toLowerCase())
+      .single();
+    
+    if (!trader) {
+      return { demote: false, reason: '' };
+    }
+    
+    // V5: Demotion thresholds
+    const SEVERE_DRAWDOWN_PCT = 50;   // Severe drawdown threshold
+    const SUSTAINED_HOURS = 24;       // How long before demotion
+    const CRITICAL_DRAWDOWN_PCT = 75; // Immediate demotion threshold
+    
+    // Critical drawdown = immediate demotion
+    if (currentDrawdownPct >= CRITICAL_DRAWDOWN_PCT) {
+      return { 
+        demote: true, 
+        reason: `critical unrealized drawdown: -${currentDrawdownPct.toFixed(0)}%` 
+      };
+    }
+    
+    // Severe sustained drawdown
+    if (currentDrawdownPct >= SEVERE_DRAWDOWN_PCT && trader.unrealized_drawdown_since) {
+      const drawdownStart = new Date(trader.unrealized_drawdown_since).getTime();
+      const hoursInDrawdown = (Date.now() - drawdownStart) / (1000 * 60 * 60);
+      
+      if (hoursInDrawdown >= SUSTAINED_HOURS) {
+        return { 
+          demote: true, 
+          reason: `sustained ${currentDrawdownPct.toFixed(0)}% drawdown for ${hoursInDrawdown.toFixed(0)}h` 
+        };
+      }
+      
+      logger.debug(
+        `${address.slice(0, 10)}... in ${currentDrawdownPct.toFixed(0)}% drawdown for ${hoursInDrawdown.toFixed(1)}h ` +
+        `(demote at ${SUSTAINED_HOURS}h)`
+      );
+    }
+    
+    return { demote: false, reason: '' };
+  } catch (err) {
+    logger.error(`Failed to check sustained drawdown for ${address}`, err);
+    return { demote: false, reason: '' };
+  }
 }
 
 // ============================================
@@ -46,8 +214,7 @@ interface ReEvalStats {
 // ============================================
 
 /**
- * Check if elite trader should be demoted
- * Uses both absolute PnL and ROI% thresholds
+ * Check if elite trader should be demoted (V5: includes unrealized drawdown)
  */
 function shouldDemoteElite(trader: TraderAnalysis): { demote: boolean; reason: string } {
   const { demoteEliteIf } = config.reeval;
@@ -77,7 +244,6 @@ function shouldDemoteElite(trader: TraderAnalysis): { demote: boolean; reason: s
 
 /**
  * Check if good trader should be demoted
- * Uses both absolute PnL and ROI% thresholds
  */
 function shouldDemoteGood(trader: TraderAnalysis): { demote: boolean; reason: string } {
   const { demoteGoodIf } = config.reeval;
@@ -138,7 +304,6 @@ async function updateTierChangeTracking(
   if (newTier === previousTier) return;
   
   try {
-    // Get current tier change count
     const { data: trader } = await db.client
       .from('trader_quality')
       .select('tier_change_count')
@@ -162,12 +327,12 @@ async function updateTierChangeTracking(
 // ============================================
 
 /**
- * Run full re-evaluation of all tracked traders
+ * Run full re-evaluation of all tracked traders (V5)
  */
 export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
   logger.info('');
   logger.info('='.repeat(60));
-  logger.info('TRADER RE-EVALUATION V4');
+  logger.info('TRADER RE-EVALUATION V5');
   logger.info('='.repeat(60));
   logger.info('');
   
@@ -179,6 +344,7 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
     newElite: 0,
     newGood: 0,
     removedFromTracking: 0,
+    demotedForDrawdown: 0,
   };
   
   try {
@@ -201,11 +367,73 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
       stats.totalEvaluated++;
       const previousTier = trader.quality_tier as string;
       
-      // Re-analyze trader with fresh data
+      // ============================================
+      // V5: Check unrealized drawdown FIRST
+      // ============================================
+      const unrealizedSummary = await getTraderUnrealizedPnl(trader.address);
+      let demotedByDrawdown = false;
+      
+      if (unrealizedSummary) {
+        const currentDrawdownPct = unrealizedSummary.unrealizedPnlPct < 0 
+          ? Math.abs(unrealizedSummary.unrealizedPnlPct) 
+          : 0;
+        
+        // Update tracking
+        await updateUnrealizedDrawdownTracking(trader.address, currentDrawdownPct);
+        
+        // Check if should demote for sustained drawdown
+        const { demote, reason } = await shouldDemoteForSustainedDrawdown(
+          trader.address,
+          currentDrawdownPct
+        );
+        
+        if (demote) {
+          // Demote directly due to sustained unrealized loss
+          const newTier = previousTier === 'elite' ? 'good' : 'weak';
+          const isTracked = newTier !== 'weak';
+          
+          await db.client
+            .from('trader_quality')
+            .update({
+              quality_tier: newTier,
+              is_tracked: isTracked,
+            })
+            .eq('address', trader.address);
+          
+          await updateTierChangeTracking(trader.address, newTier, previousTier);
+          
+          await saveTraderHistory({
+            address: trader.address,
+            pnl_7d: trader.pnl_7d || 0,
+            pnl_30d: trader.pnl_30d || 0,
+            roi_7d_pct: trader.roi_7d_pct || 0,
+            roi_30d_pct: trader.roi_30d_pct || 0,
+            win_rate: trader.win_rate || 0,
+            profit_factor: trader.profit_factor || 1,
+            total_trades: trader.total_trades || 0,
+            quality_tier: newTier,
+            previous_tier: previousTier,
+            tier_changed: true,
+            change_reason: `unrealized_drawdown: ${reason}`,
+          });
+          
+          logger.info(`🔻 ${trader.address.slice(0, 10)}... ${previousTier.toUpperCase()} → ${newTier.toUpperCase()}: ${reason}`);
+          
+          stats.demoted++;
+          stats.demotedForDrawdown++;
+          if (!isTracked) stats.removedFromTracking++;
+          demotedByDrawdown = true;
+          
+          continue; // Skip regular analysis
+        }
+      }
+      
+      // ============================================
+      // Regular re-analysis
+      // ============================================
       const analysis = await analyzeTrader(trader.address);
       
       if (!analysis) {
-        // Couldn't analyze - might have no recent trades
         logger.warn(`${trader.address.slice(0, 10)}... - Could not analyze, removing from tracking`);
         
         await db.client
@@ -243,7 +471,6 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
       if (previousTier === 'elite') {
         const { demote, reason } = shouldDemoteElite(analysis);
         if (demote) {
-          // Check if they still qualify as good
           if (analysis.quality_tier === 'good') {
             finalTier = 'good';
             changeReason = `demoted: ${reason}`;
@@ -353,7 +580,7 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
     logger.info('='.repeat(60));
     logger.info(`Total evaluated: ${stats.totalEvaluated}`);
     logger.info(`Promoted: ${stats.promoted}`);
-    logger.info(`Demoted: ${stats.demoted}`);
+    logger.info(`Demoted: ${stats.demoted} (${stats.demotedForDrawdown} for unrealized drawdown)`);
     logger.info(`Maintained: ${stats.maintained}`);
     logger.info(`Removed from tracking: ${stats.removedFromTracking}`);
     logger.info(`New Elite: ${stats.newElite}`);
@@ -365,6 +592,76 @@ export async function reEvaluateAllTraders(): Promise<ReEvalStats> {
   }
   
   return stats;
+}
+
+/**
+ * V5: Quick check of just unrealized drawdowns (can run more frequently)
+ * This doesn't do full analysis, just checks current position health
+ */
+export async function checkUnrealizedDrawdowns(): Promise<number> {
+  logger.info('Checking unrealized drawdowns...');
+  
+  let demotedCount = 0;
+  
+  try {
+    const { data: trackedTraders, error } = await db.client
+      .from('trader_quality')
+      .select('address, quality_tier')
+      .eq('is_tracked', true)
+      .in('quality_tier', ['elite', 'good']);
+    
+    if (error || !trackedTraders) {
+      return 0;
+    }
+    
+    for (const trader of trackedTraders) {
+      const unrealizedSummary = await getTraderUnrealizedPnl(trader.address);
+      
+      if (!unrealizedSummary) continue;
+      
+      const currentDrawdownPct = unrealizedSummary.unrealizedPnlPct < 0 
+        ? Math.abs(unrealizedSummary.unrealizedPnlPct) 
+        : 0;
+      
+      // Update tracking
+      await updateUnrealizedDrawdownTracking(trader.address, currentDrawdownPct);
+      
+      // Check if should demote
+      const { demote, reason } = await shouldDemoteForSustainedDrawdown(
+        trader.address,
+        currentDrawdownPct
+      );
+      
+      if (demote) {
+        const previousTier = trader.quality_tier;
+        const newTier = previousTier === 'elite' ? 'good' : 'weak';
+        const isTracked = newTier !== 'weak';
+        
+        await db.client
+          .from('trader_quality')
+          .update({
+            quality_tier: newTier,
+            is_tracked: isTracked,
+          })
+          .eq('address', trader.address);
+        
+        logger.info(`🔻 ${trader.address.slice(0, 10)}... ${previousTier.toUpperCase()} → ${newTier.toUpperCase()}: ${reason}`);
+        demotedCount++;
+      }
+      
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    
+    if (demotedCount > 0) {
+      logger.info(`Demoted ${demotedCount} traders due to sustained drawdown`);
+    }
+    
+  } catch (error) {
+    logger.error('Drawdown check failed', error);
+  }
+  
+  return demotedCount;
 }
 
 /**
@@ -417,9 +714,25 @@ export async function getVolatileTraders(limit: number = 10): Promise<unknown[]>
   return data || [];
 }
 
+/**
+ * V5: Get traders currently in drawdown
+ */
+export async function getTradersInDrawdown(): Promise<unknown[]> {
+  const { data } = await db.client
+    .from('trader_quality')
+    .select('address, quality_tier, max_unrealized_drawdown_pct, unrealized_drawdown_since, current_unrealized_pnl_pct')
+    .eq('is_tracked', true)
+    .not('unrealized_drawdown_since', 'is', null)
+    .order('max_unrealized_drawdown_pct', { ascending: false });
+  
+  return data || [];
+}
+
 export default {
   reEvaluateAllTraders,
+  checkUnrealizedDrawdowns,
   cleanupOldHistory,
   getTraderHistory,
   getVolatileTraders,
+  getTradersInDrawdown,
 };

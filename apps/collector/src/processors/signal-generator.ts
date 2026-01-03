@@ -1,9 +1,9 @@
-// Signal Generator V8
-// Enhanced from V7 with:
-// - Volatility percentile-based dynamic stops
-// - Smarter minimum/maximum stop distances per volatility tier
-// - No more tight stops getting wicked out
-// - Position age tracking (opened_at) for frontend display
+// Signal Generator V9
+// Enhanced from V8 with:
+// - Confidence penalty when lead traders are underwater on position
+// - Track lead trader unrealized P&L for frontend warning
+// - Risk score adjustment based on current position health
+// - Store lead_trader_underwater_pct in signal for UI display
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -11,36 +11,25 @@ import { config } from '../config.js';
 import hyperliquid from '../utils/hyperliquid-api.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v8');
+const logger = createLogger('signal-generator-v9');
 
 // ============================================
 // V8: Volatility-Based Stop Configuration
 // ============================================
 
-/**
- * Calculate dynamic stop based on volatility percentile
- * Higher volatility = wider stops to avoid wicking
- */
 function calculateDynamicStopDistance(
   atrPct: number,
   volatilityRank: number
 ): { minStop: number; maxStop: number; multiplier: number } {
-  // volatilityRank is 0-100 (percentile vs all coins)
-  
   if (volatilityRank >= 80) {
-    // Top 20% most volatile (memecoins, small caps)
     return { minStop: 10, maxStop: 25, multiplier: 2.5 };
   } else if (volatilityRank >= 60) {
-    // High volatility (HYPE, newer alts)
     return { minStop: 7, maxStop: 15, multiplier: 2.0 };
   } else if (volatilityRank >= 40) {
-    // Medium volatility (SOL, AVAX, mid-caps)
     return { minStop: 5, maxStop: 12, multiplier: 2.0 };
   } else if (volatilityRank >= 20) {
-    // Low-medium volatility (ETH)
     return { minStop: 4, maxStop: 10, multiplier: 1.75 };
   } else {
-    // Lowest volatility (BTC, stables)
     return { minStop: 3, maxStop: 8, multiplier: 1.5 };
   }
 }
@@ -88,6 +77,9 @@ interface TraderWithPosition {
   conviction_pct: number;
   has_stop_order: boolean;
   opened_at: string | null;
+  // V9: Track unrealized P&L for this position
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
 }
 
 interface SignalCandidate {
@@ -123,6 +115,8 @@ interface SignalCandidate {
   riskScore: number;
   confidence: number;
   signalStrength: 'strong' | 'medium';
+  // V9: Track lead trader underwater percentage
+  leadTraderUnderwaterPct: number;
 }
 
 interface ExistingSignal {
@@ -188,18 +182,16 @@ async function calculateEnhancedStopLoss(
     .eq('coin', coin)
     .single();
 
-  let atrPct = 5; // Default 5% if no data
-  let volatilityRank = 50; // Default medium
+  let atrPct = 5;
+  let volatilityRank = 50;
   
   if (volData && volData.atr_14d && volData.last_price) {
     atrPct = (parseFloat(volData.atr_14d) / parseFloat(volData.last_price)) * 100;
     volatilityRank = volData.volatility_rank || 50;
   }
 
-  // V8: Get dynamic stop parameters based on volatility
   const stopConfig = calculateDynamicStopDistance(atrPct, volatilityRank);
   
-  // Calculate stop distance: ATR * multiplier, clamped to min/max
   let stopDistancePct = atrPct * stopConfig.multiplier;
   stopDistancePct = Math.max(stopConfig.minStop, Math.min(stopConfig.maxStop, stopDistancePct));
 
@@ -223,7 +215,6 @@ async function calculateEnhancedStopLoss(
       const liqBasedStop = Math.max(...liqPrices) * 1.15;
       stopLoss = Math.max(stopLoss, liqBasedStop);
     }
-    // Ensure stop is below entry for longs
     stopLoss = Math.min(stopLoss, entryPrice * (1 - stopConfig.minStop / 100));
   } else {
     stopLoss = entryPrice * (1 + stopDistancePct / 100);
@@ -231,7 +222,6 @@ async function calculateEnhancedStopLoss(
       const liqBasedStop = Math.min(...liqPrices) * 0.85;
       stopLoss = Math.min(stopLoss, liqBasedStop);
     }
-    // Ensure stop is above entry for shorts
     stopLoss = Math.max(stopLoss, entryPrice * (1 + stopConfig.minStop / 100));
   }
 
@@ -260,7 +250,6 @@ function calculateTakeProfits(
     tp2 = entry + riskDistance * 2;
     tp3 = entry + riskDistance * 3;
     
-    // Validate TPs are above entry for longs
     if (tp1 <= entry || tp2 <= entry || tp3 <= entry) {
       logger.error(`TP calculation error for LONG: entry=${entry}, stop=${stopLoss}, tp1=${tp1}`);
       tp1 = entry * 1.02;
@@ -272,7 +261,6 @@ function calculateTakeProfits(
     tp2 = entry - riskDistance * 2;
     tp3 = entry - riskDistance * 3;
     
-    // Validate TPs are below entry for shorts
     if (tp1 >= entry || tp2 >= entry || tp3 >= entry) {
       logger.error(`TP calculation error for SHORT: entry=${entry}, stop=${stopLoss}, tp1=${tp1}`);
       tp1 = entry * 0.98;
@@ -298,6 +286,39 @@ function calculateSuggestedLeverage(
   );
 }
 
+// ============================================
+// V9: Calculate lead trader underwater percentage
+// ============================================
+
+function calculateLeadTraderUnderwaterPct(traders: TraderWithPosition[]): number {
+  if (traders.length === 0) return 0;
+  
+  // Find lead trader (highest 7d P&L among elite, or highest among good)
+  const elites = traders.filter(t => t.tier === 'elite');
+  const goods = traders.filter(t => t.tier === 'good');
+  
+  let leadTrader: TraderWithPosition | null = null;
+  
+  if (elites.length > 0) {
+    leadTrader = elites.reduce((best, t) => t.pnl_7d > best.pnl_7d ? t : best);
+  } else if (goods.length > 0) {
+    leadTrader = goods.reduce((best, t) => t.pnl_7d > best.pnl_7d ? t : best);
+  }
+  
+  if (!leadTrader) return 0;
+  
+  // If unrealized_pnl_pct is negative, trader is underwater
+  if (leadTrader.unrealized_pnl_pct < 0) {
+    return Math.abs(leadTrader.unrealized_pnl_pct);
+  }
+  
+  return 0; // Lead trader is in profit
+}
+
+// ============================================
+// V9: Confidence with underwater penalty
+// ============================================
+
 function calculateConfidence(
   eliteCount: number,
   goodCount: number,
@@ -308,49 +329,85 @@ function calculateConfidence(
   avgConvictionPct: number,
   fundingContext: string,
   tradersWithStops: number,
-  totalTraders: number
+  totalTraders: number,
+  leadTraderUnderwaterPct: number = 0
 ): number {
   let confidence = 0;
 
+  // Trader count scoring
   if (eliteCount >= 3) confidence += 25;
   else if (eliteCount >= 2) confidence += 20;
   else if (eliteCount >= 1) confidence += 15;
   else if (goodCount >= 4) confidence += 12;
   else if (goodCount >= 3) confidence += 8;
 
+  // Agreement scoring
   if (agreement >= 0.9) confidence += 20;
   else if (agreement >= 0.8) confidence += 15;
   else if (agreement >= 0.7) confidence += 10;
   else confidence += 5;
 
+  // Win rate scoring
   if (avgWinRate >= 0.6) confidence += 15;
   else if (avgWinRate >= 0.55) confidence += 12;
   else if (avgWinRate >= 0.5) confidence += 8;
   else confidence += 4;
 
+  // Profit factor scoring
   if (avgProfitFactor >= 2.0) confidence += 10;
   else if (avgProfitFactor >= 1.5) confidence += 7;
   else if (avgProfitFactor >= 1.2) confidence += 4;
 
+  // Combined P&L scoring
   if (combinedPnl7d >= 100000) confidence += 10;
   else if (combinedPnl7d >= 50000) confidence += 7;
   else if (combinedPnl7d >= 25000) confidence += 5;
   else if (combinedPnl7d >= 10000) confidence += 3;
 
+  // Conviction scoring
   if (avgConvictionPct >= 30) confidence += 10;
   else if (avgConvictionPct >= 20) confidence += 7;
   else if (avgConvictionPct >= 10) confidence += 4;
   else if (avgConvictionPct >= 5) confidence += 2;
 
+  // Funding context
   if (fundingContext === 'favorable') confidence += 5;
   else if (fundingContext === 'neutral') confidence += 2;
 
+  // Stop orders
   const stopRatio = totalTraders > 0 ? tradersWithStops / totalTraders : 0;
   if (stopRatio >= 0.5) confidence += 5;
   else if (stopRatio >= 0.25) confidence += 2;
 
-  return Math.min(100, confidence);
+  // ============================================
+  // V9: UNDERWATER PENALTY
+  // Reduce confidence when lead traders are underwater
+  // ============================================
+  if (leadTraderUnderwaterPct > 0) {
+    if (leadTraderUnderwaterPct >= 50) {
+      // Severe: Lead trader down 50%+ on this position
+      confidence -= 30;
+      logger.debug(`Confidence -30: lead trader ${leadTraderUnderwaterPct.toFixed(1)}% underwater`);
+    } else if (leadTraderUnderwaterPct >= 25) {
+      // Major: Lead trader down 25-50%
+      confidence -= 20;
+      logger.debug(`Confidence -20: lead trader ${leadTraderUnderwaterPct.toFixed(1)}% underwater`);
+    } else if (leadTraderUnderwaterPct >= 10) {
+      // Moderate: Lead trader down 10-25%
+      confidence -= 10;
+      logger.debug(`Confidence -10: lead trader ${leadTraderUnderwaterPct.toFixed(1)}% underwater`);
+    } else if (leadTraderUnderwaterPct >= 5) {
+      // Minor: Lead trader down 5-10%
+      confidence -= 5;
+    }
+  }
+
+  return Math.max(0, Math.min(100, confidence));
 }
+
+// ============================================
+// V9: Risk score with underwater factor
+// ============================================
 
 function calculateRiskScore(
   agreement: number,
@@ -359,7 +416,8 @@ function calculateRiskScore(
   stopDistancePct: number,
   eliteCount: number,
   volatilityRank: number,
-  fundingContext: string
+  fundingContext: string,
+  leadTraderUnderwaterPct: number = 0
 ): number {
   let risk = 50;
 
@@ -384,6 +442,11 @@ function calculateRiskScore(
   else if (volatilityRank >= 40) risk += 5;
 
   if (fundingContext === 'unfavorable') risk += 10;
+
+  // V9: Increase risk when lead trader is underwater
+  if (leadTraderUnderwaterPct >= 25) risk += 20;
+  else if (leadTraderUnderwaterPct >= 10) risk += 10;
+  else if (leadTraderUnderwaterPct >= 5) risk += 5;
 
   return Math.max(0, Math.min(100, risk));
 }
@@ -692,6 +755,12 @@ export async function generateSignals(): Promise<void> {
           : 0;
         const convictionPct = Math.min(100, rawConviction);
 
+        // V9: Calculate unrealized P&L percentage for this position
+        const unrealizedPnl = pos.unrealized_pnl || 0;
+        const unrealizedPnlPct = pos.value_usd > 0 
+          ? (unrealizedPnl / pos.value_usd) * 100 
+          : 0;
+
         const traderWithPos: TraderWithPosition = {
           address: pos.address,
           tier: trader.quality_tier as 'elite' | 'good',
@@ -706,6 +775,8 @@ export async function generateSignals(): Promise<void> {
           conviction_pct: convictionPct,
           has_stop_order: pos.has_stop_order || false,
           opened_at: pos.opened_at || null,
+          unrealized_pnl: unrealizedPnl,
+          unrealized_pnl_pct: unrealizedPnlPct,
         };
 
         if (trader.quality_tier === 'elite') {
@@ -729,6 +800,9 @@ export async function generateSignals(): Promise<void> {
       const maxConvictionPct = Math.max(...allTraders.map(t => t.conviction_pct));
       const tradersWithStops = allTraders.filter(t => t.has_stop_order).length;
 
+      // V9: Calculate lead trader underwater percentage
+      const leadTraderUnderwaterPct = calculateLeadTraderUnderwaterPct(allTraders);
+
       const currentPrice = await getCurrentPrice(coin);
       if (!currentPrice) continue;
 
@@ -738,7 +812,6 @@ export async function generateSignals(): Promise<void> {
       const existingSignal = existingSignalMap.get(signalKey);
       const conflicting = await hasConflictingActiveSignal(coin, direction);
       
-      // Use existing entry/stop/TPs if signal exists, don't recalculate
       let entryPrice: number;
       let stopLoss: number;
       let stopDistancePct: number;
@@ -756,7 +829,6 @@ export async function generateSignals(): Promise<void> {
         volatilityRank = 50;
         atrMultiple = 2.0;
         
-        // Validate existing TPs are in correct direction
         const tpValid = direction === 'long' 
           ? (tp1 > entryPrice && tp2 > entryPrice && tp3 > entryPrice)
           : (tp1 < entryPrice && tp2 < entryPrice && tp3 < entryPrice);
@@ -787,7 +859,7 @@ export async function generateSignals(): Promise<void> {
           const newConfidence = calculateConfidence(
             eliteTraders.length, goodTraders.length, agreement, avgWinRate,
             avgProfitFactor, combinedPnl7d, avgConvictionPct, 'neutral',
-            tradersWithStops, allTraders.length
+            tradersWithStops, allTraders.length, leadTraderUnderwaterPct
           );
           
           if (newConfidence > conflicting.confidence) {
@@ -853,6 +925,7 @@ export async function generateSignals(): Promise<void> {
         riskScore: 0,
         confidence: 0,
         signalStrength: 'medium',
+        leadTraderUnderwaterPct,
       };
 
       if (!meetsSignalRequirements(candidate)) {
@@ -866,7 +939,8 @@ export async function generateSignals(): Promise<void> {
         stopDistancePct,
         eliteTraders.length,
         volatilityRank,
-        fundingData.context
+        fundingData.context,
+        leadTraderUnderwaterPct
       );
 
       candidate.confidence = calculateConfidence(
@@ -879,7 +953,8 @@ export async function generateSignals(): Promise<void> {
         avgConvictionPct,
         fundingData.context,
         tradersWithStops,
-        allTraders.length
+        allTraders.length,
+        leadTraderUnderwaterPct
       );
 
       candidate.signalStrength = determineSignalStrength(eliteTraders.length, goodTraders.length);
@@ -923,6 +998,8 @@ export async function generateSignals(): Promise<void> {
         is_active: true,
         outcome: existingSignal?.outcome || 'open',
         expires_at: existingSignal?.expires_at || new Date(Date.now() + config.signals.expiryHours * 60 * 60 * 1000).toISOString(),
+        // V9: Store lead trader underwater percentage for frontend
+        lead_trader_underwater_pct: leadTraderUnderwaterPct,
       };
 
       validSignals.push(signalData);
@@ -930,12 +1007,16 @@ export async function generateSignals(): Promise<void> {
       const isNew = !existingSignal;
       
       if (isNew) {
+        const underwaterWarning = leadTraderUnderwaterPct > 5 
+          ? ` | ⚠️ Lead -${leadTraderUnderwaterPct.toFixed(0)}%` 
+          : '';
+        
         logger.info(
           `NEW Signal: ${coin} ${direction.toUpperCase()} | ` +
           `${eliteTraders.length}E + ${goodTraders.length}G | ` +
           `Entry: $${entryPrice.toFixed(2)} | Stop: ${stopDistancePct.toFixed(1)}% | ` +
           `VolRank: ${volatilityRank} | ` +
-          `${candidate.signalStrength.toUpperCase()} (${candidate.confidence}%)`
+          `${candidate.signalStrength.toUpperCase()} (${candidate.confidence}%)${underwaterWarning}`
         );
       }
     }

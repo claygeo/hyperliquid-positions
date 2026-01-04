@@ -270,22 +270,44 @@ function WalletImportModal({
       try {
         const analysis = await analyzeTrader(address);
         
-        const { error: dbError } = await supabase
+        // Check if trader already exists
+        const { data: existing } = await supabase
           .from('trader_quality')
-          .upsert({
-            address: address,
-            quality_tier: analysis.tier,
-            is_tracked: analysis.tier === 'elite' || analysis.tier === 'good',
-            pnl_7d: analysis.pnl_7d,
-            account_value: analysis.account_value,
-            win_rate: analysis.win_rate,
-            analyzed_at: new Date().toISOString(),
-            discovered_at: new Date().toISOString(),
-          }, {
-            onConflict: 'address'
-          });
-
-        if (dbError) throw dbError;
+          .select('address')
+          .eq('address', address)
+          .single();
+        
+        if (existing) {
+          // Update existing
+          const { error: dbError } = await supabase
+            .from('trader_quality')
+            .update({
+              quality_tier: analysis.tier,
+              is_tracked: analysis.tier === 'elite' || analysis.tier === 'good',
+              pnl_7d: analysis.pnl_7d,
+              account_value: analysis.account_value,
+              win_rate: analysis.win_rate,
+              analyzed_at: new Date().toISOString(),
+            })
+            .eq('address', address);
+          
+          if (dbError) throw dbError;
+        } else {
+          // Insert new (created_at has default now())
+          const { error: dbError } = await supabase
+            .from('trader_quality')
+            .insert({
+              address: address,
+              quality_tier: analysis.tier,
+              is_tracked: analysis.tier === 'elite' || analysis.tier === 'good',
+              pnl_7d: analysis.pnl_7d,
+              account_value: analysis.account_value,
+              win_rate: analysis.win_rate,
+              analyzed_at: new Date().toISOString(),
+            });
+          
+          if (dbError) throw dbError;
+        }
 
         results.push({
           address,

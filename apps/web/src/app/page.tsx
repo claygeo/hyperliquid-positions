@@ -11,7 +11,10 @@ import {
   Zap,
   Clock,
   ExternalLink,
-  AlertTriangle
+  AlertTriangle,
+  Plus,
+  X,
+  Loader2
 } from 'lucide-react';
 
 // ============================================
@@ -27,7 +30,6 @@ interface TraderInfo {
   entry_price: number;
   conviction_pct?: number;
   opened_at?: string | null;
-  // V9: Track unrealized P&L
   unrealized_pnl?: number;
   unrealized_pnl_pct?: number;
 }
@@ -58,7 +60,6 @@ interface QualitySignal {
   avg_entry_price: number;
   created_at: string;
   updated_at: string;
-  // V9: Lead trader underwater percentage
   lead_trader_underwater_pct?: number;
 }
 
@@ -74,6 +75,20 @@ interface SignalStats {
   stopped: number;
   open: number;
   win_rate: number;
+}
+
+interface ImportProgress {
+  current: number;
+  total: number;
+  currentAddress: string;
+  status: 'inserting' | 'analyzing' | 'done' | 'error';
+  results: {
+    address: string;
+    tier: string;
+    pnl_7d: number;
+    status: 'success' | 'error';
+    error?: string;
+  }[];
 }
 
 // ============================================
@@ -140,6 +155,328 @@ function getTraderUrl(address: string): string {
   return `https://legacy.hyperdash.com/trader/${address}`;
 }
 
+function parseAddresses(input: string): string[] {
+  const addresses = input
+    .split(/[\s,\n]+/)
+    .map(addr => addr.trim().toLowerCase())
+    .filter(addr => addr.startsWith('0x') && addr.length === 42);
+  
+  return [...new Set(addresses)];
+}
+
+// ============================================
+// WALLET IMPORT MODAL
+// ============================================
+
+function WalletImportModal({ 
+  isOpen, 
+  onClose,
+  onComplete
+}: { 
+  isOpen: boolean; 
+  onClose: () => void;
+  onComplete: () => void;
+}) {
+  const [input, setInput] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState<ImportProgress | null>(null);
+  const supabase = createClient();
+
+  const analyzeTrader = async (address: string): Promise<{
+    tier: 'elite' | 'good' | 'weak';
+    pnl_7d: number;
+    account_value: number;
+    win_rate: number;
+    error?: string;
+  }> => {
+    try {
+      const stateRes = await fetch('https://api.hyperliquid.xyz/info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'clearinghouseState', user: address })
+      });
+      
+      if (!stateRes.ok) throw new Error('Failed to fetch account state');
+      const state = await stateRes.json();
+      const accountValue = parseFloat(state.marginSummary?.accountValue || '0');
+      
+      if (accountValue < 1000) {
+        return { tier: 'weak', pnl_7d: 0, account_value: accountValue, win_rate: 0, error: 'Account too small' };
+      }
+
+      const fillsRes = await fetch('https://api.hyperliquid.xyz/info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'userFills', user: address })
+      });
+      
+      if (!fillsRes.ok) throw new Error('Failed to fetch fills');
+      const fills = await fillsRes.json();
+      
+      const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const recentFills = fills.filter((f: any) => f.time >= sevenDaysAgo);
+      const pnl_7d = recentFills.reduce((sum: number, f: any) => sum + parseFloat(f.closedPnl || '0'), 0);
+      
+      const closingFills = recentFills.filter((f: any) => parseFloat(f.closedPnl || '0') !== 0);
+      const wins = closingFills.filter((f: any) => parseFloat(f.closedPnl || '0') > 0).length;
+      const win_rate = closingFills.length > 0 ? wins / closingFills.length : 0;
+      
+      let tier: 'elite' | 'good' | 'weak' = 'weak';
+      const roi_7d = accountValue > 0 ? (pnl_7d / accountValue) * 100 : 0;
+      
+      if (pnl_7d >= 25000 && roi_7d >= 10 && win_rate >= 0.5 && accountValue >= 50000) {
+        tier = 'elite';
+      } else if (pnl_7d >= 5000 && roi_7d >= 5 && win_rate >= 0.45 && accountValue >= 10000) {
+        tier = 'good';
+      }
+      
+      return { tier, pnl_7d, account_value: accountValue, win_rate };
+    } catch (error) {
+      return { tier: 'weak', pnl_7d: 0, account_value: 0, win_rate: 0, error: String(error) };
+    }
+  };
+
+  const handleImport = async () => {
+    const addresses = parseAddresses(input);
+    
+    if (addresses.length === 0) {
+      alert('No valid addresses found. Addresses must start with 0x and be 42 characters.');
+      return;
+    }
+
+    setIsProcessing(true);
+    setProgress({
+      current: 0,
+      total: addresses.length,
+      currentAddress: '',
+      status: 'inserting',
+      results: []
+    });
+
+    const results: ImportProgress['results'] = [];
+
+    for (let i = 0; i < addresses.length; i++) {
+      const address = addresses[i];
+      
+      setProgress(prev => ({
+        ...prev!,
+        current: i + 1,
+        currentAddress: address,
+        status: 'analyzing'
+      }));
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      try {
+        const analysis = await analyzeTrader(address);
+        
+        const { error: dbError } = await supabase
+          .from('trader_quality')
+          .upsert({
+            address: address,
+            quality_tier: analysis.tier,
+            is_tracked: analysis.tier === 'elite' || analysis.tier === 'good',
+            pnl_7d: analysis.pnl_7d,
+            account_value: analysis.account_value,
+            win_rate: analysis.win_rate,
+            analyzed_at: new Date().toISOString(),
+            discovered_at: new Date().toISOString(),
+          }, {
+            onConflict: 'address'
+          });
+
+        if (dbError) throw dbError;
+
+        results.push({
+          address,
+          tier: analysis.tier,
+          pnl_7d: analysis.pnl_7d,
+          status: 'success'
+        });
+      } catch (error) {
+        results.push({
+          address,
+          tier: 'weak',
+          pnl_7d: 0,
+          status: 'error',
+          error: String(error)
+        });
+      }
+
+      setProgress(prev => ({
+        ...prev!,
+        results: [...results]
+      }));
+    }
+
+    setProgress(prev => ({
+      ...prev!,
+      status: 'done'
+    }));
+
+    setIsProcessing(false);
+  };
+
+  const handleClose = () => {
+    if (!isProcessing) {
+      setInput('');
+      setProgress(null);
+      onClose();
+      if (progress?.status === 'done') {
+        onComplete();
+      }
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-card border border-border rounded-lg w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between p-4 border-b border-border">
+          <h2 className="text-lg font-semibold">Import Wallets</h2>
+          <button 
+            onClick={handleClose}
+            disabled={isProcessing}
+            className="p-1 hover:bg-muted rounded disabled:opacity-50"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="p-4 flex-1 overflow-y-auto">
+          {!progress ? (
+            <>
+              <p className="text-sm text-muted-foreground mb-3">
+                Paste wallet addresses below. Supports any format: comma-separated, space-separated, or one per line.
+              </p>
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="0x1234...&#10;0x5678...&#10;or&#10;0x1234..., 0x5678..."
+                className="w-full h-40 p-3 bg-background border border-border rounded-lg text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+              <p className="text-xs text-muted-foreground mt-2">
+                {parseAddresses(input).length} valid addresses detected
+              </p>
+            </>
+          ) : (
+            <div className="space-y-4">
+              <div className="text-center">
+                <div className="text-4xl font-bold text-primary mb-2">
+                  {progress.current}/{progress.total}
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  {progress.status === 'done' ? (
+                    'Complete!'
+                  ) : (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin inline mr-2" />
+                      Analyzing {progress.currentAddress.slice(0, 8)}...
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="w-full bg-muted rounded-full h-2">
+                <div 
+                  className="bg-primary h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                />
+              </div>
+
+              {progress.results.length > 0 && (
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {progress.results.map((result, idx) => (
+                    <div 
+                      key={idx}
+                      className="flex items-center justify-between p-2 bg-background rounded text-sm"
+                    >
+                      <span className="font-mono text-xs">
+                        {result.address.slice(0, 8)}...{result.address.slice(-4)}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        {result.status === 'success' ? (
+                          <>
+                            <span className={`text-xs px-1.5 py-0.5 rounded ${
+                              result.tier === 'elite' ? 'bg-green-500/20 text-green-500' :
+                              result.tier === 'good' ? 'bg-blue-500/20 text-blue-500' :
+                              'bg-muted text-muted-foreground'
+                            }`}>
+                              {result.tier.toUpperCase()}
+                            </span>
+                            <span className={result.pnl_7d >= 0 ? 'text-green-500 text-xs' : 'text-red-500 text-xs'}>
+                              {formatPnl(result.pnl_7d)}
+                            </span>
+                          </>
+                        ) : (
+                          <span className="text-red-500 text-xs">Error</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {progress.status === 'done' && (
+                <div className="bg-muted/50 rounded-lg p-3 text-sm">
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div>
+                      <div className="text-green-500 font-bold">
+                        {progress.results.filter(r => r.tier === 'elite').length}
+                      </div>
+                      <div className="text-xs text-muted-foreground">Elite</div>
+                    </div>
+                    <div>
+                      <div className="text-blue-500 font-bold">
+                        {progress.results.filter(r => r.tier === 'good').length}
+                      </div>
+                      <div className="text-xs text-muted-foreground">Good</div>
+                    </div>
+                    <div>
+                      <div className="text-muted-foreground font-bold">
+                        {progress.results.filter(r => r.tier === 'weak').length}
+                      </div>
+                      <div className="text-xs text-muted-foreground">Weak</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="p-4 border-t border-border">
+          {!progress ? (
+            <button
+              onClick={handleImport}
+              disabled={parseAddresses(input).length === 0}
+              className="w-full py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Import & Analyze {parseAddresses(input).length > 0 && `(${parseAddresses(input).length})`}
+            </button>
+          ) : progress.status === 'done' ? (
+            <button
+              onClick={handleClose}
+              className="w-full py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90"
+            >
+              Done
+            </button>
+          ) : (
+            <button
+              disabled
+              className="w-full py-2 bg-muted text-muted-foreground rounded-lg font-medium cursor-not-allowed"
+            >
+              <Loader2 className="h-4 w-4 animate-spin inline mr-2" />
+              Processing...
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ============================================
 // V9: UNDERWATER WARNING BADGE
 // ============================================
@@ -147,7 +484,6 @@ function getTraderUrl(address: string): string {
 function UnderwaterWarning({ underwaterPct }: { underwaterPct: number }) {
   if (!underwaterPct || underwaterPct < 5) return null;
   
-  // Determine severity
   let severity: 'warning' | 'danger' | 'critical';
   let message: string;
   
@@ -282,7 +618,7 @@ function CopyTradeButton({ signal }: { signal: QualitySignal }) {
 }
 
 // ============================================
-// SIGNAL STORY - The main narrative
+// SIGNAL STORY
 // ============================================
 
 function SignalStory({ signal }: { signal: QualitySignal }) {
@@ -393,15 +729,12 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   return (
     <Card className="overflow-hidden">
       <CardContent className="p-0">
-        {/* Collapsed View */}
         <div 
           className="p-3 sm:p-4 cursor-pointer hover:bg-muted/30 transition-colors"
           onClick={onToggle}
         >
-          {/* Header row */}
           <div className="flex items-start sm:items-center justify-between mb-3 gap-2">
             <div className="flex flex-wrap items-center gap-2">
-              {/* Coin + Direction */}
               <div className="flex items-center gap-2">
                 <span className="text-lg sm:text-xl font-bold">{signal.coin}</span>
                 <span className={`text-xs font-bold px-2 py-0.5 rounded ${
@@ -411,7 +744,6 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                 </span>
               </div>
               
-              {/* Funding context */}
               {signal.funding_context === 'favorable' && (
                 <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
                   <Zap className="h-3 w-3" />
@@ -435,17 +767,14 @@ function SignalCard({ signal, isExpanded, onToggle }: {
             </div>
           </div>
           
-          {/* V9: Underwater Warning */}
           {underwaterPct >= 5 && (
             <div className="mb-3">
               <UnderwaterWarning underwaterPct={underwaterPct} />
             </div>
           )}
           
-          {/* Story */}
           <SignalStory signal={signal} />
           
-          {/* Price + Stop */}
           <div className="mt-3 sm:mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <PriceDisplay signal={signal} />
             <div className="text-sm">
@@ -458,15 +787,12 @@ function SignalCard({ signal, isExpanded, onToggle }: {
           </div>
         </div>
         
-        {/* Expanded View */}
         {isExpanded && (
           <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-4">
-            {/* Copy Trade Button */}
             <div className="flex justify-end">
               <CopyTradeButton signal={signal} />
             </div>
             
-            {/* V9: More prominent underwater warning in expanded view */}
             {underwaterPct >= 10 && (
               <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3">
                 <div className="flex items-start gap-2">
@@ -483,7 +809,6 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               </div>
             )}
             
-            {/* Take Profit Levels */}
             <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
                 <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
@@ -499,7 +824,6 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               </div>
             </div>
             
-            {/* Signal Stats */}
             <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
               <div>
                 <div className="text-muted-foreground text-xs">Combined 7d P&L</div>
@@ -517,7 +841,6 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               </div>
             </div>
             
-            {/* Traders List */}
             {traders.length > 0 && (
               <div>
                 <div className="text-xs text-muted-foreground mb-2">Traders in this signal</div>
@@ -557,7 +880,6 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                               {trader.conviction_pct.toFixed(0)}% conv
                             </span>
                           )}
-                          {/* V9: Show if individual trader is underwater */}
                           {traderUnderwaterPct >= 5 && (
                             <span className="text-orange-400 text-xs">
                               -{traderUnderwaterPct.toFixed(0)}%
@@ -590,6 +912,7 @@ export default function SignalsPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [mounted, setMounted] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
 
   const supabase = createClient();
 
@@ -690,7 +1013,6 @@ export default function SignalsPage() {
 
   return (
     <div className="min-h-screen bg-background font-sans">
-      {/* Header */}
       <header className="border-b border-border sticky top-0 bg-background z-20">
         <div className="max-w-3xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
           <div className="flex items-center justify-between">
@@ -709,6 +1031,13 @@ export default function SignalsPage() {
                 </div>
               )}
               <button
+                onClick={() => setShowImportModal(true)}
+                className="p-1.5 sm:p-2 bg-secondary hover:bg-secondary/80 rounded-md transition-colors"
+                title="Import Wallets"
+              >
+                <Plus className="h-4 w-4" />
+              </button>
+              <button
                 onClick={handleRefresh}
                 disabled={isLoading}
                 className="px-2 sm:px-3 py-1.5 text-xs sm:text-sm bg-secondary hover:bg-secondary/80 rounded-md transition-colors disabled:opacity-50"
@@ -721,10 +1050,8 @@ export default function SignalsPage() {
       </header>
 
       <main className="max-w-3xl mx-auto px-3 sm:px-4 py-4 sm:py-6">
-        {/* Signal Performance Summary */}
         <SignalPerformanceSummary stats={signalStats} />
         
-        {/* Filters */}
         <div className="flex gap-2 mb-4 sm:mb-6 overflow-x-auto pb-1">
           {(['all', 'strong', 'long', 'short'] as const).map((f) => (
             <button
@@ -744,7 +1071,6 @@ export default function SignalsPage() {
           ))}
         </div>
 
-        {/* Signals */}
         {filteredSignals.length > 0 ? (
           <div className="space-y-3 sm:space-y-4">
             {filteredSignals.map((signal) => (
@@ -769,7 +1095,6 @@ export default function SignalsPage() {
           </Card>
         )}
 
-        {/* Footer */}
         <div className="flex items-center justify-center gap-2 mt-6 text-xs sm:text-sm text-muted-foreground">
           <span className="relative flex h-2 w-2">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
@@ -778,6 +1103,15 @@ export default function SignalsPage() {
           <span>Live · Updated {lastRefresh}</span>
         </div>
       </main>
+
+      <WalletImportModal 
+        isOpen={showImportModal}
+        onClose={() => setShowImportModal(false)}
+        onComplete={() => {
+          fetchStats();
+          fetchSignals();
+        }}
+      />
     </div>
   );
 }

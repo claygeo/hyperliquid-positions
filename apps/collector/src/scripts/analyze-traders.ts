@@ -14,7 +14,7 @@ const logger = createLogger('analyze-script');
 async function getUnanalyzedHolders(): Promise<{ address: string }[]> {
   // Get holders that either:
   // 1. Don't have a trader_quality record yet, OR
-  // 2. Have quality_tier = 'unanalyzed'
+  // 2. Have analyzed_at = NULL (never been analyzed)
   
   const allHolders: { address: string }[] = [];
   let offset = 0;
@@ -43,16 +43,31 @@ async function getUnanalyzedHolders(): Promise<{ address: string }[]> {
   
   logger.info(`Total holders in database: ${allHolders.length}`);
   
-  // Check which ones are already analyzed
-  const analyzedResult = await db.client
-    .from('trader_quality')
-    .select('address')
-    .neq('quality_tier', 'unanalyzed');
+  // Check which ones are already analyzed (paginate to avoid 1000 row limit)
+  const analyzedAddresses: string[] = [];
+  offset = 0;
   
-  const analyzedSet = new Set(
-    (analyzedResult.data || []).map((r: { address: string }) => r.address)
-  );
+  while (true) {
+    const result = await db.client
+      .from('trader_quality')
+      .select('address')
+      .not('analyzed_at', 'is', null)
+      .range(offset, offset + batchSize - 1);
+    
+    if (result.error || !result.data || result.data.length === 0) {
+      break;
+    }
+    
+    analyzedAddresses.push(...result.data.map((r: { address: string }) => r.address));
+    
+    if (result.data.length < batchSize) {
+      break;
+    }
+    
+    offset += batchSize;
+  }
   
+  const analyzedSet = new Set(analyzedAddresses);
   const unanalyzed = allHolders.filter(h => !analyzedSet.has(h.address));
   
   logger.info(`Already analyzed: ${analyzedSet.size}`);

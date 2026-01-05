@@ -1,5 +1,5 @@
-// Hyperliquid API V4 - Comprehensive API Client
-// All endpoints in one place with proper typing and retry logic
+// Hyperliquid API V5 - Comprehensive API Client
+// Added: findPositionOpenTime() for accurate position timestamps
 
 import { createLogger } from './logger.js';
 
@@ -297,6 +297,161 @@ export async function getL2Book(coin: string, nSigFigs?: number): Promise<L2Book
 }
 
 // ============================================
+// V5: Position Open Time Detection
+// ============================================
+
+/**
+ * Find when a position was actually opened by querying fill history.
+ * Returns the timestamp of the first "Open Long" or "Open Short" fill
+ * that matches the current position direction.
+ * 
+ * @param address - Trader wallet address
+ * @param coin - The asset (e.g., "BTC", "ETH")
+ * @param direction - Current position direction ("long" or "short")
+ * @param lookbackDays - How far back to search (default 30 days)
+ * @returns Date of position open, or null if not found
+ */
+export async function findPositionOpenTime(
+  address: string,
+  coin: string,
+  direction: 'long' | 'short',
+  lookbackDays: number = 30
+): Promise<{ openedAt: Date; entryPrice: number } | null> {
+  try {
+    const startTime = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
+    const fills = await getUserFills(address, startTime);
+    
+    if (!fills || fills.length === 0) {
+      logger.debug(`No fills found for ${address.slice(0, 8)}... ${coin}`);
+      return null;
+    }
+    
+    // Filter fills for this coin
+    const coinFills = fills.filter(f => f.coin === coin);
+    
+    if (coinFills.length === 0) {
+      logger.debug(`No ${coin} fills found for ${address.slice(0, 8)}...`);
+      return null;
+    }
+    
+    // Sort by time ascending (oldest first)
+    coinFills.sort((a, b) => a.time - b.time);
+    
+    // The dir field contains: "Open Long", "Close Long", "Open Short", "Close Short"
+    const openDir = direction === 'long' ? 'Open Long' : 'Open Short';
+    const closeDir = direction === 'long' ? 'Close Long' : 'Close Short';
+    
+    // Walk through fills to find the most recent position open
+    // We need to track opens and closes to find when the CURRENT position started
+    let positionSize = 0;
+    let lastOpenTime: number | null = null;
+    let lastOpenPrice: number | null = null;
+    
+    for (const fill of coinFills) {
+      const size = parseFloat(fill.sz);
+      
+      if (fill.dir.includes('Open')) {
+        // Opening or adding to position
+        if (fill.dir === openDir) {
+          if (positionSize === 0) {
+            // Fresh position open
+            lastOpenTime = fill.time;
+            lastOpenPrice = parseFloat(fill.px);
+          }
+          positionSize += size;
+        } else {
+          // Opening opposite direction - this would close existing and open new
+          positionSize = size;
+          lastOpenTime = fill.time;
+          lastOpenPrice = parseFloat(fill.px);
+        }
+      } else if (fill.dir.includes('Close')) {
+        // Closing position
+        positionSize = Math.max(0, positionSize - size);
+        
+        if (positionSize === 0) {
+          // Position fully closed, reset
+          lastOpenTime = null;
+          lastOpenPrice = null;
+        }
+      }
+    }
+    
+    // If we found an open time and position is still open
+    if (lastOpenTime && positionSize > 0) {
+      logger.debug(
+        `Found ${coin} ${direction} open time for ${address.slice(0, 8)}...: ` +
+        `${new Date(lastOpenTime).toISOString()}`
+      );
+      return {
+        openedAt: new Date(lastOpenTime),
+        entryPrice: lastOpenPrice || 0,
+      };
+    }
+    
+    // Fallback: just find the most recent open fill for this direction
+    const recentOpens = coinFills
+      .filter(f => f.dir === openDir)
+      .sort((a, b) => b.time - a.time);
+    
+    if (recentOpens.length > 0) {
+      const mostRecent = recentOpens[0];
+      logger.debug(
+        `Using most recent ${coin} ${direction} fill for ${address.slice(0, 8)}...: ` +
+        `${new Date(mostRecent.time).toISOString()}`
+      );
+      return {
+        openedAt: new Date(mostRecent.time),
+        entryPrice: parseFloat(mostRecent.px),
+      };
+    }
+    
+    logger.debug(`Could not determine open time for ${address.slice(0, 8)}... ${coin} ${direction}`);
+    return null;
+  } catch (error) {
+    logger.error(`Error finding position open time for ${address.slice(0, 8)}... ${coin}`, error);
+    return null;
+  }
+}
+
+/**
+ * Get the most recent size change (add/reduce) for a position
+ */
+export async function findLastSizeChange(
+  address: string,
+  coin: string,
+  direction: 'long' | 'short',
+  lookbackHours: number = 24
+): Promise<{ timestamp: Date; type: 'increase' | 'decrease'; size: number; price: number } | null> {
+  try {
+    const startTime = Date.now() - lookbackHours * 60 * 60 * 1000;
+    const fills = await getUserFills(address, startTime);
+    
+    if (!fills || fills.length === 0) return null;
+    
+    // Filter fills for this coin, most recent first
+    const coinFills = fills
+      .filter(f => f.coin === coin)
+      .sort((a, b) => b.time - a.time);
+    
+    if (coinFills.length === 0) return null;
+    
+    const mostRecent = coinFills[0];
+    const isIncrease = mostRecent.dir.includes('Open');
+    
+    return {
+      timestamp: new Date(mostRecent.time),
+      type: isIncrease ? 'increase' : 'decrease',
+      size: parseFloat(mostRecent.sz),
+      price: parseFloat(mostRecent.px),
+    };
+  } catch (error) {
+    logger.error(`Error finding last size change for ${address.slice(0, 8)}... ${coin}`, error);
+    return null;
+  }
+}
+
+// ============================================
 // Derived/Calculated Functions
 // ============================================
 
@@ -484,4 +639,6 @@ export default {
   calculateATR,
   calculateNetFunding,
   checkRecentLiquidations,
+  findPositionOpenTime,
+  findLastSizeChange,
 };

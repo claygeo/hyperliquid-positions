@@ -131,6 +131,8 @@ function formatTimeWithEST(dateString: string): string {
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
   const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMins / 60);
+  const diffDays = Math.floor(diffHours / 24);
   
   // Format EST time
   const estTime = date.toLocaleTimeString('en-US', {
@@ -140,11 +142,24 @@ function formatTimeWithEST(dateString: string): string {
     timeZone: 'America/New_York'
   });
   
+  // Format date for older positions
+  const estDate = date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'America/New_York'
+  });
+  
+  // Relative time
   let ago: string;
   if (diffMins < 1) ago = 'just now';
   else if (diffMins < 60) ago = `${diffMins}m ago`;
-  else if (diffMins < 1440) ago = `${Math.floor(diffMins / 60)}h ago`;
-  else ago = `${Math.floor(diffMins / 1440)}d ago`;
+  else if (diffHours < 24) ago = `${diffHours}h ago`;
+  else ago = `${diffDays}d ago`;
+  
+  // Include date for anything older than 24h
+  if (diffHours >= 24) {
+    return `${ago} (${estDate}, ${estTime} EST)`;
+  }
   
   return `${ago} (${estTime} EST)`;
 }

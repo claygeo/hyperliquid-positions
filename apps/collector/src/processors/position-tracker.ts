@@ -1,5 +1,6 @@
-// Position Tracker V6
-// Fixed: opened_at now persists across restarts by reading from DB
+// Position Tracker V7
+// NEW: Queries fill history for accurate position open times
+// Fixed: opened_at now shows ACTUAL open time, not detection time
 // Enhanced with:
 // - Position history tracking (entry timing detection)
 // - Position age weighting (fresh positions > stale)
@@ -13,7 +14,7 @@ import { config } from '../config.js';
 import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
 import { generateSignals } from './signal-generator.js';
 
-const logger = createLogger('position-tracker-v6');
+const logger = createLogger('position-tracker-v7');
 
 // ============================================
 // Types
@@ -98,8 +99,11 @@ const previousPositions = new Map<string, PreviousPositionState>();
 // Track if we've loaded from DB this session
 let hasLoadedFromDb = false;
 
+// Track positions we've already looked up fill history for (to avoid repeated API calls)
+const fillHistoryLookedUp = new Set<string>();
+
 // ============================================
-// V6: Load Previous Positions from Database
+// V7: Load Previous Positions from Database
 // ============================================
 
 async function loadPreviousPositionsFromDb(): Promise<void> {
@@ -124,6 +128,11 @@ async function loadPreviousPositionsFromDb(): Promise<void> {
           peak_unrealized_pnl: pos.peak_unrealized_pnl || 0,
           trough_unrealized_pnl: pos.trough_unrealized_pnl || 0,
         });
+        
+        // Mark as already looked up if we have a valid opened_at
+        if (pos.opened_at) {
+          fillHistoryLookedUp.add(key);
+        }
       }
       logger.info(`Loaded ${dbPositions.length} previous positions from database`);
     }
@@ -133,6 +142,48 @@ async function loadPreviousPositionsFromDb(): Promise<void> {
     logger.error('Failed to load previous positions from DB', error);
     hasLoadedFromDb = true; // Don't retry on error
   }
+}
+
+// ============================================
+// V7: Get Accurate Open Time from Fill History
+// ============================================
+
+async function getAccurateOpenTime(
+  address: string,
+  coin: string,
+  direction: 'long' | 'short'
+): Promise<Date | null> {
+  const key = `${address}-${coin}`;
+  
+  // Check if we already have this from DB/cache
+  const cached = previousPositions.get(key);
+  if (cached?.opened_at && cached.direction === direction) {
+    return cached.opened_at;
+  }
+  
+  // Check if we already tried looking this up
+  if (fillHistoryLookedUp.has(key)) {
+    return null;
+  }
+  
+  // Mark as looked up to avoid repeated API calls
+  fillHistoryLookedUp.add(key);
+  
+  // Query fill history for actual open time
+  logger.info(`🔍 Looking up fill history for ${address.slice(0, 8)}... ${coin} ${direction}`);
+  
+  const result = await hyperliquid.findPositionOpenTime(address, coin, direction, 30);
+  
+  if (result) {
+    logger.info(
+      `✅ Found actual open time: ${address.slice(0, 8)}... ${coin} ${direction} ` +
+      `opened at ${result.openedAt.toISOString()}`
+    );
+    return result.openedAt;
+  }
+  
+  logger.debug(`Could not find open time for ${address.slice(0, 8)}... ${coin}`);
+  return null;
 }
 
 // ============================================
@@ -313,6 +364,7 @@ function updatePreviousPositionCache(
     });
   } else {
     previousPositions.delete(key);
+    fillHistoryLookedUp.delete(key); // Allow fresh lookup if position reopens
   }
 }
 
@@ -394,7 +446,6 @@ async function checkForUrgentReeval(
 
   const triggers: UrgentReevalTrigger[] = [];
 
-  // Use V5 config thresholds (less aggressive)
   const severeThreshold = config.urgentReeval?.severeDrawdownPct || -30;
   const eliteThreshold = config.urgentReeval?.eliteDrawdownPct || -20;
 
@@ -414,7 +465,6 @@ async function checkForUrgentReeval(
     });
   }
 
-  // Check for recent liquidations
   const { wasLiquidated } = await hyperliquid.checkRecentLiquidations(address, 24);
   if (wasLiquidated) {
     triggers.push({
@@ -452,98 +502,104 @@ async function queueUrgentReeval(trigger: UrgentReevalTrigger): Promise<void> {
 }
 
 // ============================================
-// Position Processing
+// Position Processing (V7 - with fill history lookup)
 // ============================================
 
-function processPositions(
+async function processPositions(
   address: string,
   positions: Position[],
   orders: OpenOrder[],
   accountValue: number
-): TrackedPosition[] {
-  return positions
-    .filter(p => {
-      const value = Math.abs(parseFloat(p.positionValue || '0'));
-      return value >= config.positions.minPositionValue;
-    })
-    .map(p => {
-      const size = parseFloat(p.szi);
-      const coin = p.coin;
-      const positionValue = Math.abs(parseFloat(p.positionValue));
-      const unrealizedPnl = parseFloat(p.unrealizedPnl || '0');
+): Promise<TrackedPosition[]> {
+  const results: TrackedPosition[] = [];
+  
+  for (const p of positions) {
+    const value = Math.abs(parseFloat(p.positionValue || '0'));
+    if (value < config.positions.minPositionValue) continue;
+    
+    const size = parseFloat(p.szi);
+    const coin = p.coin;
+    const positionValue = Math.abs(parseFloat(p.positionValue));
+    const unrealizedPnl = parseFloat(p.unrealizedPnl || '0');
+    const currentDirection: 'long' | 'short' = size > 0 ? 'long' : 'short';
 
-      const convictionPct = accountValue > 0 
-        ? Math.min(100, (positionValue / accountValue) * 100)
-        : 0;
+    const convictionPct = accountValue > 0 
+      ? Math.min(100, (positionValue / accountValue) * 100)
+      : 0;
 
-      const relatedOrders = orders.filter(o => o.coin === coin);
-      const hasPendingEntry = relatedOrders.some(o => !o.reduceOnly);
-      const hasStopOrder = relatedOrders.some(o => 
-        o.reduceOnly && o.isTrigger && 
-        ((size > 0 && o.side === 'A') || (size < 0 && o.side === 'B'))
-      );
-      const hasTpOrder = relatedOrders.some(o => 
-        o.reduceOnly && !o.isTrigger
-      );
+    const relatedOrders = orders.filter(o => o.coin === coin);
+    const hasPendingEntry = relatedOrders.some(o => !o.reduceOnly);
+    const hasStopOrder = relatedOrders.some(o => 
+      o.reduceOnly && o.isTrigger && 
+      ((size > 0 && o.side === 'A') || (size < 0 && o.side === 'B'))
+    );
+    const hasTpOrder = relatedOrders.some(o => 
+      o.reduceOnly && !o.isTrigger
+    );
 
-      const pendingEntry = relatedOrders.find(o => !o.reduceOnly);
-      const pendingOrderPrice = pendingEntry 
-        ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
-        : null;
+    const pendingEntry = relatedOrders.find(o => !o.reduceOnly);
+    const pendingOrderPrice = pendingEntry 
+      ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
+      : null;
 
-      // V6: Get previous state from cache (which was loaded from DB on startup)
-      const key = `${address}-${coin}`;
-      const prev = previousPositions.get(key);
-      
-      // Determine opened_at - only set to now if this is truly a new position
-      let openedAt = prev?.opened_at || null;
-      const currentDirection = size > 0 ? 'long' : 'short';
-      
-      if (!prev) {
-        // No previous record at all - new position
-        openedAt = new Date();
-      } else if (prev.direction !== currentDirection) {
-        // Direction changed (flip) - treat as new position
-        openedAt = new Date();
-      }
-      // Otherwise keep the existing opened_at from DB/cache
+    // V7: Get previous state from cache
+    const key = `${address}-${coin}`;
+    const prev = previousPositions.get(key);
+    
+    // Determine opened_at
+    let openedAt: Date | null = null;
+    
+    if (prev && prev.direction === currentDirection && prev.opened_at) {
+      // Same position, same direction - keep existing opened_at
+      openedAt = prev.opened_at;
+    } else if (prev && prev.direction !== currentDirection) {
+      // Direction flipped - this is a new position, query fill history
+      openedAt = await getAccurateOpenTime(address, coin, currentDirection);
+      if (!openedAt) openedAt = new Date(); // Fallback to now
+    } else if (!prev) {
+      // No previous record - query fill history for actual open time
+      openedAt = await getAccurateOpenTime(address, coin, currentDirection);
+      if (!openedAt) openedAt = new Date(); // Fallback to now
+    }
 
-      // Calculate position age
-      const positionAgeHours = openedAt 
-        ? (Date.now() - openedAt.getTime()) / (1000 * 60 * 60)
-        : 0;
+    // Calculate position age
+    const positionAgeHours = openedAt 
+      ? (Date.now() - openedAt.getTime()) / (1000 * 60 * 60)
+      : 0;
 
-      // Track peak/trough unrealized P&L
-      const peakUnrealizedPnl = prev 
-        ? Math.max(prev.peak_unrealized_pnl || unrealizedPnl, unrealizedPnl)
-        : unrealizedPnl;
-      const troughUnrealizedPnl = prev 
-        ? Math.min(prev.trough_unrealized_pnl || unrealizedPnl, unrealizedPnl)
-        : unrealizedPnl;
+    // Track peak/trough unrealized P&L
+    const peakUnrealizedPnl = prev 
+      ? Math.max(prev.peak_unrealized_pnl || unrealizedPnl, unrealizedPnl)
+      : unrealizedPnl;
+    const troughUnrealizedPnl = prev 
+      ? Math.min(prev.trough_unrealized_pnl || unrealizedPnl, unrealizedPnl)
+      : unrealizedPnl;
 
-      return {
-        address,
-        coin,
-        direction: currentDirection,
-        size: Math.abs(size),
-        entry_price: parseFloat(p.entryPx),
-        value_usd: positionValue,
-        leverage: p.leverage?.value || 1,
-        unrealized_pnl: unrealizedPnl,
-        margin_used: parseFloat(p.marginUsed || '0'),
-        liquidation_price: p.liquidationPx ? parseFloat(p.liquidationPx) : null,
-        conviction_pct: convictionPct,
-        has_pending_entry: hasPendingEntry,
-        has_stop_order: hasStopOrder,
-        has_tp_order: hasTpOrder,
-        pending_order_price: pendingOrderPrice,
-        opened_at: openedAt,
-        position_age_hours: positionAgeHours,
-        last_size_change_at: new Date(), // Will be updated on actual changes
-        peak_unrealized_pnl: peakUnrealizedPnl,
-        trough_unrealized_pnl: troughUnrealizedPnl,
-      } as TrackedPosition;
+    results.push({
+      address,
+      coin,
+      direction: currentDirection,
+      size: Math.abs(size),
+      entry_price: parseFloat(p.entryPx),
+      value_usd: positionValue,
+      leverage: p.leverage?.value || 1,
+      unrealized_pnl: unrealizedPnl,
+      margin_used: parseFloat(p.marginUsed || '0'),
+      liquidation_price: p.liquidationPx ? parseFloat(p.liquidationPx) : null,
+      conviction_pct: convictionPct,
+      has_pending_entry: hasPendingEntry,
+      has_stop_order: hasStopOrder,
+      has_tp_order: hasTpOrder,
+      pending_order_price: pendingOrderPrice,
+      opened_at: openedAt,
+      position_age_hours: positionAgeHours,
+      last_size_change_at: new Date(),
+      peak_unrealized_pnl: peakUnrealizedPnl,
+      trough_unrealized_pnl: troughUnrealizedPnl,
     });
+  }
+  
+  return results;
 }
 
 // ============================================
@@ -613,7 +669,7 @@ async function pollPositions(): Promise<void> {
   isPolling = true;
 
   try {
-    // V6: Load previous positions from DB on first poll
+    // Load previous positions from DB on first poll
     await loadPreviousPositionsFromDb();
 
     const { data: trackedTraders, error } = await db.client
@@ -644,7 +700,8 @@ async function pollPositions(): Promise<void> {
         continue;
       }
 
-      const processed = processPositions(
+      // V7: processPositions is now async (may query fill history)
+      const processed = await processPositions(
         trader.address,
         data.positions,
         data.openOrders,
@@ -681,6 +738,7 @@ async function pollPositions(): Promise<void> {
           
           // Remove from cache
           previousPositions.delete(key);
+          fillHistoryLookedUp.delete(key);
         }
       }
 
@@ -828,7 +886,7 @@ export async function getPositionAgeStats(): Promise<{
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V6 starting...');
+  logger.info('Position tracker V7 starting...');
   
   pollPositions();
   

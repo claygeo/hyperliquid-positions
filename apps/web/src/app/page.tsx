@@ -151,6 +151,44 @@ function formatPositionAge(traders: TraderInfo[]): string | null {
   return `${diffDays}d ago`;
 }
 
+function formatTimeWithEST(dateString: string): string {
+  const date = new Date(dateString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  
+  // Format EST time
+  const estTime = date.toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'America/New_York'
+  });
+  
+  let ago: string;
+  if (diffMins < 1) ago = 'just now';
+  else if (diffMins < 60) ago = `${diffMins}m ago`;
+  else if (diffMins < 1440) ago = `${Math.floor(diffMins / 60)}h ago`;
+  else ago = `${Math.floor(diffMins / 1440)}d ago`;
+  
+  return `${ago} (${estTime} EST)`;
+}
+
+function formatTraderEntry(entryPrice: number, currentPrice: number, direction: string): { pnlPct: number; display: string } {
+  let pnlPct: number;
+  if (direction === 'long') {
+    pnlPct = ((currentPrice - entryPrice) / entryPrice) * 100;
+  } else {
+    pnlPct = ((entryPrice - currentPrice) / entryPrice) * 100;
+  }
+  
+  const sign = pnlPct >= 0 ? '+' : '';
+  return {
+    pnlPct,
+    display: `${sign}${pnlPct.toFixed(1)}%`
+  };
+}
+
 function getTraderUrl(address: string): string {
   return `https://legacy.hyperdash.com/trader/${address}`;
 }
@@ -711,18 +749,28 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
   const isProfit = pnlPct > 0;
   
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
-  const positionAge = formatPositionAge(traders);
+  
+  // Get most recent entry time
+  const openedDates = traders
+    .map(t => t.opened_at)
+    .filter((d): d is string => d !== null && d !== undefined);
+  
+  const mostRecentEntry = openedDates.length > 0 
+    ? openedDates.reduce((latest, d) => new Date(d) > new Date(latest) ? d : latest)
+    : null;
+  
+  const entryTimeDisplay = mostRecentEntry ? formatTimeWithEST(mostRecentEntry) : null;
   
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 text-sm">
       <div className="flex items-center gap-2">
         <span className="text-muted-foreground">Entry</span>
         <span className="font-mono font-medium">{formatPrice(entry)}</span>
-        {positionAge && (
-          <span className="text-muted-foreground">({positionAge})</span>
+        {entryTimeDisplay && (
+          <span className="text-muted-foreground text-xs">({entryTimeDisplay})</span>
         )}
-        <span className="text-muted-foreground hidden sm:inline">→</span>
       </div>
+      <span className="text-muted-foreground hidden sm:inline">→</span>
       <div className="flex items-center gap-2">
         <span className="text-muted-foreground">Now</span>
         <span className="font-mono font-medium">{formatPrice(current)}</span>
@@ -871,41 +919,63 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                     const traderUnderwater = (trader.unrealized_pnl_pct || 0) < 0;
                     const traderUnderwaterPct = traderUnderwater ? Math.abs(trader.unrealized_pnl_pct || 0) : 0;
                     
+                    // Calculate this trader's P&L on their position
+                    const traderEntry = trader.entry_price || 0;
+                    const currentPrice = signal.current_price || 0;
+                    const traderPnl = traderEntry && currentPrice 
+                      ? formatTraderEntry(traderEntry, currentPrice, signal.direction)
+                      : null;
+                    
+                    // Format when they entered
+                    const entryTime = trader.opened_at 
+                      ? formatTimeWithEST(trader.opened_at)
+                      : null;
+                    
                     return (
                       <a
                         key={trader.address}
                         href={getTraderUrl(trader.address)}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="flex items-center justify-between p-2 bg-background rounded-lg hover:bg-muted/50 transition-colors"
+                        className="block p-2 bg-background rounded-lg hover:bg-muted/50 transition-colors"
                       >
-                        <div className="flex items-center gap-2">
-                          <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                            trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
-                          }`}>
-                            {trader.tier === 'elite' ? 'Elite' : 'Good'}
-                          </span>
-                          <span className="font-mono text-xs text-muted-foreground">
-                            {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
-                          </span>
-                          <ExternalLink className="h-3 w-3 text-muted-foreground" />
+                        <div className="flex items-center justify-between mb-1">
+                          <div className="flex items-center gap-2">
+                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                              trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
+                            }`}>
+                              {trader.tier === 'elite' ? 'Elite' : 'Good'}
+                            </span>
+                            <span className="font-mono text-xs text-muted-foreground">
+                              {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
+                            </span>
+                            <ExternalLink className="h-3 w-3 text-muted-foreground" />
+                          </div>
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className={(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}>
+                              {formatPnl(trader.pnl_7d || 0)}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {((trader.win_rate || 0) * 100).toFixed(0)}% WR
+                            </span>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2 sm:gap-4 text-xs">
-                          <span className={(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}>
-                            {formatPnl(trader.pnl_7d || 0)}
-                          </span>
-                          <span className="text-muted-foreground hidden sm:inline">
-                            {((trader.win_rate || 0) * 100).toFixed(0)}% WR
-                          </span>
-                          {trader.conviction_pct && trader.conviction_pct > 0 && (
-                            <span className="text-muted-foreground hidden sm:inline">
-                              {trader.conviction_pct.toFixed(0)}% conv
-                            </span>
-                          )}
-                          {traderUnderwaterPct >= 5 && (
-                            <span className="text-orange-400 text-xs">
-                              -{traderUnderwaterPct.toFixed(0)}%
-                            </span>
+                        {/* Entry details row */}
+                        <div className="flex items-center justify-between text-xs text-muted-foreground pl-1">
+                          <div className="flex items-center gap-2">
+                            {traderEntry > 0 && (
+                              <>
+                                <span>Entry: <span className="font-mono text-foreground">{formatPrice(traderEntry)}</span></span>
+                                {traderPnl && (
+                                  <span className={traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}>
+                                    ({traderPnl.display})
+                                  </span>
+                                )}
+                              </>
+                            )}
+                          </div>
+                          {entryTime && (
+                            <span className="text-xs">{entryTime}</span>
                           )}
                         </div>
                       </a>

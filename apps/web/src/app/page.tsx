@@ -43,6 +43,7 @@ interface QualitySignal {
   avg_win_rate: number;
   total_position_value: number;
   signal_strength: string;
+  signal_tier: 'elite_entry' | 'confirmed' | 'consensus' | null;
   confidence: number;
   stop_loss: number;
   take_profit_1: number;
@@ -528,10 +529,6 @@ function WalletImportModal({
 }
 
 // ============================================
-// V9: UNDERWATER WARNING BADGE
-// ============================================
-
-// ============================================
 // SIGNAL PERFORMANCE SUMMARY
 // ============================================
 
@@ -602,6 +599,34 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
 }
 
 // ============================================
+// V11: SIGNAL TIER BADGE
+// ============================================
+
+function SignalTierBadge({ signal }: { signal: QualitySignal }) {
+  const tier = signal.signal_tier;
+  const eliteCount = signal.elite_count || 0;
+  const goodCount = signal.good_count || 0;
+  
+  // For elite_entry tier, show "(Elite)" badge
+  if (tier === 'elite_entry') {
+    return (
+      <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
+        Elite
+      </span>
+    );
+  }
+  
+  // For confirmed/consensus, show "XE + XG" format
+  return (
+    <span className="text-xs text-muted-foreground">
+      {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
+      {eliteCount > 0 && goodCount > 0 && ' + '}
+      {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
+    </span>
+  );
+}
+
+// ============================================
 // SIGNAL CARD
 // ============================================
 
@@ -613,13 +638,10 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   const isLong = signal.direction === 'long';
   const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
-  
-  // Count traders
-  const eliteCount = traders.filter(t => t.tier === 'elite').length;
-  const goodCount = traders.filter(t => t.tier === 'good').length;
+  const isEliteEntry = signal.signal_tier === 'elite_entry';
   
   return (
-    <Card className="overflow-hidden">
+    <Card className={`overflow-hidden ${isEliteEntry ? 'border-yellow-500/30' : ''}`}>
       <CardContent className="p-0">
         <div 
           className="p-3 sm:p-4 cursor-pointer hover:bg-muted/30 transition-colors"
@@ -637,12 +659,8 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                 </span>
               </div>
               
-              {/* Trader count badge */}
-              <span className="text-xs text-muted-foreground">
-                {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
-                {eliteCount > 0 && goodCount > 0 && ' + '}
-                {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
-              </span>
+              {/* V11: Signal tier badge */}
+              <SignalTierBadge signal={signal} />
               
               {signal.funding_context === 'favorable' && (
                 <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
@@ -967,7 +985,7 @@ export default function SignalsPage() {
             <CardContent className="py-12 text-center">
               <h3 className="text-lg font-medium mb-2">No Active Signals</h3>
               <p className="text-muted-foreground text-sm">
-                Signals appear when multiple quality traders converge on the same position.
+                Signals appear when elite traders open positions or multiple quality traders converge.
               </p>
             </CardContent>
           </Card>

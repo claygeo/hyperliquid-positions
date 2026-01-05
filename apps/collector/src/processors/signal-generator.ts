@@ -1,12 +1,14 @@
-// Signal Generator V10.1
-// CHANGES FROM V10:
-// - Includes position addition history in trader data (for UI display)
-// - Handles stale tier updates (when trader gets re-evaluated)
-// - Better logging for debugging
+// Signal Generator V11
+// CHANGES FROM V10.1:
+// - NEW: Creates signals on SINGLE ELITE opens (faster alerts)
+// - NEW: Signal tiers: elite_entry → confirmed → consensus
+// - elite_entry: 1 elite trader (fast alert, lower confidence)
+// - confirmed: 2E, or 1E+1G, or 3G (current behavior)
+// - consensus: 3E+, or 2E+2G+ (highest confidence)
+// - Tier upgrades automatically as more traders join
 //
-// ARCHITECTURE (unchanged):
+// ARCHITECTURE:
 // - EVENT-DRIVEN: Only creates signals when we WITNESS a position open
-// - NOT state-based: Doesn't create signals from existing positions
 // - VERIFIED: Every signal has entry_detected_at = when WE saw the open
 
 import { createLogger } from '../utils/logger.js';
@@ -16,11 +18,13 @@ import hyperliquid from '../utils/hyperliquid-api.js';
 import { PositionChange, subscribeToPositionChanges } from './position-tracker.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v10.1');
+const logger = createLogger('signal-generator-v11');
 
 // ============================================
 // Types
 // ============================================
+
+type SignalTier = 'elite_entry' | 'confirmed' | 'consensus';
 
 interface TraderQuality {
   address: string;
@@ -57,7 +61,6 @@ interface TraderForSignal {
   opened_at: string;
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
-  // V10.1: Position addition history
   additions: PositionAddition[];
 }
 
@@ -79,6 +82,41 @@ interface ActiveSignal {
   confidence: number;
   traders: TraderForSignal[];
   trigger_event_id: number;
+  signal_tier: SignalTier;
+}
+
+// ============================================
+// Signal Tier Determination
+// ============================================
+
+function determineSignalTier(eliteCount: number, goodCount: number): SignalTier {
+  // Consensus: 3+ elite OR 2+ elite with 2+ good
+  if (eliteCount >= 3 || (eliteCount >= 2 && goodCount >= 2)) {
+    return 'consensus';
+  }
+  
+  // Confirmed: 2 elite OR 1 elite + 1 good OR 3+ good
+  if (eliteCount >= 2 || (eliteCount >= 1 && goodCount >= 1) || goodCount >= 3) {
+    return 'confirmed';
+  }
+  
+  // Elite Entry: 1 elite (no good traders needed)
+  if (eliteCount >= 1) {
+    return 'elite_entry';
+  }
+  
+  // Should not reach here if signal requirements are met
+  return 'elite_entry';
+}
+
+function shouldCreateSignal(eliteCount: number, goodCount: number): boolean {
+  // V11: Create signal with just 1 elite trader
+  if (eliteCount >= 1) return true;
+  
+  // Still require 3+ good for good-only signals (they need validation)
+  if (goodCount >= 3) return true;
+  
+  return false;
 }
 
 // ============================================
@@ -140,7 +178,6 @@ async function getActiveSignalForCoin(coin: string, direction: string): Promise<
   return data as ActiveSignal | null;
 }
 
-// V10.1: Get position additions for a trader
 async function getPositionAdditions(address: string, coin: string, direction: string, since?: string): Promise<PositionAddition[]> {
   let query = db.client
     .from('position_history')
@@ -182,7 +219,7 @@ async function getAllTradersInPosition(coin: string, direction: string): Promise
 
   for (const pos of positions) {
     const quality = await getTraderQuality(pos.address);
-    // V10.1: Skip weak traders entirely
+    // Skip weak traders entirely
     if (!quality || quality.quality_tier === 'weak') continue;
 
     const convictionPct = quality.account_value > 0
@@ -193,7 +230,6 @@ async function getAllTradersInPosition(coin: string, direction: string): Promise
       ? (pos.unrealized_pnl / pos.value_usd) * 100
       : 0;
 
-    // V10.1: Get position additions
     const additions = await getPositionAdditions(pos.address, coin, direction, pos.opened_at);
 
     traders.push({
@@ -310,16 +346,24 @@ function calculateConfidence(
   avgProfitFactor: number,
   combinedPnl7d: number,
   avgConvictionPct: number,
-  fundingContext: string
+  fundingContext: string,
+  signalTier: SignalTier
 ): number {
   let confidence = 0;
 
-  // Trader count scoring
-  if (eliteCount >= 3) confidence += 25;
-  else if (eliteCount >= 2) confidence += 20;
-  else if (eliteCount >= 1) confidence += 15;
-  else if (goodCount >= 4) confidence += 12;
-  else if (goodCount >= 3) confidence += 8;
+  // V11: Tier-based base scoring
+  if (signalTier === 'consensus') {
+    confidence += 30;
+  } else if (signalTier === 'confirmed') {
+    confidence += 20;
+  } else {
+    // elite_entry - lower base confidence
+    confidence += 10;
+  }
+
+  // Additional trader count scoring
+  if (eliteCount >= 3) confidence += 10;
+  else if (eliteCount >= 2) confidence += 5;
 
   // Win rate scoring
   if (avgWinRate >= 0.6) confidence += 20;
@@ -339,13 +383,12 @@ function calculateConfidence(
   else if (combinedPnl7d >= 10000) confidence += 5;
 
   // Conviction scoring
-  if (avgConvictionPct >= 30) confidence += 15;
-  else if (avgConvictionPct >= 20) confidence += 10;
+  if (avgConvictionPct >= 30) confidence += 10;
+  else if (avgConvictionPct >= 20) confidence += 7;
   else if (avgConvictionPct >= 10) confidence += 5;
 
   // Funding context
-  if (fundingContext === 'favorable') confidence += 10;
-  else if (fundingContext === 'neutral') confidence += 5;
+  if (fundingContext === 'favorable') confidence += 5;
 
   return Math.max(0, Math.min(100, confidence));
 }
@@ -356,9 +399,17 @@ function calculateRiskScore(
   stopDistancePct: number,
   eliteCount: number,
   volatilityRank: number,
-  fundingContext: string
+  fundingContext: string,
+  signalTier: SignalTier
 ): number {
   let risk = 50;
+
+  // V11: Higher risk for single trader signals
+  if (signalTier === 'elite_entry') {
+    risk += 15;
+  } else if (signalTier === 'confirmed') {
+    risk += 5;
+  }
 
   risk -= eliteCount * 5;
 
@@ -394,6 +445,7 @@ function calculateSuggestedLeverage(
   );
 }
 
+// Keep for backwards compatibility with signal_strength field
 function determineSignalStrength(eliteCount: number, goodCount: number): 'strong' | 'medium' {
   const { strongSignal } = config.signals;
 
@@ -406,15 +458,14 @@ function determineSignalStrength(eliteCount: number, goodCount: number): 'strong
 }
 
 // ============================================
-// V10.1: Update Signal Trader Tiers
-// Called when traders are re-evaluated
+// V11: Update Signal Trader Tiers
 // ============================================
 
 export async function updateSignalTraderTiers(): Promise<void> {
   try {
     const { data: activeSignals } = await db.client
       .from('quality_signals')
-      .select('id, coin, direction, traders')
+      .select('id, coin, direction, traders, signal_tier')
       .eq('is_active', true);
 
     if (!activeSignals || activeSignals.length === 0) return;
@@ -431,7 +482,6 @@ export async function updateSignalTraderTiers(): Promise<void> {
         const currentQuality = await getTraderQuality(trader.address);
         
         if (!currentQuality || currentQuality.quality_tier === 'weak') {
-          // Trader is now weak or not tracked - remove from signal
           logger.info(
             `Removing ${trader.address.slice(0, 8)}... from ${signal.coin} signal - ` +
             `was ${trader.tier}, now ${currentQuality?.quality_tier || 'untracked'}`
@@ -442,7 +492,6 @@ export async function updateSignalTraderTiers(): Promise<void> {
         }
 
         if (currentQuality.quality_tier !== trader.tier) {
-          // Tier changed but still valid
           logger.info(
             `Updating ${trader.address.slice(0, 8)}... in ${signal.coin} signal - ` +
             `${trader.tier} → ${currentQuality.quality_tier}`
@@ -462,18 +511,13 @@ export async function updateSignalTraderTiers(): Promise<void> {
         const eliteCount = updatedTraders.filter(t => t.tier === 'elite').length;
         const goodCount = updatedTraders.filter(t => t.tier === 'good').length;
 
-        // Check if signal still meets requirements
-        const { signals } = config;
-        const stillQualifies = 
-          eliteCount >= signals.minEliteForSignal ||
-          goodCount >= signals.minGoodForSignal ||
-          (eliteCount >= signals.minMixedForSignal.elite && goodCount >= signals.minMixedForSignal.good);
+        // V11: Check if signal still meets minimum requirements
+        const stillQualifies = shouldCreateSignal(eliteCount, goodCount);
 
         if (!stillQualifies || updatedTraders.length === 0) {
-          // Close the signal
           await closeSignal(signal as unknown as ActiveSignal, 'traders_no_longer_qualify');
         } else {
-          // Update signal with new trader data
+          const newTier = determineSignalTier(eliteCount, goodCount);
           const combinedPnl7d = updatedTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
           const avgWinRate = updatedTraders.reduce((sum, t) => sum + t.win_rate, 0) / updatedTraders.length;
           const avgProfitFactor = updatedTraders.reduce((sum, t) => sum + t.profit_factor, 0) / updatedTraders.length;
@@ -488,7 +532,8 @@ export async function updateSignalTraderTiers(): Promise<void> {
             avgProfitFactor,
             combinedPnl7d,
             avgConvictionPct,
-            fundingData.context
+            fundingData.context,
+            newTier
           );
 
           await db.client
@@ -502,6 +547,7 @@ export async function updateSignalTraderTiers(): Promise<void> {
               avg_win_rate: avgWinRate,
               avg_profit_factor: avgProfitFactor,
               confidence,
+              signal_tier: newTier,
               signal_strength: determineSignalStrength(eliteCount, goodCount),
               updated_at: new Date().toISOString(),
             })
@@ -509,7 +555,7 @@ export async function updateSignalTraderTiers(): Promise<void> {
 
           logger.info(
             `Updated ${signal.coin} ${signal.direction} signal: ` +
-            `removed ${removedCount} traders, now ${eliteCount}E + ${goodCount}G`
+            `removed ${removedCount} traders, now ${eliteCount}E + ${goodCount}G (${newTier})`
           );
         }
       }
@@ -526,7 +572,6 @@ export async function updateSignalTraderTiers(): Promise<void> {
 async function handleOpenEvent(change: PositionChange): Promise<void> {
   const { address, coin, direction, detected_at } = change;
   
-  // Check if this trader qualifies
   const trader = await getTraderQuality(address);
   if (!trader || trader.quality_tier === 'weak') {
     logger.debug(`Open event for ${coin} by ${address.slice(0, 8)}... - not a tracked quality trader`);
@@ -535,14 +580,11 @@ async function handleOpenEvent(change: PositionChange): Promise<void> {
 
   logger.info(`🎯 OPEN EVENT: ${trader.quality_tier.toUpperCase()} trader ${address.slice(0, 8)}... opened ${direction} ${coin}`);
 
-  // Check for existing signal
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   
   if (existingSignal) {
-    // Signal already exists - this trader is joining
     await handleTraderJoinsSignal(existingSignal, change, trader);
   } else {
-    // No existing signal - evaluate if we should create one
     await evaluateNewSignal(change, trader);
   }
 }
@@ -552,7 +594,6 @@ async function handleTraderJoinsSignal(
   change: PositionChange,
   trader: TraderQuality
 ): Promise<void> {
-  // Get updated trader list
   const allTraders = await getAllTradersInPosition(signal.coin, signal.direction);
   
   const eliteCount = allTraders.filter(t => t.tier === 'elite').length;
@@ -566,6 +607,10 @@ async function handleTraderJoinsSignal(
 
   const fundingData = await getSignalFundingContext(signal.coin, signal.direction as 'long' | 'short');
 
+  // V11: Determine new tier (might upgrade)
+  const newTier = determineSignalTier(eliteCount, goodCount);
+  const oldTier = signal.signal_tier || 'elite_entry';
+
   const confidence = calculateConfidence(
     eliteCount,
     goodCount,
@@ -573,10 +618,10 @@ async function handleTraderJoinsSignal(
     avgProfitFactor,
     combinedPnl7d,
     avgConvictionPct,
-    fundingData.context
+    fundingData.context,
+    newTier
   );
 
-  // Update signal with new trader
   await db.client
     .from('quality_signals')
     .update({
@@ -590,22 +635,24 @@ async function handleTraderJoinsSignal(
       avg_profit_factor: avgProfitFactor,
       avg_conviction_pct: avgConvictionPct,
       total_position_value: totalPositionValue,
+      signal_tier: newTier,
       signal_strength: determineSignalStrength(eliteCount, goodCount),
       updated_at: new Date().toISOString(),
     })
     .eq('id', signal.id);
 
+  const tierUpgrade = newTier !== oldTier ? ` | UPGRADED: ${oldTier} → ${newTier}` : '';
+
   logger.info(
     `📈 Signal updated: ${signal.coin} ${signal.direction} | ` +
     `+1 ${trader.quality_tier} trader | Now ${eliteCount}E + ${goodCount}G | ` +
-    `Confidence: ${signal.confidence}% → ${confidence}%`
+    `Confidence: ${signal.confidence}% → ${confidence}%${tierUpgrade}`
   );
 }
 
 async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQuality): Promise<void> {
   const { coin, direction, detected_at } = change;
   
-  // Get all traders currently in this position (might be more than just the trigger)
   const allTraders = await getAllTradersInPosition(coin, direction);
   
   if (allTraders.length === 0) {
@@ -618,21 +665,17 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
   const eliteCount = eliteTraders.length;
   const goodCount = goodTraders.length;
 
-  // Check minimum requirements
-  const { signals } = config;
-  const hasMinElite = eliteCount >= signals.minEliteForSignal;
-  const hasMinGood = goodCount >= signals.minGoodForSignal;
-  const hasMinMixed = eliteCount >= signals.minMixedForSignal.elite && 
-                      goodCount >= signals.minMixedForSignal.good;
-
-  if (!hasMinElite && !hasMinGood && !hasMinMixed) {
+  // V11: New signal requirements - single elite is enough
+  if (!shouldCreateSignal(eliteCount, goodCount)) {
     logger.debug(
       `${coin} ${direction}: Doesn't meet requirements - ${eliteCount}E + ${goodCount}G | ` +
-      `Need: ${signals.minEliteForSignal}E OR ${signals.minGoodForSignal}G OR ` +
-      `${signals.minMixedForSignal.elite}E+${signals.minMixedForSignal.good}G`
+      `Need: 1+ elite OR 3+ good`
     );
     return;
   }
+
+  // V11: Determine signal tier
+  const signalTier = determineSignalTier(eliteCount, goodCount);
 
   // Calculate signal metrics
   const combinedPnl7d = allTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
@@ -644,15 +687,18 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
   const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
   const tradersWithStops = allTraders.filter(t => t.has_stop_order).length;
 
-  // Additional quality checks
-  if (combinedPnl7d < signals.minCombinedPnl7d) {
-    logger.debug(`${coin} ${direction}: Combined 7d PnL too low ($${combinedPnl7d.toFixed(0)})`);
-    return;
-  }
+  // V11: Relaxed quality checks for elite_entry signals
+  if (signalTier !== 'elite_entry') {
+    // Only apply stricter checks for confirmed/consensus
+    if (combinedPnl7d < config.signals.minCombinedPnl7d) {
+      logger.debug(`${coin} ${direction}: Combined 7d PnL too low ($${combinedPnl7d.toFixed(0)})`);
+      return;
+    }
 
-  if (avgWinRate < signals.minAvgWinRate) {
-    logger.debug(`${coin} ${direction}: Avg win rate too low (${(avgWinRate * 100).toFixed(1)}%)`);
-    return;
+    if (avgWinRate < config.signals.minAvgWinRate) {
+      logger.debug(`${coin} ${direction}: Avg win rate too low (${(avgWinRate * 100).toFixed(1)}%)`);
+      return;
+    }
   }
 
   // Get current price for entry
@@ -677,7 +723,8 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     avgProfitFactor,
     combinedPnl7d,
     avgConvictionPct,
-    fundingData.context
+    fundingData.context,
+    signalTier
   );
 
   const riskScore = calculateRiskScore(
@@ -686,7 +733,8 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     stopData.stopDistancePct,
     eliteCount,
     stopData.volatilityRank,
-    fundingData.context
+    fundingData.context,
+    signalTier
   );
 
   const suggestedLeverage = calculateSuggestedLeverage(avgLeverage, stopData.stopDistancePct);
@@ -720,6 +768,7 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     avg_entry_price: currentPrice,
     avg_leverage: avgLeverage,
     traders: allTraders,
+    signal_tier: signalTier,
     signal_strength: signalStrength,
     confidence,
     directional_agreement: 1.0,
@@ -758,11 +807,15 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     return;
   }
 
+  // V11: Different log message based on tier
+  const tierEmoji = signalTier === 'elite_entry' ? '⚡' : signalTier === 'consensus' ? '🚨🚨' : '🚨';
+  const tierLabel = signalTier === 'elite_entry' ? 'ELITE ENTRY' : signalTier.toUpperCase();
+
   logger.info(
-    `🚨 NEW SIGNAL: ${coin} ${direction.toUpperCase()} | ` +
+    `${tierEmoji} NEW ${tierLabel} SIGNAL: ${coin} ${direction.toUpperCase()} | ` +
     `${eliteCount}E + ${goodCount}G traders | ` +
     `Entry: $${currentPrice.toFixed(4)} | Stop: ${stopData.stopDistancePct.toFixed(1)}% | ` +
-    `${signalStrength.toUpperCase()} (${confidence}%) | ` +
+    `Confidence: ${confidence}% | ` +
     `Detected: ${detected_at.toISOString()}`
   );
 }
@@ -775,12 +828,10 @@ async function handleIncreaseEvent(change: PositionChange): Promise<void> {
 
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   if (!existingSignal) {
-    // No signal exists - maybe evaluate creating one now
     await evaluateNewSignal(change, trader);
     return;
   }
 
-  // V10.1: Update signal with position additions
   const allTraders = await getAllTradersInPosition(coin, direction);
   const avgConvictionPct = allTraders.reduce((sum, t) => sum + t.conviction_pct, 0) / allTraders.length;
   const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
@@ -788,7 +839,7 @@ async function handleIncreaseEvent(change: PositionChange): Promise<void> {
   await db.client
     .from('quality_signals')
     .update({
-      traders: allTraders, // This now includes additions array
+      traders: allTraders,
       avg_conviction_pct: avgConvictionPct,
       total_position_value: totalPositionValue,
       updated_at: new Date().toISOString(),
@@ -807,11 +858,9 @@ async function handleDecreaseEvent(change: PositionChange): Promise<void> {
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   if (!existingSignal) return;
 
-  // Update signal metrics
   const allTraders = await getAllTradersInPosition(coin, direction);
   
   if (allTraders.length === 0) {
-    // All traders exited - close signal
     await closeSignal(existingSignal, 'all_traders_exited');
     return;
   }
@@ -820,6 +869,9 @@ async function handleDecreaseEvent(change: PositionChange): Promise<void> {
   const goodCount = allTraders.filter(t => t.tier === 'good').length;
   const avgConvictionPct = allTraders.reduce((sum, t) => sum + t.conviction_pct, 0) / allTraders.length;
   const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
+
+  // V11: Update tier on decrease
+  const newTier = determineSignalTier(eliteCount, goodCount);
 
   await db.client
     .from('quality_signals')
@@ -830,6 +882,7 @@ async function handleDecreaseEvent(change: PositionChange): Promise<void> {
       traders: allTraders,
       avg_conviction_pct: avgConvictionPct,
       total_position_value: totalPositionValue,
+      signal_tier: newTier,
       updated_at: new Date().toISOString(),
     })
     .eq('id', existingSignal.id);
@@ -843,31 +896,24 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   if (!existingSignal) return;
 
-  // Get remaining traders
   const allTraders = await getAllTradersInPosition(coin, direction);
   
   if (allTraders.length === 0) {
-    // All traders exited - close signal
     await closeSignal(existingSignal, 'all_traders_exited');
     return;
   }
 
-  // Check if remaining traders still meet requirements
   const eliteCount = allTraders.filter(t => t.tier === 'elite').length;
   const goodCount = allTraders.filter(t => t.tier === 'good').length;
   
-  const { signals } = config;
-  const stillQualifies = 
-    eliteCount >= signals.minEliteForSignal ||
-    goodCount >= signals.minGoodForSignal ||
-    (eliteCount >= signals.minMixedForSignal.elite && goodCount >= signals.minMixedForSignal.good);
+  // V11: Check if still qualifies
+  const stillQualifies = shouldCreateSignal(eliteCount, goodCount);
 
   if (!stillQualifies) {
     await closeSignal(existingSignal, 'below_minimum_traders');
     return;
   }
 
-  // Update with remaining traders
   const combinedPnl7d = allTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
   const avgWinRate = allTraders.reduce((sum, t) => sum + t.win_rate, 0) / allTraders.length;
   const avgProfitFactor = allTraders.reduce((sum, t) => sum + t.profit_factor, 0) / allTraders.length;
@@ -875,6 +921,7 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
   const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
 
   const fundingData = await getSignalFundingContext(coin, direction as 'long' | 'short');
+  const newTier = determineSignalTier(eliteCount, goodCount);
 
   const confidence = calculateConfidence(
     eliteCount,
@@ -883,7 +930,8 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
     avgProfitFactor,
     combinedPnl7d,
     avgConvictionPct,
-    fundingData.context
+    fundingData.context,
+    newTier
   );
 
   await db.client
@@ -899,6 +947,7 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
       avg_profit_factor: avgProfitFactor,
       avg_conviction_pct: avgConvictionPct,
       total_position_value: totalPositionValue,
+      signal_tier: newTier,
       signal_strength: determineSignalStrength(eliteCount, goodCount),
       updated_at: new Date().toISOString(),
     })
@@ -906,22 +955,19 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
 
   logger.info(
     `📉 Signal updated: ${coin} ${direction} | ` +
-    `Trader exited | Now ${eliteCount}E + ${goodCount}G | ` +
+    `Trader exited | Now ${eliteCount}E + ${goodCount}G (${newTier}) | ` +
     `Confidence: ${existingSignal.confidence}% → ${confidence}%`
   );
 }
 
 async function handleFlipEvent(change: PositionChange): Promise<void> {
-  // Flip = close old direction + open new direction
   const oldDirection = change.direction === 'long' ? 'short' : 'long';
   
-  // Close any signal in old direction
   const oldSignal = await getActiveSignalForCoin(change.coin, oldDirection);
   if (oldSignal) {
     await closeSignal(oldSignal, 'trader_flipped_direction');
   }
 
-  // Treat as new open in new direction
   await handleOpenEvent(change);
 }
 
@@ -1020,7 +1066,6 @@ async function checkPriceTargets(): Promise<void> {
       if (currentPrice <= signal.take_profit_3) hitTp3 = true;
     }
 
-    // Calculate current P&L
     let currentPnlPct = 0;
     if (signal.entry_price) {
       if (direction === 'long') {
@@ -1030,7 +1075,6 @@ async function checkPriceTargets(): Promise<void> {
       }
     }
 
-    // Track peak/trough
     const peakPrice = signal.peak_price 
       ? (direction === 'long' ? Math.max(signal.peak_price, currentPrice) : Math.min(signal.peak_price, currentPrice))
       : currentPrice;
@@ -1069,7 +1113,6 @@ async function checkPriceTargets(): Promise<void> {
 
       logger.info(`🎯🎯🎯 TP3 HIT: ${signal.coin} ${signal.direction} | P&L: +${currentPnlPct.toFixed(2)}%`);
     } else {
-      // Just update tracking
       await db.client
         .from('quality_signals')
         .update({
@@ -1096,18 +1139,14 @@ let priceCheckInterval: NodeJS.Timeout | null = null;
 let tierUpdateInterval: NodeJS.Timeout | null = null;
 
 export function initializeSignalGenerator(): void {
-  logger.info('Signal Generator V10.1 initializing (event-driven mode)...');
+  logger.info('Signal Generator V11 initializing (single elite entry mode)...');
   
-  // Subscribe to position changes from tracker
   subscribeToPositionChanges(processPositionChanges);
   
-  // Start price monitoring for stop/TP tracking
-  priceCheckInterval = setInterval(checkPriceTargets, 60 * 1000); // Every minute
+  priceCheckInterval = setInterval(checkPriceTargets, 60 * 1000);
+  tierUpdateInterval = setInterval(updateSignalTraderTiers, 5 * 60 * 1000);
   
-  // V10.1: Periodically update trader tiers in signals
-  tierUpdateInterval = setInterval(updateSignalTraderTiers, 5 * 60 * 1000); // Every 5 minutes
-  
-  logger.info('Signal Generator V10.1 ready - waiting for position events');
+  logger.info('Signal Generator V11 ready - creates signals on single elite opens');
 }
 
 export function stopSignalGenerator(): void {
@@ -1119,7 +1158,7 @@ export function stopSignalGenerator(): void {
     clearInterval(tierUpdateInterval);
     tierUpdateInterval = null;
   }
-  logger.info('Signal Generator V10.1 stopped');
+  logger.info('Signal Generator V11 stopped');
 }
 
 // ============================================
@@ -1158,10 +1197,8 @@ export async function getVerifiedSignals(): Promise<unknown[]> {
   return data || [];
 }
 
-// Legacy export for compatibility
 export async function generateSignals(): Promise<void> {
-  // V10 is event-driven, this is now a no-op
-  logger.debug('generateSignals() called - V10.1 is event-driven, no action needed');
+  logger.debug('generateSignals() called - V11 is event-driven, no action needed');
 }
 
 export default {

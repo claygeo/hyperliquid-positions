@@ -15,7 +15,8 @@ import {
   TrendingUp,
   TrendingDown,
   Target,
-  AlertTriangle
+  AlertTriangle,
+  Timer
 } from 'lucide-react';
 
 // ============================================
@@ -33,6 +34,10 @@ interface TraderInfo {
   opened_at?: string | null;
   unrealized_pnl?: number;
   unrealized_pnl_pct?: number;
+  // V12: Exit tracking fields
+  exit_price?: number | null;
+  exited_at?: string | null;
+  exit_type?: 'manual' | 'stopped' | 'liquidated' | 'signal_closed' | null;
 }
 
 interface QualitySignal {
@@ -184,6 +189,27 @@ function formatDateEST(dateString: string): string {
   }) + ' EST';
 }
 
+function formatDuration(startDate: string, endDate: string): string {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  const diffMs = end.getTime() - start.getTime();
+  
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    return `${days}d ${remainingHours}h`;
+  }
+  
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  
+  return `${minutes}m`;
+}
+
 function formatTraderEntry(entryPrice: number, currentPrice: number, direction: string): { pnlPct: number; display: string } {
   let pnlPct: number;
   if (direction === 'long') {
@@ -212,14 +238,56 @@ function parseAddresses(input: string): string[] {
   return [...new Set(addresses)];
 }
 
-function getOutcomeDisplay(signal: QualitySignal): { label: string; color: string; icon: React.ReactNode } {
+// Human-readable invalidation reasons
+function formatInvalidationReason(reason: string | undefined): string {
+  if (!reason) return 'Closed';
+  
+  const reasonMap: Record<string, string> = {
+    'all_traders_exited': 'All traders exited',
+    'majority_exit_100pct': 'All traders exited',
+    'below_minimum_traders': 'Too few traders remaining',
+    'traders_no_longer_qualify': 'Traders no longer qualify',
+    'trader_flipped_direction': 'Trader flipped direction',
+    'replaced_by_short_signal': 'Replaced by SHORT signal',
+    'replaced_by_long_signal': 'Replaced by LONG signal',
+    'stale_signal': 'Signal expired',
+    'system_reset_v10_migration': 'System migration',
+    'system_reset': 'System reset',
+    'manual_close': 'Manually closed',
+  };
+  
+  return reasonMap[reason] || reason.replace(/_/g, ' ');
+}
+
+function getOutcomeDisplay(signal: QualitySignal): { label: string; color: string; icon: React.ReactNode; sublabel?: string } {
+  // TP hits take priority
   if (signal.hit_tp3) return { label: 'TP3 Hit', color: 'text-green-500', icon: <Target className="h-4 w-4" /> };
   if (signal.hit_tp2) return { label: 'TP2 Hit', color: 'text-green-500', icon: <Target className="h-4 w-4" /> };
   if (signal.hit_tp1) return { label: 'TP1 Hit', color: 'text-green-400', icon: <Target className="h-4 w-4" /> };
-  if (signal.hit_stop || signal.outcome === 'stopped_out') return { label: 'Stopped', color: 'text-red-500', icon: <AlertTriangle className="h-4 w-4" /> };
+  
+  // Stopped
+  if (signal.hit_stop || signal.outcome === 'stopped_out') {
+    return { label: 'Stopped', color: 'text-red-500', icon: <AlertTriangle className="h-4 w-4" /> };
+  }
+  
+  // Invalidated with reason
+  if (signal.invalidation_reason) {
+    const pnl = signal.final_pnl_pct || 0;
+    const pnlDisplay = `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`;
+    const reasonText = formatInvalidationReason(signal.invalidation_reason);
+    
+    return {
+      label: pnlDisplay,
+      color: pnl >= 0 ? 'text-green-500' : 'text-red-500',
+      icon: pnl >= 0 ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />,
+      sublabel: reasonText
+    };
+  }
+  
+  // Generic profit/loss
   if (signal.outcome === 'profit') return { label: 'Profit', color: 'text-green-500', icon: <TrendingUp className="h-4 w-4" /> };
   if (signal.outcome === 'loss') return { label: 'Loss', color: 'text-red-500', icon: <TrendingDown className="h-4 w-4" /> };
-  if (signal.invalidation_reason) return { label: 'Invalidated', color: 'text-yellow-500', icon: <X className="h-4 w-4" /> };
+  
   return { label: 'Closed', color: 'text-muted-foreground', icon: <X className="h-4 w-4" /> };
 }
 
@@ -265,7 +333,7 @@ function TrackRecordModal({
 
   const stats = {
     total: closedSignals.length,
-    wins: closedSignals.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit').length,
+    wins: closedSignals.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0)).length,
     stopped: closedSignals.filter(s => s.hit_stop || s.outcome === 'stopped_out').length,
     avgPnl: closedSignals.length > 0 
       ? closedSignals.reduce((sum, s) => sum + (s.final_pnl_pct || 0), 0) / closedSignals.length 
@@ -326,6 +394,9 @@ function TrackRecordModal({
               const outcome = getOutcomeDisplay(signal);
               const traders = Array.isArray(signal.traders) ? signal.traders : [];
               const isExpanded = expandedSignal === signal.id;
+              const duration = signal.created_at && signal.closed_at 
+                ? formatDuration(signal.created_at, signal.closed_at)
+                : null;
               
               return (
                 <div 
@@ -348,12 +419,23 @@ function TrackRecordModal({
                         <span className="text-xs text-muted-foreground">
                           {signal.elite_count}E + {signal.good_count}G
                         </span>
+                        {duration && (
+                          <span className="text-xs text-muted-foreground flex items-center gap-1">
+                            <Timer className="h-3 w-3" />
+                            {duration}
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className={`flex items-center gap-1 text-sm ${outcome.color}`}>
-                          {outcome.icon}
-                          {outcome.label}
-                        </span>
+                        <div className="text-right">
+                          <span className={`flex items-center gap-1 text-sm ${outcome.color}`}>
+                            {outcome.icon}
+                            {outcome.label}
+                          </span>
+                          {outcome.sublabel && (
+                            <span className="text-xs text-muted-foreground">{outcome.sublabel}</span>
+                          )}
+                        </div>
                         {isExpanded ? (
                           <ChevronUp className="h-4 w-4 text-muted-foreground" />
                         ) : (
@@ -371,14 +453,9 @@ function TrackRecordModal({
                           Exit: <span className="text-foreground font-mono">{formatPrice(signal.current_price)}</span>
                         </span>
                       </div>
-                      <div className="flex items-center gap-3">
-                        <span className={`font-medium ${(signal.final_pnl_pct || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                          {(signal.final_pnl_pct || 0) >= 0 ? '+' : ''}{(signal.final_pnl_pct || 0).toFixed(2)}%
-                        </span>
-                        <span className="text-xs text-muted-foreground">
-                          {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}
-                        </span>
-                      </div>
+                      <span className="text-xs text-muted-foreground">
+                        {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}
+                      </span>
                     </div>
                   </div>
 
@@ -389,43 +466,36 @@ function TrackRecordModal({
                       <div className="grid grid-cols-4 gap-2 text-xs">
                         <div className={`p-2 rounded text-center ${signal.hit_stop ? 'bg-red-500/20' : 'bg-background'}`}>
                           <div className="text-muted-foreground mb-1">Stop</div>
-                          <div className={signal.hit_stop ? 'text-red-500' : 'text-foreground'}>
+                          <div className={signal.hit_stop ? 'text-red-500 font-medium' : 'text-foreground'}>
                             {formatPrice(signal.stop_loss)}
                           </div>
                         </div>
                         <div className={`p-2 rounded text-center ${signal.hit_tp1 ? 'bg-green-500/20' : 'bg-background'}`}>
                           <div className="text-muted-foreground mb-1">TP1</div>
-                          <div className={signal.hit_tp1 ? 'text-green-500' : 'text-foreground'}>
+                          <div className={signal.hit_tp1 ? 'text-green-500 font-medium' : 'text-foreground'}>
                             {formatPrice(signal.take_profit_1)}
                           </div>
                         </div>
                         <div className={`p-2 rounded text-center ${signal.hit_tp2 ? 'bg-green-500/20' : 'bg-background'}`}>
                           <div className="text-muted-foreground mb-1">TP2</div>
-                          <div className={signal.hit_tp2 ? 'text-green-500' : 'text-foreground'}>
+                          <div className={signal.hit_tp2 ? 'text-green-500 font-medium' : 'text-foreground'}>
                             {formatPrice(signal.take_profit_2)}
                           </div>
                         </div>
                         <div className={`p-2 rounded text-center ${signal.hit_tp3 ? 'bg-green-500/20' : 'bg-background'}`}>
                           <div className="text-muted-foreground mb-1">TP3</div>
-                          <div className={signal.hit_tp3 ? 'text-green-500' : 'text-foreground'}>
+                          <div className={signal.hit_tp3 ? 'text-green-500 font-medium' : 'text-foreground'}>
                             {formatPrice(signal.take_profit_3)}
                           </div>
                         </div>
                       </div>
 
                       {/* Timeline */}
-                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground bg-background rounded p-2">
                         <span>Opened: {signal.created_at ? formatDateEST(signal.created_at) : '-'}</span>
-                        <span>→</span>
+                        <span className="text-foreground">→</span>
                         <span>Closed: {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}</span>
                       </div>
-
-                      {/* Invalidation reason if exists */}
-                      {signal.invalidation_reason && (
-                        <div className="text-xs text-yellow-500 bg-yellow-500/10 rounded p-2">
-                          Reason: {signal.invalidation_reason.replace(/_/g, ' ')}
-                        </div>
-                      )}
 
                       {/* Traders */}
                       {traders.length > 0 && (
@@ -433,34 +503,77 @@ function TrackRecordModal({
                           <div className="text-xs text-muted-foreground mb-2">
                             Traders ({traders.length})
                           </div>
-                          <div className="space-y-1">
-                            {traders.map((trader) => (
-                              <a
-                                key={trader.address}
-                                href={getTraderUrl(trader.address)}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="flex items-center justify-between p-2 bg-background rounded text-xs hover:bg-muted/50 transition-colors"
-                              >
-                                <div className="flex items-center gap-2">
-                                  <span className={`px-1.5 py-0.5 rounded font-medium ${
-                                    trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
-                                  }`}>
-                                    {trader.tier === 'elite' ? 'E' : 'G'}
-                                  </span>
-                                  <span className="font-mono text-muted-foreground">
-                                    {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
-                                  </span>
-                                  <ExternalLink className="h-3 w-3 text-muted-foreground" />
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <span>Entry: {formatPrice(trader.entry_price)}</span>
-                                  <span className="text-muted-foreground">
-                                    {((trader.win_rate || 0) * 100).toFixed(0)}% WR
-                                  </span>
-                                </div>
-                              </a>
-                            ))}
+                          <div className="space-y-2">
+                            {traders.map((trader) => {
+                              const hasExitData = trader.exit_price !== null && trader.exit_price !== undefined;
+                              const traderPnl = hasExitData && trader.entry_price
+                                ? formatTraderEntry(trader.entry_price, trader.exit_price!, signal.direction)
+                                : null;
+                              
+                              return (
+                                <a
+                                  key={trader.address}
+                                  href={getTraderUrl(trader.address)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="block p-2 bg-background rounded text-xs hover:bg-muted/50 transition-colors"
+                                >
+                                  <div className="flex items-center justify-between mb-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className={`px-1.5 py-0.5 rounded font-medium ${
+                                        trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
+                                      }`}>
+                                        {trader.tier === 'elite' ? 'E' : 'G'}
+                                      </span>
+                                      <span className="font-mono text-muted-foreground">
+                                        {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
+                                      </span>
+                                      <ExternalLink className="h-3 w-3 text-muted-foreground" />
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      {traderPnl && (
+                                        <span className={`font-medium ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                                          {traderPnl.display}
+                                        </span>
+                                      )}
+                                      <span className="text-muted-foreground">
+                                        {((trader.win_rate || 0) * 100).toFixed(0)}% WR
+                                      </span>
+                                    </div>
+                                  </div>
+                                  {/* Entry/Exit Row */}
+                                  <div className="flex items-center justify-between text-muted-foreground pl-6">
+                                    <div className="flex items-center gap-3">
+                                      <span>
+                                        Entry: <span className="font-mono text-foreground">{formatPrice(trader.entry_price)}</span>
+                                        {trader.opened_at && (
+                                          <span className="ml-1 text-xs">({formatDateEST(trader.opened_at)})</span>
+                                        )}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  {hasExitData && (
+                                    <div className="flex items-center justify-between text-muted-foreground pl-6 mt-1">
+                                      <span>
+                                        Exit: <span className="font-mono text-foreground">{formatPrice(trader.exit_price!)}</span>
+                                        {trader.exited_at && (
+                                          <span className="ml-1 text-xs">({formatDateEST(trader.exited_at)})</span>
+                                        )}
+                                        {trader.exit_type && trader.exit_type !== 'manual' && (
+                                          <span className={`ml-2 px-1 py-0.5 rounded text-xs ${
+                                            trader.exit_type === 'stopped' ? 'bg-red-500/20 text-red-500' :
+                                            trader.exit_type === 'liquidated' ? 'bg-red-500/20 text-red-500' :
+                                            'bg-muted text-muted-foreground'
+                                          }`}>
+                                            {trader.exit_type}
+                                          </span>
+                                        )}
+                                      </span>
+                                    </div>
+                                  )}
+                                </a>
+                              );
+                            })}
                           </div>
                         </div>
                       )}
@@ -1134,12 +1247,12 @@ export default function SignalsPage() {
   const fetchSignalStats = useCallback(async () => {
     const { data } = await supabase
       .from('quality_signals')
-      .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop')
+      .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop, final_pnl_pct')
       .not('outcome', 'is', null);
 
     if (data) {
       const total = data.length;
-      const wins = data.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit').length;
+      const wins = data.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0)).length;
       const stopped = data.filter(s => s.hit_stop || s.outcome === 'stopped_out').length;
       const open = data.filter(s => s.outcome === 'open').length;
       const closed = total - open;

@@ -1,15 +1,14 @@
-// Signal Generator V11
-// CHANGES FROM V10.1:
-// - NEW: Creates signals on SINGLE ELITE opens (faster alerts)
-// - NEW: Signal tiers: elite_entry → confirmed → consensus
-// - elite_entry: 1 elite trader (fast alert, lower confidence)
-// - confirmed: 2E, or 1E+1G, or 3G (current behavior)
-// - consensus: 3E+, or 2E+2G+ (highest confidence)
-// - Tier upgrades automatically as more traders join
+// Signal Generator V12
+// CHANGES FROM V11:
+// - NEW: Tracks per-trader exit data (exit_price, exited_at, exit_type)
+// - When a trader closes their position, we capture their exit price/time
+// - When signal closes, any remaining traders get exit data populated
+// - This enables accurate per-trader P&L display in track record
 //
 // ARCHITECTURE:
 // - EVENT-DRIVEN: Only creates signals when we WITNESS a position open
 // - VERIFIED: Every signal has entry_detected_at = when WE saw the open
+// - EXIT TRACKING: Each trader has exit_price, exited_at, exit_type
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -18,13 +17,14 @@ import hyperliquid from '../utils/hyperliquid-api.js';
 import { PositionChange, subscribeToPositionChanges } from './position-tracker.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v11');
+const logger = createLogger('signal-generator-v12');
 
 // ============================================
 // Types
 // ============================================
 
 type SignalTier = 'elite_entry' | 'confirmed' | 'consensus';
+type ExitType = 'manual' | 'stopped' | 'liquidated' | 'signal_closed' | null;
 
 interface TraderQuality {
   address: string;
@@ -62,6 +62,10 @@ interface TraderForSignal {
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
   additions: PositionAddition[];
+  // V12: Exit tracking fields
+  exit_price: number | null;
+  exited_at: string | null;
+  exit_type: ExitType;
 }
 
 interface ActiveSignal {
@@ -249,6 +253,10 @@ async function getAllTradersInPosition(coin: string, direction: string): Promise
       unrealized_pnl: pos.unrealized_pnl || 0,
       unrealized_pnl_pct: unrealizedPnlPct,
       additions,
+      // V12: Initialize exit fields as null (trader still in position)
+      exit_price: null,
+      exited_at: null,
+      exit_type: null,
     });
   }
 
@@ -455,6 +463,34 @@ function determineSignalStrength(eliteCount: number, goodCount: number): 'strong
       goodCount >= strongSignal.minMixed.good) return 'strong';
 
   return 'medium';
+}
+
+// ============================================
+// V12: Update Trader Exit Data in Signal
+// ============================================
+
+async function updateTraderExitInSignal(
+  signal: ActiveSignal,
+  traderAddress: string,
+  exitPrice: number,
+  exitType: ExitType
+): Promise<TraderForSignal[]> {
+  const traders = signal.traders || [];
+  const exitedAt = new Date().toISOString();
+  
+  const updatedTraders = traders.map(trader => {
+    if (trader.address.toLowerCase() === traderAddress.toLowerCase()) {
+      return {
+        ...trader,
+        exit_price: exitPrice,
+        exited_at: exitedAt,
+        exit_type: exitType,
+      };
+    }
+    return trader;
+  });
+
+  return updatedTraders;
 }
 
 // ============================================
@@ -891,15 +927,26 @@ async function handleDecreaseEvent(change: PositionChange): Promise<void> {
 }
 
 async function handleCloseEvent(change: PositionChange): Promise<void> {
-  const { address, coin, direction } = change;
+  const { address, coin, direction, price_at_event } = change;
   
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   if (!existingSignal) return;
 
+  // V12: Capture this trader's exit data BEFORE removing them from active traders list
+  const exitPrice = price_at_event || await hyperliquid.getMidPrice(coin) || 0;
+  const updatedTradersWithExit = await updateTraderExitInSignal(
+    existingSignal,
+    address,
+    exitPrice,
+    'manual'
+  );
+
+  // Get remaining active traders (excludes the one who just closed)
   const allTraders = await getAllTradersInPosition(coin, direction);
   
   if (allTraders.length === 0) {
-    await closeSignal(existingSignal, 'all_traders_exited');
+    // V12: Pass traders with exit data to closeSignal
+    await closeSignal(existingSignal, 'all_traders_exited', updatedTradersWithExit);
     return;
   }
 
@@ -910,9 +957,14 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
   const stillQualifies = shouldCreateSignal(eliteCount, goodCount);
 
   if (!stillQualifies) {
-    await closeSignal(existingSignal, 'below_minimum_traders');
+    // V12: Pass traders with exit data
+    await closeSignal(existingSignal, 'below_minimum_traders', updatedTradersWithExit);
     return;
   }
+
+  // Merge: keep traders who exited (with exit data) + active traders (without exit data)
+  const exitedTraders = updatedTradersWithExit.filter(t => t.exit_price !== null);
+  const mergedTraders = [...exitedTraders, ...allTraders];
 
   const combinedPnl7d = allTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
   const avgWinRate = allTraders.reduce((sum, t) => sum + t.win_rate, 0) / allTraders.length;
@@ -940,7 +992,7 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
       elite_count: eliteCount,
       good_count: goodCount,
       total_traders: allTraders.length,
-      traders: allTraders,
+      traders: mergedTraders,  // V12: Store both exited and active traders
       confidence,
       combined_pnl_7d: combinedPnl7d,
       avg_win_rate: avgWinRate,
@@ -955,7 +1007,8 @@ async function handleCloseEvent(change: PositionChange): Promise<void> {
 
   logger.info(
     `📉 Signal updated: ${coin} ${direction} | ` +
-    `Trader exited | Now ${eliteCount}E + ${goodCount}G (${newTier}) | ` +
+    `Trader ${address.slice(0, 8)}... exited @ $${exitPrice.toFixed(2)} | ` +
+    `Now ${eliteCount}E + ${goodCount}G (${newTier}) | ` +
     `Confidence: ${existingSignal.confidence}% → ${confidence}%`
   );
 }
@@ -971,8 +1024,14 @@ async function handleFlipEvent(change: PositionChange): Promise<void> {
   await handleOpenEvent(change);
 }
 
-async function closeSignal(signal: ActiveSignal, reason: string): Promise<void> {
+// V12: Updated closeSignal to accept pre-computed traders with exit data
+async function closeSignal(
+  signal: ActiveSignal, 
+  reason: string,
+  tradersWithExitData?: TraderForSignal[]
+): Promise<void> {
   const currentPrice = await hyperliquid.getMidPrice(signal.coin);
+  const closedAt = new Date().toISOString();
   
   let pnlPct = 0;
   if (currentPrice && signal.entry_price) {
@@ -983,6 +1042,21 @@ async function closeSignal(signal: ActiveSignal, reason: string): Promise<void> 
     }
   }
 
+  // V12: Populate exit data for any traders who don't have it yet
+  let finalTraders = tradersWithExitData || signal.traders || [];
+  
+  finalTraders = finalTraders.map(trader => {
+    if (trader.exit_price === null || trader.exit_price === undefined) {
+      return {
+        ...trader,
+        exit_price: currentPrice || signal.entry_price,
+        exited_at: closedAt,
+        exit_type: 'signal_closed' as ExitType,
+      };
+    }
+    return trader;
+  });
+
   await db.client
     .from('quality_signals')
     .update({
@@ -992,7 +1066,8 @@ async function closeSignal(signal: ActiveSignal, reason: string): Promise<void> 
       outcome: pnlPct > 0 ? 'profit' : 'loss',
       final_pnl_pct: pnlPct,
       current_price: currentPrice,
-      closed_at: new Date().toISOString(),
+      closed_at: closedAt,
+      traders: finalTraders,  // V12: Save traders with exit data
     })
     .eq('id', signal.id);
 
@@ -1083,6 +1158,15 @@ async function checkPriceTargets(): Promise<void> {
       : currentPrice;
 
     if (hitStop) {
+      // V12: Update traders with stop exit data
+      const closedAt = new Date().toISOString();
+      const tradersWithExit = (signal.traders || []).map((trader: TraderForSignal) => ({
+        ...trader,
+        exit_price: trader.exit_price ?? currentPrice,
+        exited_at: trader.exited_at ?? closedAt,
+        exit_type: trader.exit_type ?? 'stopped' as ExitType,
+      }));
+
       await db.client
         .from('quality_signals')
         .update({
@@ -1091,12 +1175,22 @@ async function checkPriceTargets(): Promise<void> {
           hit_stop: true,
           final_pnl_pct: currentPnlPct,
           current_price: currentPrice,
-          closed_at: new Date().toISOString(),
+          closed_at: closedAt,
+          traders: tradersWithExit,
         })
         .eq('id', signal.id);
 
       logger.info(`🛑 STOP HIT: ${signal.coin} ${signal.direction} | P&L: ${currentPnlPct.toFixed(2)}%`);
     } else if (hitTp3 && !signal.hit_tp3) {
+      // V12: Update traders with TP3 exit data
+      const closedAt = new Date().toISOString();
+      const tradersWithExit = (signal.traders || []).map((trader: TraderForSignal) => ({
+        ...trader,
+        exit_price: trader.exit_price ?? currentPrice,
+        exited_at: trader.exited_at ?? closedAt,
+        exit_type: trader.exit_type ?? 'manual' as ExitType,
+      }));
+
       await db.client
         .from('quality_signals')
         .update({
@@ -1107,7 +1201,8 @@ async function checkPriceTargets(): Promise<void> {
           hit_tp3: true,
           final_pnl_pct: currentPnlPct,
           current_price: currentPrice,
-          closed_at: new Date().toISOString(),
+          closed_at: closedAt,
+          traders: tradersWithExit,
         })
         .eq('id', signal.id);
 
@@ -1139,14 +1234,14 @@ let priceCheckInterval: NodeJS.Timeout | null = null;
 let tierUpdateInterval: NodeJS.Timeout | null = null;
 
 export function initializeSignalGenerator(): void {
-  logger.info('Signal Generator V11 initializing (single elite entry mode)...');
+  logger.info('Signal Generator V12 initializing (with per-trader exit tracking)...');
   
   subscribeToPositionChanges(processPositionChanges);
   
   priceCheckInterval = setInterval(checkPriceTargets, 60 * 1000);
   tierUpdateInterval = setInterval(updateSignalTraderTiers, 5 * 60 * 1000);
   
-  logger.info('Signal Generator V11 ready - creates signals on single elite opens');
+  logger.info('Signal Generator V12 ready - tracks per-trader entry AND exit data');
 }
 
 export function stopSignalGenerator(): void {
@@ -1158,7 +1253,7 @@ export function stopSignalGenerator(): void {
     clearInterval(tierUpdateInterval);
     tierUpdateInterval = null;
   }
-  logger.info('Signal Generator V11 stopped');
+  logger.info('Signal Generator V12 stopped');
 }
 
 // ============================================
@@ -1198,7 +1293,7 @@ export async function getVerifiedSignals(): Promise<unknown[]> {
 }
 
 export async function generateSignals(): Promise<void> {
-  logger.debug('generateSignals() called - V11 is event-driven, no action needed');
+  logger.debug('generateSignals() called - V12 is event-driven, no action needed');
 }
 
 export default {

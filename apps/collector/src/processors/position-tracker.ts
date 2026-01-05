@@ -148,10 +148,56 @@ async function loadPreviousPositionsFromDb(): Promise<void> {
 // V7: Get Accurate Open Time from Fill History
 // ============================================
 
+// Queue for fill history lookups (to avoid rate limiting)
+const fillLookupQueue: Array<{ address: string; coin: string; direction: 'long' | 'short' }> = [];
+let isProcessingFillQueue = false;
+
+async function processFillLookupQueue(): Promise<void> {
+  if (isProcessingFillQueue || fillLookupQueue.length === 0) return;
+  isProcessingFillQueue = true;
+  
+  // Process max 3 lookups per cycle to avoid rate limiting
+  const batch = fillLookupQueue.splice(0, 3);
+  
+  for (const item of batch) {
+    const key = `${item.address}-${item.coin}`;
+    
+    logger.info(`🔍 Looking up fill history for ${item.address.slice(0, 8)}... ${item.coin} ${item.direction}`);
+    
+    const result = await hyperliquid.findPositionOpenTime(item.address, item.coin, item.direction, 30);
+    
+    if (result) {
+      logger.info(
+        `✅ Found actual open time: ${item.address.slice(0, 8)}... ${item.coin} ${item.direction} ` +
+        `opened at ${result.openedAt.toISOString()}`
+      );
+      
+      // Update the DB with accurate open time
+      await db.client
+        .from('trader_positions')
+        .update({ opened_at: result.openedAt.toISOString() })
+        .eq('address', item.address)
+        .eq('coin', item.coin);
+      
+      // Update cache
+      const cached = previousPositions.get(key);
+      if (cached) {
+        cached.opened_at = result.openedAt;
+      }
+    }
+    
+    // Rate limit: wait 500ms between lookups
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  
+  isProcessingFillQueue = false;
+}
+
 async function getAccurateOpenTime(
   address: string,
   coin: string,
-  direction: 'long' | 'short'
+  direction: 'long' | 'short',
+  isNewPosition: boolean // Only query API for truly new positions
 ): Promise<Date | null> {
   const key = `${address}-${coin}`;
   
@@ -169,20 +215,15 @@ async function getAccurateOpenTime(
   // Mark as looked up to avoid repeated API calls
   fillHistoryLookedUp.add(key);
   
-  // Query fill history for actual open time
-  logger.info(`🔍 Looking up fill history for ${address.slice(0, 8)}... ${coin} ${direction}`);
-  
-  const result = await hyperliquid.findPositionOpenTime(address, coin, direction, 30);
-  
-  if (result) {
-    logger.info(
-      `✅ Found actual open time: ${address.slice(0, 8)}... ${coin} ${direction} ` +
-      `opened at ${result.openedAt.toISOString()}`
-    );
-    return result.openedAt;
+  // Only query fill history for TRULY NEW positions (detected in real-time)
+  // NOT for positions loaded from DB on startup
+  if (isNewPosition) {
+    // Queue the lookup instead of doing it immediately
+    fillLookupQueue.push({ address, coin, direction });
+    logger.debug(`Queued fill lookup for ${address.slice(0, 8)}... ${coin} (queue: ${fillLookupQueue.length})`);
   }
   
-  logger.debug(`Could not find open time for ${address.slice(0, 8)}... ${coin}`);
+  // Return null for now - the queue processor will update DB later
   return null;
 }
 
@@ -549,17 +590,24 @@ async function processPositions(
     // Determine opened_at
     let openedAt: Date | null = null;
     
+    // Check if this is a truly NEW position (not in our cache/DB)
+    const isTrulyNewPosition = !prev;
+    const isDirectionFlip = prev && prev.direction !== currentDirection;
+    
     if (prev && prev.direction === currentDirection && prev.opened_at) {
       // Same position, same direction - keep existing opened_at
       openedAt = prev.opened_at;
-    } else if (prev && prev.direction !== currentDirection) {
-      // Direction flipped - this is a new position, query fill history
-      openedAt = await getAccurateOpenTime(address, coin, currentDirection);
+    } else if (isDirectionFlip) {
+      // Direction flipped - this is a new position, queue fill history lookup
+      openedAt = await getAccurateOpenTime(address, coin, currentDirection, true);
       if (!openedAt) openedAt = new Date(); // Fallback to now
-    } else if (!prev) {
-      // No previous record - query fill history for actual open time
-      openedAt = await getAccurateOpenTime(address, coin, currentDirection);
+    } else if (isTrulyNewPosition) {
+      // No previous record - queue fill history lookup for truly new positions
+      openedAt = await getAccurateOpenTime(address, coin, currentDirection, true);
       if (!openedAt) openedAt = new Date(); // Fallback to now
+    } else {
+      // Position exists but no opened_at - use current time (don't query API for old positions)
+      openedAt = new Date();
     }
 
     // Calculate position age
@@ -770,10 +818,14 @@ async function pollPositions(): Promise<void> {
     await savePositions(allPositions);
     await saveOpenOrders(allOpenOrders);
 
+    // Process queued fill history lookups (rate-limited)
+    await processFillLookupQueue();
+
     logger.info(
       `Updated ${allPositions.length} positions, ${allOpenOrders.length} open orders` +
       (positionChanges.length > 0 ? `, ${positionChanges.length} changes` : '') +
-      (urgentReevals > 0 ? `, ${urgentReevals} urgent reevals` : '')
+      (urgentReevals > 0 ? `, ${urgentReevals} urgent reevals` : '') +
+      (fillLookupQueue.length > 0 ? `, ${fillLookupQueue.length} fill lookups queued` : '')
     );
 
     await generateSignals();

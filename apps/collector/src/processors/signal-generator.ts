@@ -1,20 +1,13 @@
-// Signal Generator V10
-// MAJOR ARCHITECTURE CHANGE:
+// Signal Generator V10.1
+// CHANGES FROM V10:
+// - Includes position addition history in trader data (for UI display)
+// - Handles stale tier updates (when trader gets re-evaluated)
+// - Better logging for debugging
+//
+// ARCHITECTURE (unchanged):
 // - EVENT-DRIVEN: Only creates signals when we WITNESS a position open
 // - NOT state-based: Doesn't create signals from existing positions
 // - VERIFIED: Every signal has entry_detected_at = when WE saw the open
-// - TRUSTED: is_verified_open = true means we caught it live
-//
-// Flow:
-// 1. Position tracker detects 'open' event → Signal generator evaluates
-// 2. If trader qualifies → Create signal with verified timestamp
-// 3. On 'increase' → Update signal (more conviction)
-// 4. On 'decrease'/'close' → Update or close signal
-//
-// This means:
-// - Signals only appear for NEW positions we witness
-// - Old positions that existed before collector started = NO signal
-// - You can trust signal timestamps for trade timing
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -23,7 +16,7 @@ import hyperliquid from '../utils/hyperliquid-api.js';
 import { PositionChange, subscribeToPositionChanges } from './position-tracker.js';
 import { getSignalFundingContext } from './funding-tracker.js';
 
-const logger = createLogger('signal-generator-v10');
+const logger = createLogger('signal-generator-v10.1');
 
 // ============================================
 // Types
@@ -31,12 +24,21 @@ const logger = createLogger('signal-generator-v10');
 
 interface TraderQuality {
   address: string;
-  quality_tier: 'elite' | 'good';
+  quality_tier: 'elite' | 'good' | 'weak';
   pnl_7d: number;
   pnl_30d: number;
   win_rate: number;
   profit_factor: number;
   account_value: number;
+}
+
+interface PositionAddition {
+  size_added: number;
+  price_at_add: number;
+  new_entry_price: number;
+  new_size: number;
+  value_usd: number;
+  detected_at: string;
 }
 
 interface TraderForSignal {
@@ -55,6 +57,8 @@ interface TraderForSignal {
   opened_at: string;
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
+  // V10.1: Position addition history
+  additions: PositionAddition[];
 }
 
 interface ActiveSignal {
@@ -108,7 +112,6 @@ async function getTraderQuality(address: string): Promise<TraderQuality | null> 
     .select('address, quality_tier, pnl_7d, pnl_30d, win_rate, profit_factor, account_value')
     .eq('address', address)
     .eq('is_tracked', true)
-    .in('quality_tier', ['elite', 'good'])
     .single();
 
   return data as TraderQuality | null;
@@ -137,6 +140,35 @@ async function getActiveSignalForCoin(coin: string, direction: string): Promise<
   return data as ActiveSignal | null;
 }
 
+// V10.1: Get position additions for a trader
+async function getPositionAdditions(address: string, coin: string, direction: string, since?: string): Promise<PositionAddition[]> {
+  let query = db.client
+    .from('position_history')
+    .select('*')
+    .eq('address', address)
+    .eq('coin', coin)
+    .eq('direction', direction)
+    .eq('event_type', 'increase')
+    .order('detected_at', { ascending: true });
+
+  if (since) {
+    query = query.gte('detected_at', since);
+  }
+
+  const { data } = await query;
+
+  if (!data || data.length === 0) return [];
+
+  return data.map(row => ({
+    size_added: parseFloat(row.size_change) || 0,
+    price_at_add: parseFloat(row.price_at_event) || 0,
+    new_entry_price: parseFloat(row.new_entry_price) || 0,
+    new_size: parseFloat(row.new_size) || 0,
+    value_usd: parseFloat(row.new_value_usd) || 0,
+    detected_at: row.detected_at,
+  }));
+}
+
 async function getAllTradersInPosition(coin: string, direction: string): Promise<TraderForSignal[]> {
   const { data: positions } = await db.client
     .from('trader_positions')
@@ -150,7 +182,8 @@ async function getAllTradersInPosition(coin: string, direction: string): Promise
 
   for (const pos of positions) {
     const quality = await getTraderQuality(pos.address);
-    if (!quality) continue;
+    // V10.1: Skip weak traders entirely
+    if (!quality || quality.quality_tier === 'weak') continue;
 
     const convictionPct = quality.account_value > 0
       ? Math.min(100, (pos.value_usd / quality.account_value) * 100)
@@ -159,6 +192,9 @@ async function getAllTradersInPosition(coin: string, direction: string): Promise
     const unrealizedPnlPct = pos.value_usd > 0
       ? (pos.unrealized_pnl / pos.value_usd) * 100
       : 0;
+
+    // V10.1: Get position additions
+    const additions = await getPositionAdditions(pos.address, coin, direction, pos.opened_at);
 
     traders.push({
       address: pos.address,
@@ -176,6 +212,7 @@ async function getAllTradersInPosition(coin: string, direction: string): Promise
       opened_at: pos.opened_at,
       unrealized_pnl: pos.unrealized_pnl || 0,
       unrealized_pnl_pct: unrealizedPnlPct,
+      additions,
     });
   }
 
@@ -369,6 +406,120 @@ function determineSignalStrength(eliteCount: number, goodCount: number): 'strong
 }
 
 // ============================================
+// V10.1: Update Signal Trader Tiers
+// Called when traders are re-evaluated
+// ============================================
+
+export async function updateSignalTraderTiers(): Promise<void> {
+  try {
+    const { data: activeSignals } = await db.client
+      .from('quality_signals')
+      .select('id, coin, direction, traders')
+      .eq('is_active', true);
+
+    if (!activeSignals || activeSignals.length === 0) return;
+
+    for (const signal of activeSignals) {
+      const traders = signal.traders as TraderForSignal[];
+      if (!traders || traders.length === 0) continue;
+
+      let updated = false;
+      let removedCount = 0;
+      const updatedTraders: TraderForSignal[] = [];
+
+      for (const trader of traders) {
+        const currentQuality = await getTraderQuality(trader.address);
+        
+        if (!currentQuality || currentQuality.quality_tier === 'weak') {
+          // Trader is now weak or not tracked - remove from signal
+          logger.info(
+            `Removing ${trader.address.slice(0, 8)}... from ${signal.coin} signal - ` +
+            `was ${trader.tier}, now ${currentQuality?.quality_tier || 'untracked'}`
+          );
+          removedCount++;
+          updated = true;
+          continue;
+        }
+
+        if (currentQuality.quality_tier !== trader.tier) {
+          // Tier changed but still valid
+          logger.info(
+            `Updating ${trader.address.slice(0, 8)}... in ${signal.coin} signal - ` +
+            `${trader.tier} → ${currentQuality.quality_tier}`
+          );
+          trader.tier = currentQuality.quality_tier as 'elite' | 'good';
+          trader.pnl_7d = currentQuality.pnl_7d || 0;
+          trader.pnl_30d = currentQuality.pnl_30d || 0;
+          trader.win_rate = currentQuality.win_rate || 0;
+          trader.profit_factor = currentQuality.profit_factor || 1;
+          updated = true;
+        }
+
+        updatedTraders.push(trader);
+      }
+
+      if (updated) {
+        const eliteCount = updatedTraders.filter(t => t.tier === 'elite').length;
+        const goodCount = updatedTraders.filter(t => t.tier === 'good').length;
+
+        // Check if signal still meets requirements
+        const { signals } = config;
+        const stillQualifies = 
+          eliteCount >= signals.minEliteForSignal ||
+          goodCount >= signals.minGoodForSignal ||
+          (eliteCount >= signals.minMixedForSignal.elite && goodCount >= signals.minMixedForSignal.good);
+
+        if (!stillQualifies || updatedTraders.length === 0) {
+          // Close the signal
+          await closeSignal(signal as unknown as ActiveSignal, 'traders_no_longer_qualify');
+        } else {
+          // Update signal with new trader data
+          const combinedPnl7d = updatedTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
+          const avgWinRate = updatedTraders.reduce((sum, t) => sum + t.win_rate, 0) / updatedTraders.length;
+          const avgProfitFactor = updatedTraders.reduce((sum, t) => sum + t.profit_factor, 0) / updatedTraders.length;
+          const avgConvictionPct = updatedTraders.reduce((sum, t) => sum + t.conviction_pct, 0) / updatedTraders.length;
+
+          const fundingData = await getSignalFundingContext(signal.coin, signal.direction as 'long' | 'short');
+
+          const confidence = calculateConfidence(
+            eliteCount,
+            goodCount,
+            avgWinRate,
+            avgProfitFactor,
+            combinedPnl7d,
+            avgConvictionPct,
+            fundingData.context
+          );
+
+          await db.client
+            .from('quality_signals')
+            .update({
+              traders: updatedTraders,
+              elite_count: eliteCount,
+              good_count: goodCount,
+              total_traders: updatedTraders.length,
+              combined_pnl_7d: combinedPnl7d,
+              avg_win_rate: avgWinRate,
+              avg_profit_factor: avgProfitFactor,
+              confidence,
+              signal_strength: determineSignalStrength(eliteCount, goodCount),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', signal.id);
+
+          logger.info(
+            `Updated ${signal.coin} ${signal.direction} signal: ` +
+            `removed ${removedCount} traders, now ${eliteCount}E + ${goodCount}G`
+          );
+        }
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to update signal trader tiers', error);
+  }
+}
+
+// ============================================
 // EVENT HANDLERS
 // ============================================
 
@@ -377,7 +528,7 @@ async function handleOpenEvent(change: PositionChange): Promise<void> {
   
   // Check if this trader qualifies
   const trader = await getTraderQuality(address);
-  if (!trader) {
+  if (!trader || trader.quality_tier === 'weak') {
     logger.debug(`Open event for ${coin} by ${address.slice(0, 8)}... - not a tracked quality trader`);
     return;
   }
@@ -571,7 +722,7 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     traders: allTraders,
     signal_strength: signalStrength,
     confidence,
-    directional_agreement: 1.0, // All traders are same direction by definition
+    directional_agreement: 1.0,
     opposing_traders: 0,
     suggested_entry: currentPrice,
     entry_price: currentPrice,
@@ -592,7 +743,6 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     current_price: currentPrice,
     is_active: true,
     outcome: 'open',
-    // V10: New fields for verified tracking
     entry_detected_at: detected_at.toISOString(),
     is_verified_open: true,
     trigger_event_id: change.id || null,
@@ -621,17 +771,16 @@ async function handleIncreaseEvent(change: PositionChange): Promise<void> {
   const { address, coin, direction } = change;
   
   const trader = await getTraderQuality(address);
-  if (!trader) return;
+  if (!trader || trader.quality_tier === 'weak') return;
 
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   if (!existingSignal) {
     // No signal exists - maybe evaluate creating one now
-    // (another trader might have opened, now this one is adding)
     await evaluateNewSignal(change, trader);
     return;
   }
 
-  // Update signal metrics (conviction may have increased)
+  // V10.1: Update signal with position additions
   const allTraders = await getAllTradersInPosition(coin, direction);
   const avgConvictionPct = allTraders.reduce((sum, t) => sum + t.conviction_pct, 0) / allTraders.length;
   const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
@@ -639,14 +788,17 @@ async function handleIncreaseEvent(change: PositionChange): Promise<void> {
   await db.client
     .from('quality_signals')
     .update({
-      traders: allTraders,
+      traders: allTraders, // This now includes additions array
       avg_conviction_pct: avgConvictionPct,
       total_position_value: totalPositionValue,
       updated_at: new Date().toISOString(),
     })
     .eq('id', existingSignal.id);
 
-  logger.debug(`Signal ${coin} ${direction} updated - trader increased position`);
+  logger.info(
+    `📈 ${coin} ${direction}: ${address.slice(0, 8)}... added to position | ` +
+    `+${change.size_change.toFixed(4)} @ $${change.price_at_event.toFixed(2)}`
+  );
 }
 
 async function handleDecreaseEvent(change: PositionChange): Promise<void> {
@@ -941,9 +1093,10 @@ async function checkPriceTargets(): Promise<void> {
 // ============================================
 
 let priceCheckInterval: NodeJS.Timeout | null = null;
+let tierUpdateInterval: NodeJS.Timeout | null = null;
 
 export function initializeSignalGenerator(): void {
-  logger.info('Signal Generator V10 initializing (event-driven mode)...');
+  logger.info('Signal Generator V10.1 initializing (event-driven mode)...');
   
   // Subscribe to position changes from tracker
   subscribeToPositionChanges(processPositionChanges);
@@ -951,7 +1104,10 @@ export function initializeSignalGenerator(): void {
   // Start price monitoring for stop/TP tracking
   priceCheckInterval = setInterval(checkPriceTargets, 60 * 1000); // Every minute
   
-  logger.info('Signal Generator V10 ready - waiting for position events');
+  // V10.1: Periodically update trader tiers in signals
+  tierUpdateInterval = setInterval(updateSignalTraderTiers, 5 * 60 * 1000); // Every 5 minutes
+  
+  logger.info('Signal Generator V10.1 ready - waiting for position events');
 }
 
 export function stopSignalGenerator(): void {
@@ -959,7 +1115,11 @@ export function stopSignalGenerator(): void {
     clearInterval(priceCheckInterval);
     priceCheckInterval = null;
   }
-  logger.info('Signal Generator V10 stopped');
+  if (tierUpdateInterval) {
+    clearInterval(tierUpdateInterval);
+    tierUpdateInterval = null;
+  }
+  logger.info('Signal Generator V10.1 stopped');
 }
 
 // ============================================
@@ -1001,14 +1161,14 @@ export async function getVerifiedSignals(): Promise<unknown[]> {
 // Legacy export for compatibility
 export async function generateSignals(): Promise<void> {
   // V10 is event-driven, this is now a no-op
-  // Signals are generated via processPositionChanges()
-  logger.debug('generateSignals() called - V10 is event-driven, no action needed');
+  logger.debug('generateSignals() called - V10.1 is event-driven, no action needed');
 }
 
 export default {
   initializeSignalGenerator,
   stopSignalGenerator,
   processPositionChanges,
+  updateSignalTraderTiers,
   getActiveSignals,
   getSignalForCoin,
   getVerifiedSignals,

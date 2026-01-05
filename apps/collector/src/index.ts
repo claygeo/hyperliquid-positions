@@ -1,23 +1,20 @@
-// Collector Entry Point V6 - Event-Driven Signal System
-// MAJOR CHANGE: Signals are now EVENT-DRIVEN
+// Collector Entry Point V6.1 - Event-Driven Signal System
+// CHANGES FROM V6:
+// - Uses Signal Generator V10.1 with position additions tracking
+// - Periodic tier updates for active signals
+// - Better logging for debugging
+//
+// MAJOR ARCHITECTURE:
 // - Signals only created when we WITNESS a position open
 // - No more signals from existing/old positions
 // - Verified timestamps you can trust for trade timing
-//
-// Enhanced with:
-// - Real-time WebSocket fill detection
-// - Conviction scoring
-// - Volatility-adjusted stops
-// - Funding context awareness
-// - Urgent re-evaluation triggers
-// - Daily equity snapshots (built-in scheduler)
 
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 import { createLogger } from './utils/logger.js';
 import { startPositionTracker, stopPositionTracker, getPositionStats } from './processors/position-tracker.js';
-import { initializeSignalGenerator, stopSignalGenerator, getActiveSignals, getVerifiedSignals } from './processors/signal-generator.js';
+import { initializeSignalGenerator, stopSignalGenerator, getActiveSignals, getVerifiedSignals, updateSignalTraderTiers } from './processors/signal-generator.js';
 import { getQualityStats, analyzeTrader, saveTraderAnalysis } from './processors/pnl-analyzer.js';
 import { startSignalTracker, stopSignalTracker, getPerformanceSummary } from './processors/signal-tracker.js';
 import { reEvaluateAllTraders, cleanupOldHistory } from './processors/trader-reeval.js';
@@ -27,7 +24,7 @@ import { startVolatilityTracker, stopVolatilityTracker } from './processors/vola
 import db from './db/client.js';
 import { config } from './config.js';
 
-const logger = createLogger('main-v6');
+const logger = createLogger('main-v6.1');
 
 // ============================================
 // Types
@@ -59,11 +56,6 @@ interface HyperliquidClearinghouseState {
 // Real-time Fill Handler
 // ============================================
 
-/**
- * Handle real-time fills from WebSocket
- * V6: No longer triggers signal regeneration - signals are event-driven now
- * Position tracker will detect changes and emit events to signal generator
- */
 async function handleRealtimeFill(fill: {
   address: string;
   coin: string;
@@ -73,12 +65,10 @@ async function handleRealtimeFill(fill: {
   closedPnl: number;
   qualityTier?: 'elite' | 'good';
 }): Promise<void> {
-  // Only care about quality trader fills
   if (!fill.qualityTier) return;
 
   const value = fill.size * fill.price;
   
-  // Log significant fills
   if (value >= 10000 || fill.qualityTier === 'elite') {
     logger.info(
       `🔔 LIVE ${fill.qualityTier.toUpperCase()} FILL: ` +
@@ -87,11 +77,6 @@ async function handleRealtimeFill(fill: {
     );
   }
 
-  // V6: Removed generateSignals() call here
-  // Position tracker will detect the change and signal generator 
-  // will handle it via the event subscription
-
-  // Create alert for new elite entries
   if (fill.qualityTier === 'elite' && fill.closedPnl === 0 && value >= 10000) {
     try {
       await db.client.from('signal_alerts').insert({
@@ -112,17 +97,11 @@ async function handleRealtimeFill(fill: {
 
 let lastEquitySnapshotDate = '';
 
-/**
- * Check if we need to run daily equity snapshots
- * Runs once per day at first check after midnight UTC
- */
 async function checkDailyEquitySnapshot(): Promise<void> {
-  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  const today = new Date().toISOString().split('T')[0];
   
-  // Already ran today
   if (lastEquitySnapshotDate === today) return;
   
-  // Check if we already have snapshots for today in the database
   const { data: existingSnapshots } = await db.client
     .from('trader_equity_history')
     .select('id')
@@ -135,7 +114,6 @@ async function checkDailyEquitySnapshot(): Promise<void> {
     return;
   }
   
-  // Run the snapshot
   logger.info('');
   logger.info('='.repeat(50));
   logger.info(`📊 DAILY EQUITY SNAPSHOT - ${today}`);
@@ -145,12 +123,8 @@ async function checkDailyEquitySnapshot(): Promise<void> {
   lastEquitySnapshotDate = today;
 }
 
-/**
- * Save equity snapshots for all tracked traders
- */
 async function saveAllEquitySnapshots(): Promise<void> {
   try {
-    // Get all tracked traders
     const { data: traders, error: tradersError } = await db.client
       .from('trader_quality')
       .select('address')
@@ -169,7 +143,6 @@ async function saveAllEquitySnapshots(): Promise<void> {
     
     for (const trader of traders) {
       try {
-        // Fetch current account state from Hyperliquid
         const response = await fetch('https://api.hyperliquid.xyz/info', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -184,15 +157,13 @@ async function saveAllEquitySnapshots(): Promise<void> {
           continue;
         }
         
-        // Type the response properly
         const state = await response.json() as HyperliquidClearinghouseState;
         const accountValue = parseFloat(state.marginSummary?.accountValue || '0');
         
         if (accountValue <= 0) {
-          continue; // Skip empty accounts
+          continue;
         }
         
-        // Save snapshot with all required fields
         const { error: insertError } = await db.client
           .from('trader_equity_history')
           .upsert({
@@ -217,7 +188,6 @@ async function saveAllEquitySnapshots(): Promise<void> {
           saved++;
         }
         
-        // Rate limit
         await new Promise(resolve => setTimeout(resolve, 100));
         
       } catch (err) {
@@ -227,7 +197,6 @@ async function saveAllEquitySnapshots(): Promise<void> {
     
     logger.info(`✅ Equity snapshots complete: ${saved} saved, ${failed} failed`);
     
-    // Log how many days of history we have
     const { data: dateCount } = await db.client
       .from('trader_equity_history')
       .select('snapshot_date')
@@ -287,6 +256,10 @@ async function reanalyzeQualityTraders(): Promise<void> {
       }
       await new Promise(resolve => setTimeout(resolve, 200));
     }
+
+    // V6.1: Update signal trader tiers after re-analysis
+    await updateSignalTraderTiers();
+    
   } catch (error) {
     logger.error('Re-analysis failed', error);
   }
@@ -303,30 +276,26 @@ async function logStatusUpdate(): Promise<void> {
 
     logger.info('');
     logger.info('-'.repeat(70));
-    logger.info('STATUS UPDATE V6 (Event-Driven)');
+    logger.info('STATUS UPDATE V6.1 (Event-Driven + Tier Sync)');
     logger.info('-'.repeat(70));
     
-    // Quality traders
     logger.info(
       `Quality Traders: ${qualityStats.elite} Elite | ${qualityStats.good} Good | ` +
       `${qualityStats.tracked} Tracked`
     );
     
-    // Positions
     logger.info(
       `Positions: ${positionStats.totalPositions} total | ` +
       `${positionStats.uniqueCoins} coins | ` +
       `${positionStats.withStopOrders || 0} with stops`
     );
     
-    // WebSocket status
     logger.info(
       `WebSocket: ${streamStats.isConnected ? '🟢 Connected' : '🔴 Disconnected'} | ` +
       `${streamStats.subscribedCount} subscribed | ` +
       `${streamStats.fillsReceived} fills received`
     );
     
-    // Active signals - V6: Show verified vs total
     logger.info(`Active Signals: ${activeSignals.length} (${verifiedSignals.length} verified)`);
     
     if (activeSignals.length > 0) {
@@ -340,7 +309,6 @@ async function logStatusUpdate(): Promise<void> {
         const fundingEmoji = signal.funding_context === 'favorable' ? '✅' : 
                            signal.funding_context === 'unfavorable' ? '⚠️' : '';
         
-        // V6: Show when signal was detected
         const detectedAt = signal.entry_detected_at 
           ? new Date(signal.entry_detected_at).toLocaleTimeString()
           : 'unknown';
@@ -357,7 +325,6 @@ async function logStatusUpdate(): Promise<void> {
       }
     }
     
-    // Performance summary
     if (perfSummary.totalSignals > 0) {
       logger.info('');
       logger.info('Signal Performance:');
@@ -383,6 +350,8 @@ async function checkWeeklyReeval(): Promise<void> {
     logger.info('Running weekly full re-evaluation...');
     await reEvaluateAllTraders();
     await cleanupOldHistory();
+    // V6.1: Update signal tiers after full re-eval
+    await updateSignalTraderTiers();
     lastFullReeval = now;
   }
 }
@@ -394,19 +363,19 @@ async function checkWeeklyReeval(): Promise<void> {
 async function main(): Promise<void> {
   logger.info('');
   logger.info('='.repeat(70));
-  logger.info('QUALITY TRADER SIGNAL SYSTEM V6 - EVENT-DRIVEN');
+  logger.info('QUALITY TRADER SIGNAL SYSTEM V6.1 - EVENT-DRIVEN');
   logger.info('='.repeat(70));
   logger.info('');
-  logger.info('V6 Features:');
+  logger.info('V6.1 Features:');
   logger.info('  ✓ EVENT-DRIVEN signals (only fires on witnessed opens)');
   logger.info('  ✓ Verified timestamps (entry_detected_at = when WE saw it)');
   logger.info('  ✓ No signals from pre-existing positions');
+  logger.info('  ✓ Position addition tracking (shows when traders add to positions)');
+  logger.info('  ✓ Tier sync (removes weak traders from signals automatically)');
   logger.info('  ✓ Real-time WebSocket fill detection');
   logger.info('  ✓ Position conviction scoring (% of account)');
   logger.info('  ✓ Volatility-adjusted stops (ATR-based)');
   logger.info('  ✓ Funding rate context (favorable/unfavorable)');
-  logger.info('  ✓ Open order awareness (see entries before fills)');
-  logger.info('  ✓ Urgent re-evaluation triggers (rapid demotion)');
   logger.info('  ✓ Daily equity snapshots (automatic)');
   logger.info('');
   logger.info('⚠️  IMPORTANT: Signals will only appear for NEW position opens');
@@ -414,7 +383,6 @@ async function main(): Promise<void> {
   logger.info('    will NOT generate signals (we didn\'t witness their open).');
   logger.info('');
 
-  // Validate environment
   if (!process.env.SUPABASE_URL) {
     logger.error('Missing SUPABASE_URL');
     process.exit(1);
@@ -425,7 +393,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Check traders
   const initialStats = await getQualityStats();
 
   if (initialStats.tracked === 0) {
@@ -446,7 +413,7 @@ async function main(): Promise<void> {
   }
 
   try {
-    // 1. Start volatility tracker first (needed for signal generation)
+    // 1. Start volatility tracker first
     logger.info('Starting volatility tracker...');
     startVolatilityTracker();
     
@@ -454,14 +421,13 @@ async function main(): Promise<void> {
     logger.info('Starting funding tracker...');
     startFundingTracker();
     
-    // Wait a bit for initial data
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // 3. Initialize signal generator FIRST (V6: sets up event subscription)
-    logger.info('Initializing signal generator V10 (event-driven)...');
+    // 3. Initialize signal generator FIRST (sets up event subscription)
+    logger.info('Initializing signal generator V10.1 (event-driven + tier sync)...');
     initializeSignalGenerator();
 
-    // 4. Start position tracker (V6: will emit events to signal generator)
+    // 4. Start position tracker (will emit events to signal generator)
     logger.info('Starting position tracker V7.2...');
     startPositionTracker();
 
@@ -469,16 +435,14 @@ async function main(): Promise<void> {
     logger.info('Starting signal performance tracker...');
     startSignalTracker();
 
-    // 6. Start WebSocket stream for real-time fills
+    // 6. Start WebSocket stream
     if (config.websocket?.enabled !== false) {
       logger.info('Starting WebSocket stream...');
       startWebSocketStream();
-      
-      // Register fill handler
       onFill(handleRealtimeFill);
     }
 
-    // 7. Start periodic re-analysis
+    // 7. Periodic re-analysis (now includes tier sync)
     logger.info('Starting periodic re-analysis...');
     setInterval(reanalyzeQualityTraders, 5 * 60 * 1000);
 
@@ -489,11 +453,9 @@ async function main(): Promise<void> {
     // 9. Status logging every 5 minutes
     setInterval(logStatusUpdate, 5 * 60 * 1000);
 
-    // 10. Daily equity snapshot checker (runs every hour, triggers once per day)
+    // 10. Daily equity snapshot checker
     logger.info('Starting daily equity snapshot scheduler...');
     setInterval(checkDailyEquitySnapshot, 60 * 60 * 1000);
-    
-    // Run equity snapshot check immediately on startup
     await checkDailyEquitySnapshot();
 
     logger.info('');
@@ -505,7 +467,6 @@ async function main(): Promise<void> {
     logger.info('='.repeat(70));
     logger.info('');
 
-    // Initial status after 15 seconds (let data populate)
     setTimeout(logStatusUpdate, 15000);
 
   } catch (error) {
@@ -513,7 +474,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Graceful shutdown
   const shutdown = async () => {
     logger.info('');
     logger.info('Shutting down...');

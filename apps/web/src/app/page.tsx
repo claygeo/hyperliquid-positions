@@ -6,12 +6,9 @@ import { Card, CardContent } from '@/components/ui/card';
 import { 
   ChevronDown, 
   ChevronUp, 
-  Copy, 
-  Check,
   Zap,
   Clock,
   ExternalLink,
-  AlertTriangle,
   Plus,
   X,
   Loader2
@@ -120,28 +117,6 @@ function formatTimeAgo(dateString: string): string {
   const diffMins = Math.floor(diffMs / 60000);
   
   if (diffMins < 1) return 'Just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  
-  const diffHours = Math.floor(diffMins / 60);
-  if (diffHours < 24) return `${diffHours}h ago`;
-  
-  const diffDays = Math.floor(diffHours / 24);
-  return `${diffDays}d ago`;
-}
-
-function formatPositionAge(traders: TraderInfo[]): string | null {
-  const openedDates = traders
-    .map(t => t.opened_at)
-    .filter((d): d is string => d !== null && d !== undefined)
-    .map(d => new Date(d).getTime());
-  
-  if (openedDates.length === 0) return null;
-  
-  const mostRecent = Math.max(...openedDates);
-  const diffMs = Date.now() - mostRecent;
-  const diffMins = Math.floor(diffMs / 60000);
-  
-  if (diffMins < 1) return 'just now';
   if (diffMins < 60) return `${diffMins}m ago`;
   
   const diffHours = Math.floor(diffMins / 60);
@@ -541,43 +516,6 @@ function WalletImportModal({
 // V9: UNDERWATER WARNING BADGE
 // ============================================
 
-function UnderwaterWarning({ underwaterPct }: { underwaterPct: number }) {
-  if (!underwaterPct || underwaterPct < 5) return null;
-  
-  let severity: 'warning' | 'danger' | 'critical';
-  let message: string;
-  
-  if (underwaterPct >= 50) {
-    severity = 'critical';
-    message = `Lead trader -${underwaterPct.toFixed(0)}% on this position`;
-  } else if (underwaterPct >= 25) {
-    severity = 'danger';
-    message = `Lead trader -${underwaterPct.toFixed(0)}% underwater`;
-  } else {
-    severity = 'warning';
-    message = `Lead trader -${underwaterPct.toFixed(0)}% on position`;
-  }
-  
-  const bgColor = severity === 'critical' 
-    ? 'bg-red-500/20 border-red-500/50' 
-    : severity === 'danger'
-    ? 'bg-orange-500/20 border-orange-500/50'
-    : 'bg-yellow-500/20 border-yellow-500/50';
-    
-  const textColor = severity === 'critical'
-    ? 'text-red-400'
-    : severity === 'danger'
-    ? 'text-orange-400'
-    : 'text-yellow-400';
-  
-  return (
-    <div className={`flex items-center gap-1.5 px-2 py-1 rounded border ${bgColor} ${textColor} text-xs`}>
-      <AlertTriangle className="h-3 w-3" />
-      <span>{message}</span>
-    </div>
-  );
-}
-
 // ============================================
 // SIGNAL PERFORMANCE SUMMARY
 // ============================================
@@ -600,140 +538,6 @@ function SignalPerformanceSummary({ stats }: { stats: SignalStats | null }) {
       <span className="text-green-500">{stats.wins} TP</span>
       <span className="text-muted-foreground hidden sm:inline">·</span>
       <span className="text-red-500">{stats.stopped} stopped</span>
-    </div>
-  );
-}
-
-// ============================================
-// COPY TRADE BUTTON
-// ============================================
-
-function CopyTradeButton({ signal }: { signal: QualitySignal }) {
-  const [copied, setCopied] = useState(false);
-  const [showDropdown, setShowDropdown] = useState(false);
-
-  const copyValue = async (value: string | number) => {
-    await navigator.clipboard.writeText(String(value));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-    setShowDropdown(false);
-  };
-
-  const entryPrice = signal.entry_price || signal.current_price;
-
-  return (
-    <div className="relative">
-      <button
-        onClick={() => setShowDropdown(!showDropdown)}
-        className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors text-sm font-medium"
-      >
-        {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-        <span className="hidden sm:inline">{copied ? 'Copied!' : 'Copy Trade'}</span>
-        <span className="sm:hidden">{copied ? 'Copied!' : 'Copy'}</span>
-        <ChevronDown className={`h-4 w-4 transition-transform ${showDropdown ? 'rotate-180' : ''}`} />
-      </button>
-      
-      {showDropdown && (
-        <div className="absolute right-0 mt-2 w-48 bg-popover border border-border rounded-lg shadow-lg z-10 py-1">
-          <button
-            onClick={() => copyValue(entryPrice)}
-            className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between"
-          >
-            <span>Entry Price</span>
-            <span className="text-muted-foreground font-mono">{formatPrice(entryPrice)}</span>
-          </button>
-          <button
-            onClick={() => copyValue(signal.stop_loss)}
-            className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between"
-          >
-            <span>Stop Loss</span>
-            <span className="text-red-500 font-mono">{formatPrice(signal.stop_loss)}</span>
-          </button>
-          <button
-            onClick={() => copyValue(signal.take_profit_1)}
-            className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between"
-          >
-            <span>Take Profit 1</span>
-            <span className="text-green-500 font-mono">{formatPrice(signal.take_profit_1)}</span>
-          </button>
-          <div className="border-t border-border my-1" />
-          <button
-            onClick={() => copyValue(signal.take_profit_2)}
-            className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between text-muted-foreground"
-          >
-            <span>Take Profit 2</span>
-            <span className="font-mono">{formatPrice(signal.take_profit_2)}</span>
-          </button>
-          <button
-            onClick={() => copyValue(signal.take_profit_3)}
-            className="w-full px-4 py-2 text-left text-sm hover:bg-muted flex justify-between text-muted-foreground"
-          >
-            <span>Take Profit 3</span>
-            <span className="font-mono">{formatPrice(signal.take_profit_3)}</span>
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================
-// SIGNAL STORY
-// ============================================
-
-function SignalStory({ signal }: { signal: QualitySignal }) {
-  const traders = Array.isArray(signal.traders) ? signal.traders : [];
-  
-  const eliteTraders = traders.filter(t => t.tier === 'elite');
-  const goodTraders = traders.filter(t => t.tier === 'good');
-  
-  const leadTrader = eliteTraders.length > 0 
-    ? eliteTraders.reduce((best, t) => (t.pnl_7d || 0) > (best.pnl_7d || 0) ? t : best)
-    : goodTraders.length > 0
-    ? goodTraders.reduce((best, t) => (t.pnl_7d || 0) > (best.pnl_7d || 0) ? t : best)
-    : null;
-
-  const isLong = signal.direction === 'long';
-  const actionWord = isLong ? 'going long on' : 'shorting';
-  
-  const leadConviction = leadTrader?.conviction_pct;
-  const convictionText = leadConviction && leadConviction >= 20 
-    ? ` with ${leadConviction.toFixed(0)}% of their account`
-    : '';
-
-  const otherElite = signal.elite_count - (leadTrader?.tier === 'elite' ? 1 : 0);
-  const otherGood = signal.good_count - (leadTrader?.tier === 'good' ? 1 : 0);
-
-  return (
-    <div className="space-y-1">
-      {leadTrader && (
-        <p className="text-sm leading-relaxed">
-          <span className={leadTrader.tier === 'elite' ? 'text-green-500 font-semibold' : 'text-blue-500 font-semibold'}>
-            {leadTrader.tier === 'elite' ? 'An Elite' : 'A Good'} trader
-          </span>
-          {' '}
-          <span className="text-muted-foreground">
-            ({formatPnl(leadTrader.pnl_7d || 0)} this week, {((leadTrader.win_rate || 0) * 100).toFixed(0)}% WR)
-          </span>
-          {' '}
-          <span>
-            is {actionWord} {signal.coin}{convictionText}
-          </span>
-        </p>
-      )}
-      
-      {(otherElite > 0 || otherGood > 0) && (
-        <p className="text-sm text-muted-foreground">
-          {otherElite > 0 && (
-            <span className="text-green-500">+{otherElite} Elite</span>
-          )}
-          {otherElite > 0 && otherGood > 0 && ' and '}
-          {otherGood > 0 && (
-            <span className="text-blue-500">+{otherGood} Good</span>
-          )}
-          {' '}trader{(otherElite + otherGood) > 1 ? 's' : ''} agree
-        </p>
-      )}
     </div>
   );
 }
@@ -794,7 +598,10 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   const isLong = signal.direction === 'long';
   const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
-  const underwaterPct = signal.lead_trader_underwater_pct || 0;
+  
+  // Count traders
+  const eliteCount = traders.filter(t => t.tier === 'elite').length;
+  const goodCount = traders.filter(t => t.tier === 'good').length;
   
   return (
     <Card className="overflow-hidden">
@@ -803,6 +610,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
           className="p-3 sm:p-4 cursor-pointer hover:bg-muted/30 transition-colors"
           onClick={onToggle}
         >
+          {/* Header row */}
           <div className="flex items-start sm:items-center justify-between mb-3 gap-2">
             <div className="flex flex-wrap items-center gap-2">
               <div className="flex items-center gap-2">
@@ -813,6 +621,13 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                   {signal.direction.toUpperCase()}
                 </span>
               </div>
+              
+              {/* Trader count badge */}
+              <span className="text-xs text-muted-foreground">
+                {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
+                {eliteCount > 0 && goodCount > 0 && ' + '}
+                {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
+              </span>
               
               {signal.funding_context === 'favorable' && (
                 <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
@@ -837,15 +652,8 @@ function SignalCard({ signal, isExpanded, onToggle }: {
             </div>
           </div>
           
-          {underwaterPct >= 5 && (
-            <div className="mb-3">
-              <UnderwaterWarning underwaterPct={underwaterPct} />
-            </div>
-          )}
-          
-          <SignalStory signal={signal} />
-          
-          <div className="mt-3 sm:mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          {/* Price + Stop */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <PriceDisplay signal={signal} />
             <div className="text-sm">
               <span className="text-muted-foreground">Stop: </span>
@@ -857,28 +665,10 @@ function SignalCard({ signal, isExpanded, onToggle }: {
           </div>
         </div>
         
+        {/* Expanded View */}
         {isExpanded && (
           <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-4">
-            <div className="flex justify-end">
-              <CopyTradeButton signal={signal} />
-            </div>
-            
-            {underwaterPct >= 10 && (
-              <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3">
-                <div className="flex items-start gap-2">
-                  <AlertTriangle className="h-4 w-4 text-orange-400 mt-0.5 shrink-0" />
-                  <div className="text-sm">
-                    <p className="text-orange-400 font-medium">Lead trader is underwater</p>
-                    <p className="text-muted-foreground mt-1">
-                      The primary trader driving this signal is currently down {underwaterPct.toFixed(0)}% on this position. 
-                      While past performance is strong, this position is currently not working for them. 
-                      Consider this risk before entering.
-                    </p>
-                  </div>
-                </div>
-              </div>
-            )}
-            
+            {/* Take Profit Levels */}
             <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
                 <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
@@ -894,31 +684,12 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               </div>
             </div>
             
-            <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
-              <div>
-                <div className="text-muted-foreground text-xs">Combined 7d P&L</div>
-                <div className={`font-medium ${(signal.combined_pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                  {formatPnl(signal.combined_pnl_7d || 0)}
-                </div>
-              </div>
-              <div>
-                <div className="text-muted-foreground text-xs">Avg Win Rate</div>
-                <div className="font-medium">{((signal.avg_win_rate || 0) * 100).toFixed(0)}%</div>
-              </div>
-              <div>
-                <div className="text-muted-foreground text-xs">Avg Conviction</div>
-                <div className="font-medium">{(signal.avg_conviction_pct || 0).toFixed(0)}%</div>
-              </div>
-            </div>
-            
+            {/* Traders List */}
             {traders.length > 0 && (
               <div>
-                <div className="text-xs text-muted-foreground mb-2">Traders in this signal</div>
+                <div className="text-xs text-muted-foreground mb-2">Traders in this signal ({traders.length})</div>
                 <div className="space-y-2">
                   {traders.map((trader) => {
-                    const traderUnderwater = (trader.unrealized_pnl_pct || 0) < 0;
-                    const traderUnderwaterPct = traderUnderwater ? Math.abs(trader.unrealized_pnl_pct || 0) : 0;
-                    
                     // Calculate this trader's P&L on their position
                     const traderEntry = trader.entry_price || 0;
                     const currentPrice = signal.current_price || 0;

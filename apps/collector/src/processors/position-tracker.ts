@@ -1,4 +1,5 @@
-// Position Tracker V5
+// Position Tracker V6
+// Fixed: opened_at now persists across restarts by reading from DB
 // Enhanced with:
 // - Position history tracking (entry timing detection)
 // - Position age weighting (fresh positions > stale)
@@ -12,7 +13,7 @@ import { config } from '../config.js';
 import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
 import { generateSignals } from './signal-generator.js';
 
-const logger = createLogger('position-tracker-v5');
+const logger = createLogger('position-tracker-v6');
 
 // ============================================
 // Types
@@ -93,6 +94,46 @@ interface UrgentReevalTrigger {
 
 // In-memory cache of previous positions for change detection
 const previousPositions = new Map<string, PreviousPositionState>();
+
+// Track if we've loaded from DB this session
+let hasLoadedFromDb = false;
+
+// ============================================
+// V6: Load Previous Positions from Database
+// ============================================
+
+async function loadPreviousPositionsFromDb(): Promise<void> {
+  if (hasLoadedFromDb) return;
+  
+  try {
+    const { data: dbPositions } = await db.client
+      .from('trader_positions')
+      .select('address, coin, direction, size, entry_price, value_usd, opened_at, peak_unrealized_pnl, trough_unrealized_pnl');
+    
+    if (dbPositions && dbPositions.length > 0) {
+      for (const pos of dbPositions) {
+        const key = `${pos.address}-${pos.coin}`;
+        previousPositions.set(key, {
+          address: pos.address,
+          coin: pos.coin,
+          direction: pos.direction,
+          size: pos.size || 0,
+          entry_price: pos.entry_price || 0,
+          value_usd: pos.value_usd || 0,
+          opened_at: pos.opened_at ? new Date(pos.opened_at) : null,
+          peak_unrealized_pnl: pos.peak_unrealized_pnl || 0,
+          trough_unrealized_pnl: pos.trough_unrealized_pnl || 0,
+        });
+      }
+      logger.info(`Loaded ${dbPositions.length} previous positions from database`);
+    }
+    
+    hasLoadedFromDb = true;
+  } catch (error) {
+    logger.error('Failed to load previous positions from DB', error);
+    hasLoadedFromDb = true; // Don't retry on error
+  }
+}
 
 // ============================================
 // Position Change Detection
@@ -450,16 +491,22 @@ function processPositions(
         ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
         : null;
 
-      // Get previous state for age and P&L tracking
+      // V6: Get previous state from cache (which was loaded from DB on startup)
       const key = `${address}-${coin}`;
       const prev = previousPositions.get(key);
       
-      // Determine opened_at
+      // Determine opened_at - only set to now if this is truly a new position
       let openedAt = prev?.opened_at || null;
-      if (!prev || prev.direction !== (size > 0 ? 'long' : 'short')) {
-        // New position or direction changed
+      const currentDirection = size > 0 ? 'long' : 'short';
+      
+      if (!prev) {
+        // No previous record at all - new position
+        openedAt = new Date();
+      } else if (prev.direction !== currentDirection) {
+        // Direction changed (flip) - treat as new position
         openedAt = new Date();
       }
+      // Otherwise keep the existing opened_at from DB/cache
 
       // Calculate position age
       const positionAgeHours = openedAt 
@@ -477,7 +524,7 @@ function processPositions(
       return {
         address,
         coin,
-        direction: size > 0 ? 'long' : 'short',
+        direction: currentDirection,
         size: Math.abs(size),
         entry_price: parseFloat(p.entryPx),
         value_usd: positionValue,
@@ -566,6 +613,9 @@ async function pollPositions(): Promise<void> {
   isPolling = true;
 
   try {
+    // V6: Load previous positions from DB on first poll
+    await loadPreviousPositionsFromDb();
+
     const { data: trackedTraders, error } = await db.client
       .from('trader_quality')
       .select('address, quality_tier, account_value')
@@ -778,7 +828,7 @@ export async function getPositionAgeStats(): Promise<{
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V5 starting...');
+  logger.info('Position tracker V6 starting...');
   
   pollPositions();
   

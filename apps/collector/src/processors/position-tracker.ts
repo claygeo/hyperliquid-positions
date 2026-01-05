@@ -1,20 +1,17 @@
-// Position Tracker V7
-// NEW: Queries fill history for accurate position open times
-// Fixed: opened_at now shows ACTUAL open time, not detection time
-// Enhanced with:
-// - Position history tracking (entry timing detection)
-// - Position age weighting (fresh positions > stale)
-// - Change detection (open, increase, decrease, close, flip)
-// - Urgent re-evaluation with drawdown metrics
-// - Open order awareness
+// Position Tracker V7.2
+// CHANGES FROM V7:
+// - REMOVED: Fill history lookups (unreliable for active traders)
+// - SIMPLIFIED: opened_at = detected_at for new positions (we witnessed it)
+// - KEPT: Event detection (open, increase, decrease, close, flip)
+// - KEPT: Position history tracking
+// - ADDED: Returns position changes for signal generator to consume
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import { config } from '../config.js';
 import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
-import { generateSignals } from './signal-generator.js';
 
-const logger = createLogger('position-tracker-v7');
+const logger = createLogger('position-tracker-v7.2');
 
 // ============================================
 // Types
@@ -31,21 +28,20 @@ interface TrackedPosition {
   unrealized_pnl: number;
   margin_used: number;
   liquidation_price: number | null;
-  // V4 additions
   conviction_pct: number;
   has_pending_entry: boolean;
   has_stop_order: boolean;
   has_tp_order: boolean;
   pending_order_price: number | null;
-  // V5 additions
-  opened_at: Date | null;
+  opened_at: Date;
   position_age_hours: number;
-  last_size_change_at: Date | null;
+  last_size_change_at: Date;
   peak_unrealized_pnl: number;
   trough_unrealized_pnl: number;
 }
 
-interface PositionChange {
+export interface PositionChange {
+  id?: number; // Populated after DB insert
   address: string;
   coin: string;
   event_type: 'open' | 'increase' | 'decrease' | 'close' | 'flip';
@@ -60,6 +56,7 @@ interface PositionChange {
   price_at_event: number;
   leverage: number;
   unrealized_pnl: number;
+  detected_at: Date;
 }
 
 interface PreviousPositionState {
@@ -86,24 +83,27 @@ interface TrackedOpenOrder {
   order_id: string;
 }
 
-interface UrgentReevalTrigger {
-  address: string;
-  reason: string;
-  priority: number;
-  currentDrawdownPct: number;
-}
-
 // In-memory cache of previous positions for change detection
 const previousPositions = new Map<string, PreviousPositionState>();
 
 // Track if we've loaded from DB this session
 let hasLoadedFromDb = false;
 
-// Track positions we've already looked up fill history for (to avoid repeated API calls)
-const fillHistoryLookedUp = new Set<string>();
+// Callback for position changes (signal generator will subscribe)
+type PositionChangeCallback = (changes: PositionChange[]) => Promise<void>;
+let onPositionChanges: PositionChangeCallback | null = null;
 
 // ============================================
-// V7: Load Previous Positions from Database
+// Subscribe to position changes
+// ============================================
+
+export function subscribeToPositionChanges(callback: PositionChangeCallback): void {
+  onPositionChanges = callback;
+  logger.info('Signal generator subscribed to position changes');
+}
+
+// ============================================
+// Load Previous Positions from Database
 // ============================================
 
 async function loadPreviousPositionsFromDb(): Promise<void> {
@@ -128,11 +128,6 @@ async function loadPreviousPositionsFromDb(): Promise<void> {
           peak_unrealized_pnl: pos.peak_unrealized_pnl || 0,
           trough_unrealized_pnl: pos.trough_unrealized_pnl || 0,
         });
-        
-        // Mark as already looked up if we have a valid opened_at
-        if (pos.opened_at) {
-          fillHistoryLookedUp.add(key);
-        }
       }
       logger.info(`Loaded ${dbPositions.length} previous positions from database`);
     }
@@ -140,91 +135,8 @@ async function loadPreviousPositionsFromDb(): Promise<void> {
     hasLoadedFromDb = true;
   } catch (error) {
     logger.error('Failed to load previous positions from DB', error);
-    hasLoadedFromDb = true; // Don't retry on error
+    hasLoadedFromDb = true;
   }
-}
-
-// ============================================
-// V7: Get Accurate Open Time from Fill History
-// ============================================
-
-// Queue for fill history lookups (to avoid rate limiting)
-const fillLookupQueue: Array<{ address: string; coin: string; direction: 'long' | 'short' }> = [];
-let isProcessingFillQueue = false;
-
-async function processFillLookupQueue(): Promise<void> {
-  if (isProcessingFillQueue || fillLookupQueue.length === 0) return;
-  isProcessingFillQueue = true;
-  
-  // Process max 3 lookups per cycle to avoid rate limiting
-  const batch = fillLookupQueue.splice(0, 3);
-  
-  for (const item of batch) {
-    const key = `${item.address}-${item.coin}`;
-    
-    logger.info(`🔍 Looking up fill history for ${item.address.slice(0, 8)}... ${item.coin} ${item.direction}`);
-    
-    const result = await hyperliquid.findPositionOpenTime(item.address, item.coin, item.direction, 30);
-    
-    if (result) {
-      logger.info(
-        `✅ Found actual open time: ${item.address.slice(0, 8)}... ${item.coin} ${item.direction} ` +
-        `opened at ${result.openedAt.toISOString()}`
-      );
-      
-      // Update the DB with accurate open time
-      await db.client
-        .from('trader_positions')
-        .update({ opened_at: result.openedAt.toISOString() })
-        .eq('address', item.address)
-        .eq('coin', item.coin);
-      
-      // Update cache
-      const cached = previousPositions.get(key);
-      if (cached) {
-        cached.opened_at = result.openedAt;
-      }
-    }
-    
-    // Rate limit: wait 500ms between lookups
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  
-  isProcessingFillQueue = false;
-}
-
-async function getAccurateOpenTime(
-  address: string,
-  coin: string,
-  direction: 'long' | 'short',
-  isNewPosition: boolean // Only query API for truly new positions
-): Promise<Date | null> {
-  const key = `${address}-${coin}`;
-  
-  // Check if we already have this from DB/cache
-  const cached = previousPositions.get(key);
-  if (cached?.opened_at && cached.direction === direction) {
-    return cached.opened_at;
-  }
-  
-  // Check if we already tried looking this up
-  if (fillHistoryLookedUp.has(key)) {
-    return null;
-  }
-  
-  // Mark as looked up to avoid repeated API calls
-  fillHistoryLookedUp.add(key);
-  
-  // Only query fill history for TRULY NEW positions (detected in real-time)
-  // NOT for positions loaded from DB on startup
-  if (isNewPosition) {
-    // Queue the lookup instead of doing it immediately
-    fillLookupQueue.push({ address, coin, direction });
-    logger.debug(`Queued fill lookup for ${address.slice(0, 8)}... ${coin} (queue: ${fillLookupQueue.length})`);
-  }
-  
-  // Return null for now - the queue processor will update DB later
-  return null;
 }
 
 // ============================================
@@ -234,12 +146,12 @@ async function getAccurateOpenTime(
 function detectPositionChange(
   address: string,
   current: TrackedPosition | null,
+  prev: PreviousPositionState | null,
   currentPrice: number
 ): PositionChange | null {
-  const key = `${address}-${current?.coin || 'unknown'}`;
-  const prev = previousPositions.get(key);
+  const now = new Date();
 
-  // No previous position
+  // No previous position, current exists = OPEN
   if (!prev && current) {
     return {
       address,
@@ -256,10 +168,11 @@ function detectPositionChange(
       price_at_event: currentPrice,
       leverage: current.leverage,
       unrealized_pnl: current.unrealized_pnl,
+      detected_at: now,
     };
   }
 
-  // Position closed
+  // Previous exists, current doesn't = CLOSE
   if (prev && !current) {
     return {
       address,
@@ -276,6 +189,7 @@ function detectPositionChange(
       price_at_event: currentPrice,
       leverage: 1,
       unrealized_pnl: 0,
+      detected_at: now,
     };
   }
 
@@ -294,15 +208,16 @@ function detectPositionChange(
         new_size: current.size,
         new_entry_price: current.entry_price,
         new_value_usd: current.value_usd,
-        size_change: current.size + prev.size, // Total change
+        size_change: current.size + prev.size,
         price_at_event: currentPrice,
         leverage: current.leverage,
         unrealized_pnl: current.unrealized_pnl,
+        detected_at: now,
       };
     }
 
-    // Size increase
-    if (current.size > prev.size * 1.05) { // 5% threshold to filter noise
+    // Size increase (5% threshold to filter noise)
+    if (current.size > prev.size * 1.05) {
       return {
         address,
         coin: current.coin,
@@ -318,6 +233,7 @@ function detectPositionChange(
         price_at_event: currentPrice,
         leverage: current.leverage,
         unrealized_pnl: current.unrealized_pnl,
+        detected_at: now,
       };
     }
 
@@ -338,6 +254,7 @@ function detectPositionChange(
         price_at_event: currentPrice,
         leverage: current.leverage,
         unrealized_pnl: current.unrealized_pnl,
+        detected_at: now,
       };
     }
   }
@@ -345,25 +262,34 @@ function detectPositionChange(
   return null;
 }
 
-async function savePositionChange(change: PositionChange): Promise<void> {
+async function savePositionChange(change: PositionChange): Promise<number | null> {
   try {
-    await db.client.from('position_history').insert({
-      address: change.address,
-      coin: change.coin,
-      event_type: change.event_type,
-      direction: change.direction,
-      prev_size: change.prev_size,
-      prev_entry_price: change.prev_entry_price,
-      prev_value_usd: change.prev_value_usd,
-      new_size: change.new_size,
-      new_entry_price: change.new_entry_price,
-      new_value_usd: change.new_value_usd,
-      size_change: change.size_change,
-      price_at_event: change.price_at_event,
-      leverage: change.leverage,
-      unrealized_pnl: change.unrealized_pnl,
-      detected_at: new Date().toISOString(),
-    });
+    const { data, error } = await db.client
+      .from('position_history')
+      .insert({
+        address: change.address,
+        coin: change.coin,
+        event_type: change.event_type,
+        direction: change.direction,
+        prev_size: change.prev_size,
+        prev_entry_price: change.prev_entry_price,
+        prev_value_usd: change.prev_value_usd,
+        new_size: change.new_size,
+        new_entry_price: change.new_entry_price,
+        new_value_usd: change.new_value_usd,
+        size_change: change.size_change,
+        price_at_event: change.price_at_event,
+        leverage: change.leverage,
+        unrealized_pnl: change.unrealized_pnl,
+        detected_at: change.detected_at.toISOString(),
+      })
+      .select('id')
+      .single();
+
+    if (error) {
+      logger.error('Failed to save position change', error);
+      return null;
+    }
 
     const emoji = {
       open: '🟢',
@@ -379,17 +305,20 @@ async function savePositionChange(change: PositionChange): Promise<void> {
       `Size: ${change.prev_size.toFixed(2)} → ${change.new_size.toFixed(2)} | ` +
       `$${change.new_value_usd.toFixed(0)}`
     );
+
+    return data?.id || null;
   } catch (error) {
-    // Table might not exist yet
-    logger.debug('Could not save position history', error);
+    logger.error('Could not save position history', error);
+    return null;
   }
 }
 
 function updatePreviousPositionCache(
   address: string,
+  coin: string,
   position: TrackedPosition | null
 ): void {
-  const key = `${address}-${position?.coin || 'unknown'}`;
+  const key = `${address}-${coin}`;
   
   if (position) {
     previousPositions.set(key, {
@@ -405,7 +334,6 @@ function updatePreviousPositionCache(
     });
   } else {
     previousPositions.delete(key);
-    fillHistoryLookedUp.delete(key); // Allow fresh lookup if position reopens
   }
 }
 
@@ -472,78 +400,7 @@ async function saveOpenOrders(orders: TrackedOpenOrder[]): Promise<void> {
 }
 
 // ============================================
-// Urgent Re-evaluation Logic
-// ============================================
-
-async function checkForUrgentReeval(
-  address: string,
-  accountValue: number,
-  unrealizedPnl: number,
-  tier: string
-): Promise<UrgentReevalTrigger | null> {
-  const drawdownPct = accountValue > 0 
-    ? (unrealizedPnl / accountValue) * 100 
-    : 0;
-
-  const triggers: UrgentReevalTrigger[] = [];
-
-  const severeThreshold = config.urgentReeval?.severeDrawdownPct || -30;
-  const eliteThreshold = config.urgentReeval?.eliteDrawdownPct || -20;
-
-  if (drawdownPct < severeThreshold) {
-    triggers.push({
-      address,
-      reason: `severe_drawdown_${Math.abs(drawdownPct).toFixed(1)}pct`,
-      priority: 1,
-      currentDrawdownPct: drawdownPct,
-    });
-  } else if (tier === 'elite' && drawdownPct < eliteThreshold) {
-    triggers.push({
-      address,
-      reason: `elite_drawdown_${Math.abs(drawdownPct).toFixed(1)}pct`,
-      priority: 2,
-      currentDrawdownPct: drawdownPct,
-    });
-  }
-
-  const { wasLiquidated } = await hyperliquid.checkRecentLiquidations(address, 24);
-  if (wasLiquidated) {
-    triggers.push({
-      address,
-      reason: 'recent_liquidation',
-      priority: 1,
-      currentDrawdownPct: drawdownPct,
-    });
-  }
-
-  if (triggers.length === 0) return null;
-
-  triggers.sort((a, b) => a.priority - b.priority);
-  return triggers[0];
-}
-
-async function queueUrgentReeval(trigger: UrgentReevalTrigger): Promise<void> {
-  try {
-    await db.client.from('trader_reeval_queue').upsert({
-      address: trigger.address,
-      reason: trigger.reason,
-      priority: trigger.priority,
-      current_drawdown_pct: trigger.currentDrawdownPct,
-      triggered_at: new Date().toISOString(),
-      processed_at: null,
-    }, { onConflict: 'address' });
-
-    logger.warn(
-      `🚨 URGENT REEVAL: ${trigger.address.slice(0, 10)}... | ` +
-      `Reason: ${trigger.reason} | Priority: ${trigger.priority}`
-    );
-  } catch (error) {
-    logger.error('Failed to queue urgent reeval', error);
-  }
-}
-
-// ============================================
-// Position Processing (V7 - with fill history lookup)
+// Position Processing (V7.2 - Simplified)
 // ============================================
 
 async function processPositions(
@@ -553,6 +410,7 @@ async function processPositions(
   accountValue: number
 ): Promise<TrackedPosition[]> {
   const results: TrackedPosition[] = [];
+  const now = new Date();
   
   for (const p of positions) {
     const value = Math.abs(parseFloat(p.positionValue || '0'));
@@ -583,37 +441,25 @@ async function processPositions(
       ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
       : null;
 
-    // V7: Get previous state from cache
+    // V7.2: Get previous state from cache
     const key = `${address}-${coin}`;
     const prev = previousPositions.get(key);
     
-    // Determine opened_at
-    let openedAt: Date | null = null;
-    
-    // Check if this is a truly NEW position (not in our cache/DB)
-    const isTrulyNewPosition = !prev;
-    const isDirectionFlip = prev && prev.direction !== currentDirection;
+    // V7.2 SIMPLIFIED: Determine opened_at
+    // - If same direction position exists in cache, keep its opened_at
+    // - If new position or direction flip, opened_at = NOW (we witnessed it)
+    let openedAt: Date;
     
     if (prev && prev.direction === currentDirection && prev.opened_at) {
-      // Same position, same direction - keep existing opened_at
+      // Same position continuing - keep original open time
       openedAt = prev.opened_at;
-    } else if (isDirectionFlip) {
-      // Direction flipped - this is a new position, queue fill history lookup
-      openedAt = await getAccurateOpenTime(address, coin, currentDirection, true);
-      if (!openedAt) openedAt = new Date(); // Fallback to now
-    } else if (isTrulyNewPosition) {
-      // No previous record - queue fill history lookup for truly new positions
-      openedAt = await getAccurateOpenTime(address, coin, currentDirection, true);
-      if (!openedAt) openedAt = new Date(); // Fallback to now
     } else {
-      // Position exists but no opened_at - use current time (don't query API for old positions)
-      openedAt = new Date();
+      // New position or flip - we're witnessing this open NOW
+      openedAt = now;
     }
 
     // Calculate position age
-    const positionAgeHours = openedAt 
-      ? (Date.now() - openedAt.getTime()) / (1000 * 60 * 60)
-      : 0;
+    const positionAgeHours = (now.getTime() - openedAt.getTime()) / (1000 * 60 * 60);
 
     // Track peak/trough unrealized P&L
     const peakUnrealizedPnl = prev 
@@ -641,7 +487,7 @@ async function processPositions(
       pending_order_price: pendingOrderPrice,
       opened_at: openedAt,
       position_age_hours: positionAgeHours,
-      last_size_change_at: new Date(),
+      last_size_change_at: now,
       peak_unrealized_pnl: peakUnrealizedPnl,
       trough_unrealized_pnl: troughUnrealizedPnl,
     });
@@ -689,9 +535,9 @@ async function savePositions(positions: TrackedPosition[]): Promise<void> {
             has_stop_order: p.has_stop_order,
             has_tp_order: p.has_tp_order,
             pending_order_price: p.pending_order_price,
-            opened_at: p.opened_at?.toISOString(),
+            opened_at: p.opened_at.toISOString(),
             position_age_hours: p.position_age_hours,
-            last_size_change_at: p.last_size_change_at?.toISOString(),
+            last_size_change_at: p.last_size_change_at.toISOString(),
             peak_unrealized_pnl: p.peak_unrealized_pnl,
             trough_unrealized_pnl: p.trough_unrealized_pnl,
             updated_at: new Date().toISOString(),
@@ -735,7 +581,6 @@ async function pollPositions(): Promise<void> {
     const allPositions: TrackedPosition[] = [];
     const allOpenOrders: TrackedOpenOrder[] = [];
     const positionChanges: PositionChange[] = [];
-    let urgentReevals = 0;
 
     // Get current prices once
     const allMids = await hyperliquid.getAllMids();
@@ -748,7 +593,6 @@ async function pollPositions(): Promise<void> {
         continue;
       }
 
-      // V7: processPositions is now async (may query fill history)
       const processed = await processPositions(
         trader.address,
         data.positions,
@@ -756,37 +600,48 @@ async function pollPositions(): Promise<void> {
         data.accountValue
       );
 
-      // Detect position changes for each position
+      // Track which coins this trader currently has positions in
       const currentCoins = new Set(processed.map(p => p.coin));
       
-      // Check for changes in existing positions
+      // Detect changes for current positions
       for (const position of processed) {
+        const key = `${trader.address}-${position.coin}`;
+        const prev = previousPositions.get(key);
         const currentPrice = parseFloat(allMids[position.coin] || '0');
-        const change = detectPositionChange(trader.address, position, currentPrice);
+        
+        const change = detectPositionChange(trader.address, position, prev || null, currentPrice);
         
         if (change) {
+          const eventId = await savePositionChange(change);
+          if (eventId) {
+            change.id = eventId;
+          }
           positionChanges.push(change);
-          await savePositionChange(change);
         }
         
         // Update cache
-        updatePreviousPositionCache(trader.address, position);
+        updatePreviousPositionCache(trader.address, position.coin, position);
       }
 
-      // Check for closed positions (positions that existed before but don't now)
+      // Detect closed positions (existed in cache but not in current)
       for (const [key, prev] of previousPositions) {
-        if (key.startsWith(trader.address) && !currentCoins.has(prev.coin)) {
-          const currentPrice = parseFloat(allMids[prev.coin] || '0');
-          const change = detectPositionChange(trader.address, null, currentPrice);
+        if (!key.startsWith(trader.address)) continue;
+        
+        const coin = prev.coin;
+        if (!currentCoins.has(coin)) {
+          const currentPrice = parseFloat(allMids[coin] || '0');
+          const change = detectPositionChange(trader.address, null, prev, currentPrice);
           
           if (change) {
+            const eventId = await savePositionChange(change);
+            if (eventId) {
+              change.id = eventId;
+            }
             positionChanges.push(change);
-            await savePositionChange(change);
           }
           
           // Remove from cache
           previousPositions.delete(key);
-          fillHistoryLookedUp.delete(key);
         }
       }
 
@@ -795,40 +650,21 @@ async function pollPositions(): Promise<void> {
       const orders = await processOpenOrders(trader.address, data.openOrders);
       allOpenOrders.push(...orders);
 
-      const totalUnrealizedPnl = data.positions.reduce(
-        (sum, p) => sum + parseFloat(p.unrealizedPnl || '0'),
-        0
-      );
-
-      const urgentTrigger = await checkForUrgentReeval(
-        trader.address,
-        data.accountValue,
-        totalUnrealizedPnl,
-        trader.quality_tier
-      );
-
-      if (urgentTrigger) {
-        await queueUrgentReeval(urgentTrigger);
-        urgentReevals++;
-      }
-
       await new Promise(resolve => setTimeout(resolve, config.rateLimit.delayBetweenRequests));
     }
 
     await savePositions(allPositions);
     await saveOpenOrders(allOpenOrders);
 
-    // Process queued fill history lookups (rate-limited)
-    await processFillLookupQueue();
-
     logger.info(
-      `Updated ${allPositions.length} positions, ${allOpenOrders.length} open orders` +
-      (positionChanges.length > 0 ? `, ${positionChanges.length} changes` : '') +
-      (urgentReevals > 0 ? `, ${urgentReevals} urgent reevals` : '') +
-      (fillLookupQueue.length > 0 ? `, ${fillLookupQueue.length} fill lookups queued` : '')
+      `Updated ${allPositions.length} positions, ${allOpenOrders.length} orders` +
+      (positionChanges.length > 0 ? `, ${positionChanges.length} changes detected` : '')
     );
 
-    await generateSignals();
+    // V7.2: Notify signal generator of changes
+    if (positionChanges.length > 0 && onPositionChanges) {
+      await onPositionChanges(positionChanges);
+    }
 
   } catch (error) {
     logger.error('Position polling failed', error);
@@ -838,113 +674,15 @@ async function pollPositions(): Promise<void> {
 }
 
 // ============================================
-// Urgent Re-eval Processing
-// ============================================
-
-async function processUrgentReevals(): Promise<void> {
-  try {
-    const { data: queue } = await db.client
-      .from('trader_reeval_queue')
-      .select('*')
-      .is('processed_at', null)
-      .order('priority', { ascending: true })
-      .limit(config.urgentReeval?.maxPerCycle || 5);
-
-    if (!queue || queue.length === 0) return;
-
-    logger.info(`Processing ${queue.length} urgent re-evaluations...`);
-
-    for (const item of queue) {
-      const { analyzeTrader, saveTraderAnalysis } = await import('./pnl-analyzer.js');
-      
-      const analysis = await analyzeTrader(item.address);
-      
-      if (analysis) {
-        if (analysis.quality_tier === 'weak') {
-          logger.warn(
-            `⬇️ DEMOTED: ${item.address.slice(0, 10)}... | ` +
-            `Reason: ${item.reason} | ` +
-            `New tier: ${analysis.quality_tier}`
-          );
-
-          await db.client
-            .from('trader_quality')
-            .update({ is_tracked: false })
-            .eq('address', item.address);
-        }
-
-        await saveTraderAnalysis(analysis);
-      }
-
-      await db.client
-        .from('trader_reeval_queue')
-        .update({ processed_at: new Date().toISOString() })
-        .eq('address', item.address);
-
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-  } catch (error) {
-    logger.error('Failed to process urgent reevals', error);
-  }
-}
-
-// ============================================
-// Position Age Utilities
-// ============================================
-
-export async function getFreshPositions(maxAgeHours: number = 4): Promise<TrackedPosition[]> {
-  const { data } = await db.client
-    .from('trader_positions')
-    .select('*')
-    .gte('opened_at', new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString())
-    .order('opened_at', { ascending: false });
-
-  return (data || []) as TrackedPosition[];
-}
-
-export async function getRecentPositionChanges(hours: number = 24): Promise<PositionChange[]> {
-  const { data } = await db.client
-    .from('position_history')
-    .select('*')
-    .gte('detected_at', new Date(Date.now() - hours * 60 * 60 * 1000).toISOString())
-    .order('detected_at', { ascending: false });
-
-  return (data || []) as PositionChange[];
-}
-
-export async function getPositionAgeStats(): Promise<{
-  avgAgeHours: number;
-  freshCount: number;
-  staleCount: number;
-}> {
-  const { data: positions } = await db.client
-    .from('trader_positions')
-    .select('position_age_hours');
-
-  if (!positions || positions.length === 0) {
-    return { avgAgeHours: 0, freshCount: 0, staleCount: 0 };
-  }
-
-  const ages = positions.map(p => p.position_age_hours || 0);
-  const avgAgeHours = ages.reduce((sum, a) => sum + a, 0) / ages.length;
-  const freshCount = ages.filter(a => a < 4).length;
-  const staleCount = ages.filter(a => a > 168).length; // 1 week
-
-  return { avgAgeHours, freshCount, staleCount };
-}
-
-// ============================================
 // Exports
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V7 starting...');
+  logger.info('Position tracker V7.2 starting...');
   
   pollPositions();
   
   pollInterval = setInterval(pollPositions, config.positions.pollIntervalMs);
-  
-  setInterval(processUrgentReevals, config.urgentReeval?.processIntervalMs || 2 * 60 * 1000);
 }
 
 export function stopPositionTracker(): void {
@@ -1002,34 +740,32 @@ export async function getPositionsForCoin(coin: string): Promise<TrackedPosition
   return (data || []) as TrackedPosition[];
 }
 
-export async function getPendingEntriesForCoin(coin: string): Promise<TrackedOpenOrder[]> {
+export async function getFreshPositions(maxAgeHours: number = 4): Promise<TrackedPosition[]> {
   const { data } = await db.client
-    .from('trader_open_orders')
+    .from('trader_positions')
     .select('*')
-    .eq('coin', coin)
-    .eq('reduce_only', false);
+    .gte('opened_at', new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString())
+    .order('opened_at', { ascending: false });
 
-  return (data || []) as TrackedOpenOrder[];
+  return (data || []) as TrackedPosition[];
 }
 
-export async function getUrgentReevalQueue(): Promise<unknown[]> {
+export async function getRecentPositionChanges(hours: number = 24): Promise<PositionChange[]> {
   const { data } = await db.client
-    .from('trader_reeval_queue')
+    .from('position_history')
     .select('*')
-    .is('processed_at', null)
-    .order('priority', { ascending: true });
+    .gte('detected_at', new Date(Date.now() - hours * 60 * 60 * 1000).toISOString())
+    .order('detected_at', { ascending: false });
 
-  return data || [];
+  return (data || []) as PositionChange[];
 }
 
 export default {
   startPositionTracker,
   stopPositionTracker,
+  subscribeToPositionChanges,
   getPositionStats,
   getPositionsForCoin,
-  getPendingEntriesForCoin,
-  getUrgentReevalQueue,
   getFreshPositions,
   getRecentPositionChanges,
-  getPositionAgeStats,
 };

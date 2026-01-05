@@ -1,4 +1,9 @@
-// Collector Entry Point V5 - Quality Trader Signal System
+// Collector Entry Point V6 - Event-Driven Signal System
+// MAJOR CHANGE: Signals are now EVENT-DRIVEN
+// - Signals only created when we WITNESS a position open
+// - No more signals from existing/old positions
+// - Verified timestamps you can trust for trade timing
+//
 // Enhanced with:
 // - Real-time WebSocket fill detection
 // - Conviction scoring
@@ -12,8 +17,8 @@ dotenvConfig();
 
 import { createLogger } from './utils/logger.js';
 import { startPositionTracker, stopPositionTracker, getPositionStats } from './processors/position-tracker.js';
+import { initializeSignalGenerator, stopSignalGenerator, getActiveSignals, getVerifiedSignals } from './processors/signal-generator.js';
 import { getQualityStats, analyzeTrader, saveTraderAnalysis } from './processors/pnl-analyzer.js';
-import { generateSignals, getActiveSignals, getHighConvictionSignals } from './processors/signal-generator.js';
 import { startSignalTracker, stopSignalTracker, getPerformanceSummary } from './processors/signal-tracker.js';
 import { reEvaluateAllTraders, cleanupOldHistory } from './processors/trader-reeval.js';
 import { startWebSocketStream, stopWebSocketStream, getStreamStats, onFill } from './processors/websocket-stream.js';
@@ -22,7 +27,7 @@ import { startVolatilityTracker, stopVolatilityTracker } from './processors/vola
 import db from './db/client.js';
 import { config } from './config.js';
 
-const logger = createLogger('main-v5');
+const logger = createLogger('main-v6');
 
 // ============================================
 // Types
@@ -56,7 +61,8 @@ interface HyperliquidClearinghouseState {
 
 /**
  * Handle real-time fills from WebSocket
- * Triggers immediate signal regeneration for quality trader fills
+ * V6: No longer triggers signal regeneration - signals are event-driven now
+ * Position tracker will detect changes and emit events to signal generator
  */
 async function handleRealtimeFill(fill: {
   address: string;
@@ -81,11 +87,9 @@ async function handleRealtimeFill(fill: {
     );
   }
 
-  // Trigger signal regeneration for large fills
-  if (value >= 25000) {
-    logger.info('Triggering signal regeneration...');
-    await generateSignals();
-  }
+  // V6: Removed generateSignals() call here
+  // Position tracker will detect the change and signal generator 
+  // will handle it via the event subscription
 
   // Create alert for new elite entries
   if (fill.qualityTier === 'elite' && fill.closedPnl === 0 && value >= 10000) {
@@ -293,12 +297,13 @@ async function logStatusUpdate(): Promise<void> {
     const qualityStats = await getQualityStats();
     const positionStats = await getPositionStats();
     const activeSignals = await getActiveSignals();
+    const verifiedSignals = await getVerifiedSignals();
     const perfSummary = await getPerformanceSummary();
     const streamStats = getStreamStats();
 
     logger.info('');
     logger.info('-'.repeat(70));
-    logger.info('STATUS UPDATE V5');
+    logger.info('STATUS UPDATE V6 (Event-Driven)');
     logger.info('-'.repeat(70));
     
     // Quality traders
@@ -321,39 +326,34 @@ async function logStatusUpdate(): Promise<void> {
       `${streamStats.fillsReceived} fills received`
     );
     
-    // Active signals
-    logger.info(`Active Signals: ${activeSignals.length}`);
+    // Active signals - V6: Show verified vs total
+    logger.info(`Active Signals: ${activeSignals.length} (${verifiedSignals.length} verified)`);
     
     if (activeSignals.length > 0) {
       logger.info('');
       logger.info('Current Signals:');
       for (const signal of activeSignals.slice(0, 5) as any[]) {
         const strength = signal.signal_strength === 'strong' ? '🔥 STRONG' : '📊 MEDIUM';
-        const agreement = ((signal.directional_agreement || 0) * 100).toFixed(0);
+        const verified = signal.is_verified_open ? '✓' : '?';
         const stopDist = ((signal.stop_distance_pct || 0)).toFixed(1);
         const conviction = (signal.avg_conviction_pct || 0).toFixed(0);
         const fundingEmoji = signal.funding_context === 'favorable' ? '✅' : 
                            signal.funding_context === 'unfavorable' ? '⚠️' : '';
         
+        // V6: Show when signal was detected
+        const detectedAt = signal.entry_detected_at 
+          ? new Date(signal.entry_detected_at).toLocaleTimeString()
+          : 'unknown';
+        
         logger.info(
-          `  ${signal.coin} ${signal.direction.toUpperCase()} | ` +
+          `  ${verified} ${signal.coin} ${signal.direction.toUpperCase()} | ` +
           `${signal.elite_count}E + ${signal.good_count}G | ` +
-          `${agreement}% agree | ` +
           `${conviction}% conv | ` +
           `${signal.funding_context}${fundingEmoji} | ` +
           `Stop: ${stopDist}% | ` +
-          `${strength} (${signal.confidence}%)`
+          `${strength} (${signal.confidence}%) | ` +
+          `Detected: ${detectedAt}`
         );
-      }
-    }
-
-    // High conviction signals
-    const highConviction = await getHighConvictionSignals(25);
-    if (highConviction.length > 0) {
-      logger.info('');
-      logger.info(`💪 High Conviction Signals: ${highConviction.length}`);
-      for (const sig of highConviction.slice(0, 3) as any[]) {
-        logger.info(`  ${sig.coin} ${sig.direction} - ${sig.avg_conviction_pct.toFixed(0)}% avg conviction`);
       }
     }
     
@@ -394,10 +394,13 @@ async function checkWeeklyReeval(): Promise<void> {
 async function main(): Promise<void> {
   logger.info('');
   logger.info('='.repeat(70));
-  logger.info('QUALITY TRADER SIGNAL SYSTEM V5');
+  logger.info('QUALITY TRADER SIGNAL SYSTEM V6 - EVENT-DRIVEN');
   logger.info('='.repeat(70));
   logger.info('');
-  logger.info('V5 Features:');
+  logger.info('V6 Features:');
+  logger.info('  ✓ EVENT-DRIVEN signals (only fires on witnessed opens)');
+  logger.info('  ✓ Verified timestamps (entry_detected_at = when WE saw it)');
+  logger.info('  ✓ No signals from pre-existing positions');
   logger.info('  ✓ Real-time WebSocket fill detection');
   logger.info('  ✓ Position conviction scoring (% of account)');
   logger.info('  ✓ Volatility-adjusted stops (ATR-based)');
@@ -405,7 +408,10 @@ async function main(): Promise<void> {
   logger.info('  ✓ Open order awareness (see entries before fills)');
   logger.info('  ✓ Urgent re-evaluation triggers (rapid demotion)');
   logger.info('  ✓ Daily equity snapshots (automatic)');
-  logger.info('  ✓ Equity-based P&L calculation (after 7 days)');
+  logger.info('');
+  logger.info('⚠️  IMPORTANT: Signals will only appear for NEW position opens');
+  logger.info('    detected AFTER this collector starts. Existing positions');
+  logger.info('    will NOT generate signals (we didn\'t witness their open).');
   logger.info('');
 
   // Validate environment
@@ -451,15 +457,19 @@ async function main(): Promise<void> {
     // Wait a bit for initial data
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // 3. Start position tracker
-    logger.info('Starting position tracker V5...');
+    // 3. Initialize signal generator FIRST (V6: sets up event subscription)
+    logger.info('Initializing signal generator V10 (event-driven)...');
+    initializeSignalGenerator();
+
+    // 4. Start position tracker (V6: will emit events to signal generator)
+    logger.info('Starting position tracker V7.2...');
     startPositionTracker();
 
-    // 4. Start signal performance tracker
+    // 5. Start signal performance tracker
     logger.info('Starting signal performance tracker...');
     startSignalTracker();
 
-    // 5. Start WebSocket stream for real-time fills
+    // 6. Start WebSocket stream for real-time fills
     if (config.websocket?.enabled !== false) {
       logger.info('Starting WebSocket stream...');
       startWebSocketStream();
@@ -468,26 +478,31 @@ async function main(): Promise<void> {
       onFill(handleRealtimeFill);
     }
 
-    // 6. Start periodic re-analysis
+    // 7. Start periodic re-analysis
     logger.info('Starting periodic re-analysis...');
     setInterval(reanalyzeQualityTraders, 5 * 60 * 1000);
 
-    // 7. Weekly re-evaluation check
+    // 8. Weekly re-evaluation check
     logger.info('Starting weekly re-evaluation checker...');
     setInterval(checkWeeklyReeval, 60 * 60 * 1000);
 
-    // 8. Status logging every 5 minutes
+    // 9. Status logging every 5 minutes
     setInterval(logStatusUpdate, 5 * 60 * 1000);
 
-    // 9. Daily equity snapshot checker (runs every hour, triggers once per day)
+    // 10. Daily equity snapshot checker (runs every hour, triggers once per day)
     logger.info('Starting daily equity snapshot scheduler...');
-    setInterval(checkDailyEquitySnapshot, 60 * 60 * 1000); // Check every hour
+    setInterval(checkDailyEquitySnapshot, 60 * 60 * 1000);
     
     // Run equity snapshot check immediately on startup
     await checkDailyEquitySnapshot();
 
     logger.info('');
+    logger.info('='.repeat(70));
     logger.info('System fully operational!');
+    logger.info('');
+    logger.info('Waiting for position OPEN events from tracked traders...');
+    logger.info('Signals will appear when elite/good traders open NEW positions.');
+    logger.info('='.repeat(70));
     logger.info('');
 
     // Initial status after 15 seconds (let data populate)
@@ -503,6 +518,7 @@ async function main(): Promise<void> {
     logger.info('');
     logger.info('Shutting down...');
     stopPositionTracker();
+    stopSignalGenerator();
     stopSignalTracker();
     stopWebSocketStream();
     stopFundingTracker();

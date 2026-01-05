@@ -11,7 +11,11 @@ import {
   ExternalLink,
   Plus,
   X,
-  Loader2
+  Loader2,
+  TrendingUp,
+  TrendingDown,
+  Target,
+  AlertTriangle
 } from 'lucide-react';
 
 // ============================================
@@ -58,7 +62,14 @@ interface QualitySignal {
   avg_entry_price: number;
   created_at: string;
   updated_at: string;
-  lead_trader_underwater_pct?: number;
+  closed_at?: string;
+  outcome?: string;
+  final_pnl_pct?: number;
+  hit_stop?: boolean;
+  hit_tp1?: boolean;
+  hit_tp2?: boolean;
+  hit_tp3?: boolean;
+  invalidation_reason?: string;
 }
 
 interface SystemStats {
@@ -135,7 +146,6 @@ function formatTimeWithEST(dateString: string): string {
   const diffHours = Math.floor(diffMins / 60);
   const diffDays = Math.floor(diffHours / 24);
   
-  // Format EST time
   const estTime = date.toLocaleTimeString('en-US', {
     hour: 'numeric',
     minute: '2-digit',
@@ -143,26 +153,35 @@ function formatTimeWithEST(dateString: string): string {
     timeZone: 'America/New_York'
   });
   
-  // Format date for older positions
   const estDate = date.toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
     timeZone: 'America/New_York'
   });
   
-  // Relative time
   let ago: string;
   if (diffMins < 1) ago = 'just now';
   else if (diffMins < 60) ago = `${diffMins}m ago`;
   else if (diffHours < 24) ago = `${diffHours}h ago`;
   else ago = `${diffDays}d ago`;
   
-  // Include date for anything older than 24h
   if (diffHours >= 24) {
     return `${ago} (${estDate}, ${estTime} EST)`;
   }
   
   return `${ago} (${estTime} EST)`;
+}
+
+function formatDateEST(dateString: string): string {
+  const date = new Date(dateString);
+  return date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'America/New_York'
+  }) + ' EST';
 }
 
 function formatTraderEntry(entryPrice: number, currentPrice: number, direction: string): { pnlPct: number; display: string } {
@@ -191,6 +210,270 @@ function parseAddresses(input: string): string[] {
     .filter(addr => addr.startsWith('0x') && addr.length === 42);
   
   return [...new Set(addresses)];
+}
+
+function getOutcomeDisplay(signal: QualitySignal): { label: string; color: string; icon: React.ReactNode } {
+  if (signal.hit_tp3) return { label: 'TP3 Hit', color: 'text-green-500', icon: <Target className="h-4 w-4" /> };
+  if (signal.hit_tp2) return { label: 'TP2 Hit', color: 'text-green-500', icon: <Target className="h-4 w-4" /> };
+  if (signal.hit_tp1) return { label: 'TP1 Hit', color: 'text-green-400', icon: <Target className="h-4 w-4" /> };
+  if (signal.hit_stop || signal.outcome === 'stopped_out') return { label: 'Stopped', color: 'text-red-500', icon: <AlertTriangle className="h-4 w-4" /> };
+  if (signal.outcome === 'profit') return { label: 'Profit', color: 'text-green-500', icon: <TrendingUp className="h-4 w-4" /> };
+  if (signal.outcome === 'loss') return { label: 'Loss', color: 'text-red-500', icon: <TrendingDown className="h-4 w-4" /> };
+  if (signal.invalidation_reason) return { label: 'Invalidated', color: 'text-yellow-500', icon: <X className="h-4 w-4" /> };
+  return { label: 'Closed', color: 'text-muted-foreground', icon: <X className="h-4 w-4" /> };
+}
+
+// ============================================
+// TRACK RECORD MODAL
+// ============================================
+
+function TrackRecordModal({
+  isOpen,
+  onClose,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [closedSignals, setClosedSignals] = useState<QualitySignal[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [expandedSignal, setExpandedSignal] = useState<number | null>(null);
+  const supabase = createClient();
+
+  useEffect(() => {
+    if (isOpen) {
+      fetchClosedSignals();
+    }
+  }, [isOpen]);
+
+  const fetchClosedSignals = async () => {
+    setIsLoading(true);
+    const { data, error } = await supabase
+      .from('quality_signals')
+      .select('*')
+      .eq('is_active', false)
+      .not('closed_at', 'is', null)
+      .order('closed_at', { ascending: false })
+      .limit(50);
+
+    if (data && !error) {
+      setClosedSignals(data);
+    }
+    setIsLoading(false);
+  };
+
+  if (!isOpen) return null;
+
+  const stats = {
+    total: closedSignals.length,
+    wins: closedSignals.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit').length,
+    stopped: closedSignals.filter(s => s.hit_stop || s.outcome === 'stopped_out').length,
+    avgPnl: closedSignals.length > 0 
+      ? closedSignals.reduce((sum, s) => sum + (s.final_pnl_pct || 0), 0) / closedSignals.length 
+      : 0,
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-card border border-border rounded-lg w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-border">
+          <div>
+            <h2 className="text-lg font-semibold">Track Record</h2>
+            <p className="text-sm text-muted-foreground">Historical signal performance</p>
+          </div>
+          <button 
+            onClick={onClose}
+            className="p-1 hover:bg-muted rounded"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Stats Summary */}
+        <div className="grid grid-cols-4 gap-4 p-4 bg-muted/30 border-b border-border">
+          <div className="text-center">
+            <div className="text-2xl font-bold">{stats.total}</div>
+            <div className="text-xs text-muted-foreground">Total Closed</div>
+          </div>
+          <div className="text-center">
+            <div className="text-2xl font-bold text-green-500">{stats.wins}</div>
+            <div className="text-xs text-muted-foreground">Winners</div>
+          </div>
+          <div className="text-center">
+            <div className="text-2xl font-bold text-red-500">{stats.stopped}</div>
+            <div className="text-xs text-muted-foreground">Stopped</div>
+          </div>
+          <div className="text-center">
+            <div className={`text-2xl font-bold ${stats.avgPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+              {stats.avgPnl >= 0 ? '+' : ''}{stats.avgPnl.toFixed(1)}%
+            </div>
+            <div className="text-xs text-muted-foreground">Avg P&L</div>
+          </div>
+        </div>
+
+        {/* Signals List */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : closedSignals.length === 0 ? (
+            <div className="text-center py-12 text-muted-foreground">
+              No closed signals yet
+            </div>
+          ) : (
+            closedSignals.map((signal) => {
+              const outcome = getOutcomeDisplay(signal);
+              const traders = Array.isArray(signal.traders) ? signal.traders : [];
+              const isExpanded = expandedSignal === signal.id;
+              
+              return (
+                <div 
+                  key={signal.id}
+                  className="bg-background rounded-lg border border-border overflow-hidden"
+                >
+                  {/* Signal Header */}
+                  <div 
+                    className="p-3 cursor-pointer hover:bg-muted/30 transition-colors"
+                    onClick={() => setExpandedSignal(isExpanded ? null : signal.id)}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold">{signal.coin}</span>
+                        <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                          signal.direction === 'long' ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
+                        }`}>
+                          {signal.direction.toUpperCase()}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {signal.elite_count}E + {signal.good_count}G
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className={`flex items-center gap-1 text-sm ${outcome.color}`}>
+                          {outcome.icon}
+                          {outcome.label}
+                        </span>
+                        {isExpanded ? (
+                          <ChevronUp className="h-4 w-4 text-muted-foreground" />
+                        ) : (
+                          <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="flex items-center justify-between text-sm">
+                      <div className="flex items-center gap-4">
+                        <span className="text-muted-foreground">
+                          Entry: <span className="text-foreground font-mono">{formatPrice(signal.entry_price)}</span>
+                        </span>
+                        <span className="text-muted-foreground">
+                          Exit: <span className="text-foreground font-mono">{formatPrice(signal.current_price)}</span>
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className={`font-medium ${(signal.final_pnl_pct || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                          {(signal.final_pnl_pct || 0) >= 0 ? '+' : ''}{(signal.final_pnl_pct || 0).toFixed(2)}%
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Expanded Details */}
+                  {isExpanded && (
+                    <div className="border-t border-border bg-muted/20 p-3 space-y-3">
+                      {/* Price Targets */}
+                      <div className="grid grid-cols-4 gap-2 text-xs">
+                        <div className={`p-2 rounded text-center ${signal.hit_stop ? 'bg-red-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground mb-1">Stop</div>
+                          <div className={signal.hit_stop ? 'text-red-500' : 'text-foreground'}>
+                            {formatPrice(signal.stop_loss)}
+                          </div>
+                        </div>
+                        <div className={`p-2 rounded text-center ${signal.hit_tp1 ? 'bg-green-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground mb-1">TP1</div>
+                          <div className={signal.hit_tp1 ? 'text-green-500' : 'text-foreground'}>
+                            {formatPrice(signal.take_profit_1)}
+                          </div>
+                        </div>
+                        <div className={`p-2 rounded text-center ${signal.hit_tp2 ? 'bg-green-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground mb-1">TP2</div>
+                          <div className={signal.hit_tp2 ? 'text-green-500' : 'text-foreground'}>
+                            {formatPrice(signal.take_profit_2)}
+                          </div>
+                        </div>
+                        <div className={`p-2 rounded text-center ${signal.hit_tp3 ? 'bg-green-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground mb-1">TP3</div>
+                          <div className={signal.hit_tp3 ? 'text-green-500' : 'text-foreground'}>
+                            {formatPrice(signal.take_profit_3)}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Timeline */}
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span>Opened: {signal.created_at ? formatDateEST(signal.created_at) : '-'}</span>
+                        <span>→</span>
+                        <span>Closed: {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}</span>
+                      </div>
+
+                      {/* Invalidation reason if exists */}
+                      {signal.invalidation_reason && (
+                        <div className="text-xs text-yellow-500 bg-yellow-500/10 rounded p-2">
+                          Reason: {signal.invalidation_reason.replace(/_/g, ' ')}
+                        </div>
+                      )}
+
+                      {/* Traders */}
+                      {traders.length > 0 && (
+                        <div>
+                          <div className="text-xs text-muted-foreground mb-2">
+                            Traders ({traders.length})
+                          </div>
+                          <div className="space-y-1">
+                            {traders.map((trader) => (
+                              <a
+                                key={trader.address}
+                                href={getTraderUrl(trader.address)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center justify-between p-2 bg-background rounded text-xs hover:bg-muted/50 transition-colors"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span className={`px-1.5 py-0.5 rounded font-medium ${
+                                    trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
+                                  }`}>
+                                    {trader.tier === 'elite' ? 'E' : 'G'}
+                                  </span>
+                                  <span className="font-mono text-muted-foreground">
+                                    {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
+                                  </span>
+                                  <ExternalLink className="h-3 w-3 text-muted-foreground" />
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span>Entry: {formatPrice(trader.entry_price)}</span>
+                                  <span className="text-muted-foreground">
+                                    {((trader.win_rate || 0) * 100).toFixed(0)}% WR
+                                  </span>
+                                </div>
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ============================================
@@ -299,7 +582,6 @@ function WalletImportModal({
       try {
         const analysis = await analyzeTrader(address);
         
-        // Check if trader already exists
         const { data: existing } = await supabase
           .from('trader_quality')
           .select('address')
@@ -307,7 +589,6 @@ function WalletImportModal({
           .single();
         
         if (existing) {
-          // Update existing
           const { error: dbError } = await supabase
             .from('trader_quality')
             .update({
@@ -322,7 +603,6 @@ function WalletImportModal({
           
           if (dbError) throw dbError;
         } else {
-          // Insert new (created_at has default now())
           const { error: dbError } = await supabase
             .from('trader_quality')
             .insert({
@@ -529,17 +809,26 @@ function WalletImportModal({
 }
 
 // ============================================
-// SIGNAL PERFORMANCE SUMMARY
+// SIGNAL PERFORMANCE SUMMARY (Clickable)
 // ============================================
 
-function SignalPerformanceSummary({ stats }: { stats: SignalStats | null }) {
+function SignalPerformanceSummary({ 
+  stats, 
+  onClick 
+}: { 
+  stats: SignalStats | null;
+  onClick: () => void;
+}) {
   if (!stats || stats.total === 0) return null;
   
   const closedCount = stats.total - stats.open;
   if (closedCount === 0) return null;
   
   return (
-    <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-sm bg-muted/30 rounded-lg px-3 sm:px-4 py-2 mb-4 sm:mb-6">
+    <button
+      onClick={onClick}
+      className="w-full flex flex-wrap items-center gap-2 sm:gap-4 text-sm bg-muted/30 hover:bg-muted/50 rounded-lg px-3 sm:px-4 py-2 mb-4 sm:mb-6 transition-colors text-left"
+    >
       <span className="text-muted-foreground">Track Record:</span>
       <span className="font-medium">{closedCount} closed</span>
       <span className="text-muted-foreground hidden sm:inline">·</span>
@@ -550,7 +839,8 @@ function SignalPerformanceSummary({ stats }: { stats: SignalStats | null }) {
       <span className="text-green-500">{stats.wins} TP</span>
       <span className="text-muted-foreground hidden sm:inline">·</span>
       <span className="text-red-500">{stats.stopped} stopped</span>
-    </div>
+      <ChevronDown className="h-4 w-4 text-muted-foreground ml-auto" />
+    </button>
   );
 }
 
@@ -566,7 +856,6 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
   
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   
-  // Get most recent entry time
   const openedDates = traders
     .map(t => t.opened_at)
     .filter((d): d is string => d !== null && d !== undefined);
@@ -599,7 +888,7 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
 }
 
 // ============================================
-// V11: SIGNAL TIER BADGE
+// SIGNAL TIER BADGE
 // ============================================
 
 function SignalTierBadge({ signal }: { signal: QualitySignal }) {
@@ -607,7 +896,6 @@ function SignalTierBadge({ signal }: { signal: QualitySignal }) {
   const eliteCount = signal.elite_count || 0;
   const goodCount = signal.good_count || 0;
   
-  // For elite_entry tier, show "(Elite)" badge
   if (tier === 'elite_entry') {
     return (
       <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
@@ -616,7 +904,6 @@ function SignalTierBadge({ signal }: { signal: QualitySignal }) {
     );
   }
   
-  // For confirmed/consensus, show "XE + XG" format
   return (
     <span className="text-xs text-muted-foreground">
       {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
@@ -638,10 +925,9 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   const isLong = signal.direction === 'long';
   const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
-  const isEliteEntry = signal.signal_tier === 'elite_entry';
   
   return (
-    <Card className={`overflow-hidden ${isEliteEntry ? 'border-yellow-500/30' : ''}`}>
+    <Card className="overflow-hidden">
       <CardContent className="p-0">
         <div 
           className="p-3 sm:p-4 cursor-pointer hover:bg-muted/30 transition-colors"
@@ -659,7 +945,6 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                 </span>
               </div>
               
-              {/* V11: Signal tier badge */}
               <SignalTierBadge signal={signal} />
               
               {signal.funding_context === 'favorable' && (
@@ -723,14 +1008,12 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                 <div className="text-xs text-muted-foreground mb-2">Traders in this signal ({traders.length})</div>
                 <div className="space-y-2">
                   {traders.map((trader) => {
-                    // Calculate this trader's P&L on their position
                     const traderEntry = trader.entry_price || 0;
                     const currentPrice = signal.current_price || 0;
                     const traderPnl = traderEntry && currentPrice 
                       ? formatTraderEntry(traderEntry, currentPrice, signal.direction)
                       : null;
                     
-                    // Format when they entered
                     const entryTime = trader.opened_at 
                       ? formatTimeWithEST(trader.opened_at)
                       : null;
@@ -809,6 +1092,7 @@ export default function SignalsPage() {
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [mounted, setMounted] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showTrackRecord, setShowTrackRecord] = useState(false);
 
   const supabase = createClient();
 
@@ -850,13 +1134,13 @@ export default function SignalsPage() {
   const fetchSignalStats = useCallback(async () => {
     const { data } = await supabase
       .from('quality_signals')
-      .select('outcome')
+      .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop')
       .not('outcome', 'is', null);
 
     if (data) {
       const total = data.length;
-      const wins = data.filter(s => ['tp1', 'tp2', 'tp3'].includes(s.outcome)).length;
-      const stopped = data.filter(s => s.outcome === 'stopped').length;
+      const wins = data.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit').length;
+      const stopped = data.filter(s => s.hit_stop || s.outcome === 'stopped_out').length;
       const open = data.filter(s => s.outcome === 'open').length;
       const closed = total - open;
       
@@ -946,7 +1230,10 @@ export default function SignalsPage() {
       </header>
 
       <main className="max-w-3xl mx-auto px-3 sm:px-4 py-4 sm:py-6">
-        <SignalPerformanceSummary stats={signalStats} />
+        <SignalPerformanceSummary 
+          stats={signalStats} 
+          onClick={() => setShowTrackRecord(true)}
+        />
         
         <div className="flex gap-2 mb-4 sm:mb-6 overflow-x-auto pb-1">
           {(['all', 'strong', 'long', 'short'] as const).map((f) => (
@@ -1007,6 +1294,11 @@ export default function SignalsPage() {
           fetchStats();
           fetchSignals();
         }}
+      />
+
+      <TrackRecordModal
+        isOpen={showTrackRecord}
+        onClose={() => setShowTrackRecord(false)}
       />
     </div>
   );

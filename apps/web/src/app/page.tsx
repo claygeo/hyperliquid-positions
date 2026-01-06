@@ -12,10 +12,6 @@ import {
   Plus,
   X,
   Loader2,
-  TrendingUp,
-  TrendingDown,
-  Target,
-  AlertTriangle,
   Timer
 } from 'lucide-react';
 
@@ -186,7 +182,7 @@ function formatDateEST(dateString: string): string {
     minute: '2-digit',
     hour12: true,
     timeZone: 'America/New_York'
-  }) + ' EST';
+  });
 }
 
 function formatDuration(startDate: string, endDate: string): string {
@@ -245,50 +241,66 @@ function formatInvalidationReason(reason: string | undefined): string {
   const reasonMap: Record<string, string> = {
     'all_traders_exited': 'All traders exited',
     'majority_exit_100pct': 'All traders exited',
-    'below_minimum_traders': 'Too few traders remaining',
-    'traders_no_longer_qualify': 'Traders no longer qualify',
-    'trader_flipped_direction': 'Trader flipped direction',
-    'replaced_by_short_signal': 'Replaced by SHORT signal',
-    'replaced_by_long_signal': 'Replaced by LONG signal',
-    'stale_signal': 'Signal expired',
+    'below_minimum_traders': 'Too few traders',
+    'traders_no_longer_qualify': 'Traders disqualified',
+    'trader_flipped_direction': 'Trader flipped',
+    'replaced_by_short_signal': 'Replaced by SHORT',
+    'replaced_by_long_signal': 'Replaced by LONG',
+    'stale_signal': 'Expired',
     'system_reset_v10_migration': 'System migration',
     'system_reset': 'System reset',
-    'manual_close': 'Manually closed',
+    'manual_close': 'Manual close',
   };
   
   return reasonMap[reason] || reason.replace(/_/g, ' ');
 }
 
-function getOutcomeDisplay(signal: QualitySignal): { label: string; color: string; icon: React.ReactNode; sublabel?: string } {
-  // TP hits take priority
-  if (signal.hit_tp3) return { label: 'TP3 Hit', color: 'text-green-500', icon: <Target className="h-4 w-4" /> };
-  if (signal.hit_tp2) return { label: 'TP2 Hit', color: 'text-green-500', icon: <Target className="h-4 w-4" /> };
-  if (signal.hit_tp1) return { label: 'TP1 Hit', color: 'text-green-400', icon: <Target className="h-4 w-4" /> };
+// Calculate P&L from entry/exit prices
+function calculatePnlFromPrices(entryPrice: number, exitPrice: number, direction: string): number {
+  if (!entryPrice || !exitPrice) return 0;
   
-  // Stopped
+  if (direction === 'long') {
+    return ((exitPrice - entryPrice) / entryPrice) * 100;
+  } else {
+    return ((entryPrice - exitPrice) / entryPrice) * 100;
+  }
+}
+
+function getOutcomeDisplay(signal: QualitySignal): { label: string; color: string; sublabel?: string } {
+  // Calculate P&L from actual prices (more accurate than stored final_pnl_pct)
+  const calculatedPnl = calculatePnlFromPrices(
+    signal.entry_price, 
+    signal.current_price, 
+    signal.direction
+  );
+  
+  // Use calculated P&L, fall back to stored if no prices
+  const pnl = (signal.entry_price && signal.current_price) ? calculatedPnl : (signal.final_pnl_pct || 0);
+  const pnlDisplay = `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`;
+  const pnlColor = pnl >= 0 ? 'text-green-500' : 'text-red-500';
+  
+  // TP hits - show P&L with TP label
+  if (signal.hit_tp3) return { label: pnlDisplay, color: 'text-green-500', sublabel: 'TP3 Hit' };
+  if (signal.hit_tp2) return { label: pnlDisplay, color: 'text-green-500', sublabel: 'TP2 Hit' };
+  if (signal.hit_tp1) return { label: pnlDisplay, color: 'text-green-400', sublabel: 'TP1 Hit' };
+  
+  // Stopped - show P&L with "Stopped" sublabel
   if (signal.hit_stop || signal.outcome === 'stopped_out') {
-    return { label: 'Stopped', color: 'text-red-500', icon: <AlertTriangle className="h-4 w-4" /> };
+    return { label: pnlDisplay, color: 'text-red-500', sublabel: 'Stopped' };
   }
   
-  // Invalidated with reason
+  // Invalidated with reason - show P&L with reason
   if (signal.invalidation_reason) {
-    const pnl = signal.final_pnl_pct || 0;
-    const pnlDisplay = `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`;
     const reasonText = formatInvalidationReason(signal.invalidation_reason);
-    
     return {
       label: pnlDisplay,
-      color: pnl >= 0 ? 'text-green-500' : 'text-red-500',
-      icon: pnl >= 0 ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />,
+      color: pnlColor,
       sublabel: reasonText
     };
   }
   
-  // Generic profit/loss
-  if (signal.outcome === 'profit') return { label: 'Profit', color: 'text-green-500', icon: <TrendingUp className="h-4 w-4" /> };
-  if (signal.outcome === 'loss') return { label: 'Loss', color: 'text-red-500', icon: <TrendingDown className="h-4 w-4" /> };
-  
-  return { label: 'Closed', color: 'text-muted-foreground', icon: <X className="h-4 w-4" /> };
+  // Generic outcome - just show P&L
+  return { label: pnlDisplay, color: pnlColor };
 }
 
 // ============================================
@@ -333,60 +345,66 @@ function TrackRecordModal({
 
   const stats = {
     total: closedSignals.length,
-    wins: closedSignals.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0)).length,
+    wins: closedSignals.filter(s => {
+      const pnl = calculatePnlFromPrices(s.entry_price, s.current_price, s.direction);
+      return pnl > 0;
+    }).length,
     stopped: closedSignals.filter(s => s.hit_stop || s.outcome === 'stopped_out').length,
     avgPnl: closedSignals.length > 0 
-      ? closedSignals.reduce((sum, s) => sum + (s.final_pnl_pct || 0), 0) / closedSignals.length 
+      ? closedSignals.reduce((sum, s) => {
+          const pnl = calculatePnlFromPrices(s.entry_price, s.current_price, s.direction);
+          return sum + pnl;
+        }, 0) / closedSignals.length 
       : 0,
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-lg w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 sm:p-4">
+      <div className="bg-card border border-border rounded-lg w-full max-w-2xl max-h-[95vh] sm:max-h-[90vh] overflow-hidden flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-border">
+        <div className="flex items-center justify-between p-3 sm:p-4 border-b border-border">
           <div>
-            <h2 className="text-lg font-semibold">Track Record</h2>
-            <p className="text-sm text-muted-foreground">Historical signal performance</p>
+            <h2 className="text-base sm:text-lg font-semibold">Track Record</h2>
+            <p className="text-xs sm:text-sm text-muted-foreground">Historical performance</p>
           </div>
           <button 
             onClick={onClose}
-            className="p-1 hover:bg-muted rounded"
+            className="p-1.5 hover:bg-muted rounded"
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
         {/* Stats Summary */}
-        <div className="grid grid-cols-4 gap-4 p-4 bg-muted/30 border-b border-border">
+        <div className="grid grid-cols-4 gap-2 sm:gap-4 p-3 sm:p-4 bg-muted/30 border-b border-border">
           <div className="text-center">
-            <div className="text-2xl font-bold">{stats.total}</div>
-            <div className="text-xs text-muted-foreground">Total Closed</div>
+            <div className="text-xl sm:text-2xl font-bold font-mono">{stats.total}</div>
+            <div className="text-[10px] sm:text-xs text-muted-foreground">Closed</div>
           </div>
           <div className="text-center">
-            <div className="text-2xl font-bold text-green-500">{stats.wins}</div>
-            <div className="text-xs text-muted-foreground">Winners</div>
+            <div className="text-xl sm:text-2xl font-bold font-mono text-green-500">{stats.wins}</div>
+            <div className="text-[10px] sm:text-xs text-muted-foreground">Winners</div>
           </div>
           <div className="text-center">
-            <div className="text-2xl font-bold text-red-500">{stats.stopped}</div>
-            <div className="text-xs text-muted-foreground">Stopped</div>
+            <div className="text-xl sm:text-2xl font-bold font-mono text-red-500">{stats.stopped}</div>
+            <div className="text-[10px] sm:text-xs text-muted-foreground">Stopped</div>
           </div>
           <div className="text-center">
-            <div className={`text-2xl font-bold ${stats.avgPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+            <div className={`text-xl sm:text-2xl font-bold font-mono ${stats.avgPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
               {stats.avgPnl >= 0 ? '+' : ''}{stats.avgPnl.toFixed(1)}%
             </div>
-            <div className="text-xs text-muted-foreground">Avg P&L</div>
+            <div className="text-[10px] sm:text-xs text-muted-foreground">Avg P&L</div>
           </div>
         </div>
 
         {/* Signals List */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <div className="flex-1 overflow-y-auto p-2 sm:p-4 space-y-2 sm:space-y-3">
           {isLoading ? (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>
           ) : closedSignals.length === 0 ? (
-            <div className="text-center py-12 text-muted-foreground">
+            <div className="text-center py-12 text-muted-foreground text-sm">
               No closed signals yet
             </div>
           ) : (
@@ -405,35 +423,35 @@ function TrackRecordModal({
                 >
                   {/* Signal Header */}
                   <div 
-                    className="p-3 cursor-pointer hover:bg-muted/30 transition-colors"
+                    className="p-2.5 sm:p-3 cursor-pointer hover:bg-muted/30 transition-colors"
                     onClick={() => setExpandedSignal(isExpanded ? null : signal.id)}
                   >
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold">{signal.coin}</span>
-                        <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                    {/* Top Row: Coin, Direction, Stats, P&L */}
+                    <div className="flex items-center justify-between gap-2 mb-1.5 sm:mb-2">
+                      <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+                        <span className="font-bold text-sm sm:text-base">{signal.coin}</span>
+                        <span className={`text-[10px] sm:text-xs font-bold px-1.5 py-0.5 rounded ${
                           signal.direction === 'long' ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
                         }`}>
                           {signal.direction.toUpperCase()}
                         </span>
-                        <span className="text-xs text-muted-foreground">
-                          {signal.elite_count}E + {signal.good_count}G
+                        <span className="text-[10px] sm:text-xs text-muted-foreground">
+                          {signal.elite_count}E+{signal.good_count}G
                         </span>
                         {duration && (
-                          <span className="text-xs text-muted-foreground flex items-center gap-1">
+                          <span className="text-[10px] sm:text-xs text-muted-foreground flex items-center gap-0.5">
                             <Timer className="h-3 w-3" />
                             {duration}
                           </span>
                         )}
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
                         <div className="text-right">
-                          <span className={`flex items-center gap-1 text-sm ${outcome.color}`}>
-                            {outcome.icon}
+                          <span className={`text-sm sm:text-base font-bold font-mono ${outcome.color}`}>
                             {outcome.label}
                           </span>
                           {outcome.sublabel && (
-                            <span className="text-xs text-muted-foreground">{outcome.sublabel}</span>
+                            <div className="text-[10px] sm:text-xs text-muted-foreground">{outcome.sublabel}</div>
                           )}
                         </div>
                         {isExpanded ? (
@@ -444,8 +462,9 @@ function TrackRecordModal({
                       </div>
                     </div>
                     
-                    <div className="flex items-center justify-between text-sm">
-                      <div className="flex items-center gap-4">
+                    {/* Bottom Row: Entry, Exit, Date */}
+                    <div className="flex items-center justify-between text-xs sm:text-sm">
+                      <div className="flex items-center gap-2 sm:gap-4">
                         <span className="text-muted-foreground">
                           Entry: <span className="text-foreground font-mono">{formatPrice(signal.entry_price)}</span>
                         </span>
@@ -453,7 +472,7 @@ function TrackRecordModal({
                           Exit: <span className="text-foreground font-mono">{formatPrice(signal.current_price)}</span>
                         </span>
                       </div>
-                      <span className="text-xs text-muted-foreground">
+                      <span className="text-[10px] sm:text-xs text-muted-foreground">
                         {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}
                       </span>
                     </div>
@@ -461,37 +480,37 @@ function TrackRecordModal({
 
                   {/* Expanded Details */}
                   {isExpanded && (
-                    <div className="border-t border-border bg-muted/20 p-3 space-y-3">
+                    <div className="border-t border-border bg-muted/20 p-2.5 sm:p-3 space-y-2.5 sm:space-y-3">
                       {/* Price Targets */}
-                      <div className="grid grid-cols-4 gap-2 text-xs">
-                        <div className={`p-2 rounded text-center ${signal.hit_stop ? 'bg-red-500/20' : 'bg-background'}`}>
-                          <div className="text-muted-foreground mb-1">Stop</div>
-                          <div className={signal.hit_stop ? 'text-red-500 font-medium' : 'text-foreground'}>
+                      <div className="grid grid-cols-4 gap-1.5 sm:gap-2 text-xs">
+                        <div className={`p-1.5 sm:p-2 rounded text-center ${signal.hit_stop ? 'bg-red-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground text-[10px] sm:text-xs mb-0.5">Stop</div>
+                          <div className={`font-mono text-[11px] sm:text-xs ${signal.hit_stop ? 'text-red-500 font-medium' : 'text-foreground'}`}>
                             {formatPrice(signal.stop_loss)}
                           </div>
                         </div>
-                        <div className={`p-2 rounded text-center ${signal.hit_tp1 ? 'bg-green-500/20' : 'bg-background'}`}>
-                          <div className="text-muted-foreground mb-1">TP1</div>
-                          <div className={signal.hit_tp1 ? 'text-green-500 font-medium' : 'text-foreground'}>
+                        <div className={`p-1.5 sm:p-2 rounded text-center ${signal.hit_tp1 ? 'bg-green-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground text-[10px] sm:text-xs mb-0.5">TP1</div>
+                          <div className={`font-mono text-[11px] sm:text-xs ${signal.hit_tp1 ? 'text-green-500 font-medium' : 'text-foreground'}`}>
                             {formatPrice(signal.take_profit_1)}
                           </div>
                         </div>
-                        <div className={`p-2 rounded text-center ${signal.hit_tp2 ? 'bg-green-500/20' : 'bg-background'}`}>
-                          <div className="text-muted-foreground mb-1">TP2</div>
-                          <div className={signal.hit_tp2 ? 'text-green-500 font-medium' : 'text-foreground'}>
+                        <div className={`p-1.5 sm:p-2 rounded text-center ${signal.hit_tp2 ? 'bg-green-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground text-[10px] sm:text-xs mb-0.5">TP2</div>
+                          <div className={`font-mono text-[11px] sm:text-xs ${signal.hit_tp2 ? 'text-green-500 font-medium' : 'text-foreground'}`}>
                             {formatPrice(signal.take_profit_2)}
                           </div>
                         </div>
-                        <div className={`p-2 rounded text-center ${signal.hit_tp3 ? 'bg-green-500/20' : 'bg-background'}`}>
-                          <div className="text-muted-foreground mb-1">TP3</div>
-                          <div className={signal.hit_tp3 ? 'text-green-500 font-medium' : 'text-foreground'}>
+                        <div className={`p-1.5 sm:p-2 rounded text-center ${signal.hit_tp3 ? 'bg-green-500/20' : 'bg-background'}`}>
+                          <div className="text-muted-foreground text-[10px] sm:text-xs mb-0.5">TP3</div>
+                          <div className={`font-mono text-[11px] sm:text-xs ${signal.hit_tp3 ? 'text-green-500 font-medium' : 'text-foreground'}`}>
                             {formatPrice(signal.take_profit_3)}
                           </div>
                         </div>
                       </div>
 
                       {/* Timeline */}
-                      <div className="flex items-center justify-between text-xs text-muted-foreground bg-background rounded p-2">
+                      <div className="flex items-center justify-between text-[10px] sm:text-xs text-muted-foreground bg-background rounded p-1.5 sm:p-2">
                         <span>Opened: {signal.created_at ? formatDateEST(signal.created_at) : '-'}</span>
                         <span className="text-foreground">→</span>
                         <span>Closed: {signal.closed_at ? formatDateEST(signal.closed_at) : '-'}</span>
@@ -500,10 +519,10 @@ function TrackRecordModal({
                       {/* Traders */}
                       {traders.length > 0 && (
                         <div>
-                          <div className="text-xs text-muted-foreground mb-2">
+                          <div className="text-[10px] sm:text-xs text-muted-foreground mb-1.5 sm:mb-2">
                             Traders ({traders.length})
                           </div>
-                          <div className="space-y-2">
+                          <div className="space-y-1.5 sm:space-y-2">
                             {traders.map((trader) => {
                               const hasExitData = trader.exit_price !== null && trader.exit_price !== undefined;
                               const traderPnl = hasExitData && trader.entry_price
@@ -519,48 +538,47 @@ function TrackRecordModal({
                                   className="block p-2 bg-background rounded text-xs hover:bg-muted/50 transition-colors"
                                 >
                                   <div className="flex items-center justify-between mb-1">
-                                    <div className="flex items-center gap-2">
-                                      <span className={`px-1.5 py-0.5 rounded font-medium ${
+                                    <div className="flex items-center gap-1.5 sm:gap-2">
+                                      <span className={`px-1 sm:px-1.5 py-0.5 rounded font-medium text-[10px] sm:text-xs ${
                                         trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
                                       }`}>
                                         {trader.tier === 'elite' ? 'E' : 'G'}
                                       </span>
-                                      <span className="font-mono text-muted-foreground">
+                                      <span className="font-mono text-[10px] sm:text-xs text-muted-foreground">
                                         {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
                                       </span>
                                       <ExternalLink className="h-3 w-3 text-muted-foreground" />
                                     </div>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-1.5 sm:gap-2">
                                       {traderPnl && (
-                                        <span className={`font-medium ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                                        <span className={`font-mono font-medium text-[10px] sm:text-xs ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
                                           {traderPnl.display}
                                         </span>
                                       )}
-                                      <span className="text-muted-foreground">
+                                      <span className="text-muted-foreground text-[10px] sm:text-xs">
                                         {((trader.win_rate || 0) * 100).toFixed(0)}% WR
                                       </span>
                                     </div>
                                   </div>
-                                  {/* Entry/Exit Row */}
-                                  <div className="flex items-center justify-between text-muted-foreground pl-6">
-                                    <div className="flex items-center gap-3">
-                                      <span>
-                                        Entry: <span className="font-mono text-foreground">{formatPrice(trader.entry_price)}</span>
-                                        {trader.opened_at && (
-                                          <span className="ml-1 text-xs">({formatDateEST(trader.opened_at)})</span>
-                                        )}
-                                      </span>
-                                    </div>
+                                  {/* Entry Row */}
+                                  <div className="text-[10px] sm:text-xs text-muted-foreground pl-5 sm:pl-6">
+                                    <span>
+                                      Entry: <span className="font-mono text-foreground">{formatPrice(trader.entry_price)}</span>
+                                      {trader.opened_at && (
+                                        <span className="ml-1">({formatDateEST(trader.opened_at)})</span>
+                                      )}
+                                    </span>
                                   </div>
+                                  {/* Exit Row */}
                                   {hasExitData && (
-                                    <div className="flex items-center justify-between text-muted-foreground pl-6 mt-1">
+                                    <div className="text-[10px] sm:text-xs text-muted-foreground pl-5 sm:pl-6 mt-0.5">
                                       <span>
                                         Exit: <span className="font-mono text-foreground">{formatPrice(trader.exit_price!)}</span>
                                         {trader.exited_at && (
-                                          <span className="ml-1 text-xs">({formatDateEST(trader.exited_at)})</span>
+                                          <span className="ml-1">({formatDateEST(trader.exited_at)})</span>
                                         )}
                                         {trader.exit_type && trader.exit_type !== 'manual' && (
-                                          <span className={`ml-2 px-1 py-0.5 rounded text-xs ${
+                                          <span className={`ml-1.5 px-1 py-0.5 rounded text-[9px] sm:text-[10px] ${
                                             trader.exit_type === 'stopped' ? 'bg-red-500/20 text-red-500' :
                                             trader.exit_type === 'liquidated' ? 'bg-red-500/20 text-red-500' :
                                             'bg-muted text-muted-foreground'
@@ -775,10 +793,10 @@ function WalletImportModal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-lg w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
-        <div className="flex items-center justify-between p-4 border-b border-border">
-          <h2 className="text-lg font-semibold">Import Wallets</h2>
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 sm:p-4">
+      <div className="bg-card border border-border rounded-lg w-full max-w-lg max-h-[95vh] sm:max-h-[90vh] overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between p-3 sm:p-4 border-b border-border">
+          <h2 className="text-base sm:text-lg font-semibold">Import Wallets</h2>
           <button 
             onClick={handleClose}
             disabled={isProcessing}
@@ -788,17 +806,17 @@ function WalletImportModal({
           </button>
         </div>
 
-        <div className="p-4 flex-1 overflow-y-auto">
+        <div className="p-3 sm:p-4 flex-1 overflow-y-auto">
           {!progress ? (
             <>
-              <p className="text-sm text-muted-foreground mb-3">
-                Paste wallet addresses below. Supports any format: comma-separated, space-separated, or one per line.
+              <p className="text-xs sm:text-sm text-muted-foreground mb-3">
+                Paste wallet addresses (comma, space, or newline separated).
               </p>
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="0x1234...&#10;0x5678...&#10;or&#10;0x1234..., 0x5678..."
-                className="w-full h-40 p-3 bg-background border border-border rounded-lg text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary"
+                placeholder="0x1234...&#10;0x5678..."
+                className="w-full h-32 sm:h-40 p-2 sm:p-3 bg-background border border-border rounded-lg text-xs sm:text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary"
               />
               <p className="text-xs text-muted-foreground mt-2">
                 {parseAddresses(input).length} valid addresses detected
@@ -807,10 +825,10 @@ function WalletImportModal({
           ) : (
             <div className="space-y-4">
               <div className="text-center">
-                <div className="text-4xl font-bold text-primary mb-2">
+                <div className="text-3xl sm:text-4xl font-bold font-mono text-primary mb-2">
                   {progress.current}/{progress.total}
                 </div>
-                <div className="text-sm text-muted-foreground">
+                <div className="text-xs sm:text-sm text-muted-foreground">
                   {progress.status === 'done' ? (
                     'Complete!'
                   ) : (
@@ -830,31 +848,31 @@ function WalletImportModal({
               </div>
 
               {progress.results.length > 0 && (
-                <div className="space-y-2 max-h-60 overflow-y-auto">
+                <div className="space-y-1.5 sm:space-y-2 max-h-48 sm:max-h-60 overflow-y-auto">
                   {progress.results.map((result, idx) => (
                     <div 
                       key={idx}
-                      className="flex items-center justify-between p-2 bg-background rounded text-sm"
+                      className="flex items-center justify-between p-2 bg-background rounded text-xs sm:text-sm"
                     >
-                      <span className="font-mono text-xs">
+                      <span className="font-mono text-[10px] sm:text-xs">
                         {result.address.slice(0, 8)}...{result.address.slice(-4)}
                       </span>
                       <div className="flex items-center gap-2">
                         {result.status === 'success' ? (
                           <>
-                            <span className={`text-xs px-1.5 py-0.5 rounded ${
+                            <span className={`text-[10px] sm:text-xs px-1.5 py-0.5 rounded ${
                               result.tier === 'elite' ? 'bg-green-500/20 text-green-500' :
                               result.tier === 'good' ? 'bg-blue-500/20 text-blue-500' :
                               'bg-muted text-muted-foreground'
                             }`}>
                               {result.tier.toUpperCase()}
                             </span>
-                            <span className={result.pnl_7d >= 0 ? 'text-green-500 text-xs' : 'text-red-500 text-xs'}>
+                            <span className={`font-mono text-[10px] sm:text-xs ${result.pnl_7d >= 0 ? 'text-green-500' : 'text-red-500'}`}>
                               {formatPnl(result.pnl_7d)}
                             </span>
                           </>
                         ) : (
-                          <span className="text-red-500 text-xs">Error</span>
+                          <span className="text-red-500 text-[10px] sm:text-xs">Error</span>
                         )}
                       </div>
                     </div>
@@ -866,22 +884,22 @@ function WalletImportModal({
                 <div className="bg-muted/50 rounded-lg p-3 text-sm">
                   <div className="grid grid-cols-3 gap-2 text-center">
                     <div>
-                      <div className="text-green-500 font-bold">
+                      <div className="text-green-500 font-bold font-mono">
                         {progress.results.filter(r => r.tier === 'elite').length}
                       </div>
-                      <div className="text-xs text-muted-foreground">Elite</div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Elite</div>
                     </div>
                     <div>
-                      <div className="text-blue-500 font-bold">
+                      <div className="text-blue-500 font-bold font-mono">
                         {progress.results.filter(r => r.tier === 'good').length}
                       </div>
-                      <div className="text-xs text-muted-foreground">Good</div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Good</div>
                     </div>
                     <div>
-                      <div className="text-muted-foreground font-bold">
+                      <div className="text-muted-foreground font-bold font-mono">
                         {progress.results.filter(r => r.tier === 'weak').length}
                       </div>
-                      <div className="text-xs text-muted-foreground">Weak</div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Weak</div>
                     </div>
                   </div>
                 </div>
@@ -890,26 +908,26 @@ function WalletImportModal({
           )}
         </div>
 
-        <div className="p-4 border-t border-border">
+        <div className="p-3 sm:p-4 border-t border-border">
           {!progress ? (
             <button
               onClick={handleImport}
               disabled={parseAddresses(input).length === 0}
-              className="w-full py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Import & Analyze {parseAddresses(input).length > 0 && `(${parseAddresses(input).length})`}
             </button>
           ) : progress.status === 'done' ? (
             <button
               onClick={handleClose}
-              className="w-full py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90"
+              className="w-full py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90"
             >
               Done
             </button>
           ) : (
             <button
               disabled
-              className="w-full py-2 bg-muted text-muted-foreground rounded-lg font-medium cursor-not-allowed"
+              className="w-full py-2 bg-muted text-muted-foreground rounded-lg text-sm font-medium cursor-not-allowed"
             >
               <Loader2 className="h-4 w-4 animate-spin inline mr-2" />
               Processing...
@@ -940,18 +958,16 @@ function SignalPerformanceSummary({
   return (
     <button
       onClick={onClick}
-      className="w-full flex flex-wrap items-center gap-2 sm:gap-4 text-sm bg-muted/30 hover:bg-muted/50 rounded-lg px-3 sm:px-4 py-2 mb-4 sm:mb-6 transition-colors text-left"
+      className="w-full flex flex-wrap items-center gap-1.5 sm:gap-3 text-xs sm:text-sm bg-muted/30 hover:bg-muted/50 rounded-lg px-3 py-2 mb-4 sm:mb-6 transition-colors text-left"
     >
       <span className="text-muted-foreground">Track Record:</span>
-      <span className="font-medium">{closedCount} closed</span>
-      <span className="text-muted-foreground hidden sm:inline">·</span>
-      <span className={stats.win_rate >= 50 ? 'text-green-500 font-medium' : 'text-red-500 font-medium'}>
-        {stats.win_rate.toFixed(0)}% win rate
+      <span className="font-medium font-mono">{closedCount}</span>
+      <span className="text-muted-foreground">closed</span>
+      <span className="text-muted-foreground">·</span>
+      <span className={`font-mono font-medium ${stats.win_rate >= 50 ? 'text-green-500' : 'text-red-500'}`}>
+        {stats.win_rate.toFixed(0)}%
       </span>
-      <span className="text-muted-foreground hidden sm:inline">·</span>
-      <span className="text-green-500">{stats.wins} TP</span>
-      <span className="text-muted-foreground hidden sm:inline">·</span>
-      <span className="text-red-500">{stats.stopped} stopped</span>
+      <span className="text-muted-foreground">WR</span>
       <ChevronDown className="h-4 w-4 text-muted-foreground ml-auto" />
     </button>
   );
@@ -980,19 +996,19 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
   const entryTimeDisplay = mostRecentEntry ? formatTimeWithEST(mostRecentEntry) : null;
   
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 text-sm">
-      <div className="flex items-center gap-2">
+    <div className="flex flex-col sm:flex-row sm:items-center gap-0.5 sm:gap-4 text-xs sm:text-sm">
+      <div className="flex items-center gap-1.5 sm:gap-2">
         <span className="text-muted-foreground">Entry</span>
         <span className="font-mono font-medium">{formatPrice(entry)}</span>
         {entryTimeDisplay && (
-          <span className="text-muted-foreground text-xs">({entryTimeDisplay})</span>
+          <span className="text-muted-foreground text-[10px] sm:text-xs hidden sm:inline">({entryTimeDisplay})</span>
         )}
       </div>
       <span className="text-muted-foreground hidden sm:inline">→</span>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5 sm:gap-2">
         <span className="text-muted-foreground">Now</span>
         <span className="font-mono font-medium">{formatPrice(current)}</span>
-        <span className={`font-medium ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
+        <span className={`font-mono font-medium ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
           ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%)
         </span>
       </div>
@@ -1011,16 +1027,16 @@ function SignalTierBadge({ signal }: { signal: QualitySignal }) {
   
   if (tier === 'elite_entry') {
     return (
-      <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
+      <span className="text-[10px] sm:text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
         Elite
       </span>
     );
   }
   
   return (
-    <span className="text-xs text-muted-foreground">
+    <span className="text-[10px] sm:text-xs text-muted-foreground">
       {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
-      {eliteCount > 0 && goodCount > 0 && ' + '}
+      {eliteCount > 0 && goodCount > 0 && '+'}
       {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
     </span>
   );
@@ -1047,11 +1063,11 @@ function SignalCard({ signal, isExpanded, onToggle }: {
           onClick={onToggle}
         >
           {/* Header row */}
-          <div className="flex items-start sm:items-center justify-between mb-3 gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-2">
-                <span className="text-lg sm:text-xl font-bold">{signal.coin}</span>
-                <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+          <div className="flex items-start sm:items-center justify-between mb-2 sm:mb-3 gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+              <div className="flex items-center gap-1.5 sm:gap-2">
+                <span className="text-base sm:text-xl font-bold">{signal.coin}</span>
+                <span className={`text-[10px] sm:text-xs font-bold px-1.5 sm:px-2 py-0.5 rounded ${
                   isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
                 }`}>
                   {signal.direction.toUpperCase()}
@@ -1061,36 +1077,34 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               <SignalTierBadge signal={signal} />
               
               {signal.funding_context === 'favorable' && (
-                <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
+                <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
                   <Zap className="h-3 w-3" />
                   <span className="hidden sm:inline">Funding pays you</span>
-                  <span className="sm:hidden">Favorable</span>
                 </span>
               )}
             </div>
             
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-              <span className="text-xs text-muted-foreground flex items-center gap-1">
+              <span className="text-[10px] sm:text-xs text-muted-foreground flex items-center gap-1">
                 <Clock className="h-3 w-3" />
-                <span className="hidden sm:inline">{formatTimeAgo(signal.updated_at || signal.created_at)}</span>
-                <span className="sm:hidden">{formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}</span>
+                <span>{formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}</span>
               </span>
               {isExpanded ? (
-                <ChevronUp className="h-5 w-5 text-muted-foreground" />
+                <ChevronUp className="h-4 sm:h-5 w-4 sm:w-5 text-muted-foreground" />
               ) : (
-                <ChevronDown className="h-5 w-5 text-muted-foreground" />
+                <ChevronDown className="h-4 sm:h-5 w-4 sm:w-5 text-muted-foreground" />
               )}
             </div>
           </div>
           
           {/* Price + Stop */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-2">
             <PriceDisplay signal={signal} />
-            <div className="text-sm">
+            <div className="text-xs sm:text-sm">
               <span className="text-muted-foreground">Stop: </span>
               <span className="text-red-500 font-mono">
                 {formatPrice(signal.stop_loss)} 
-                <span className="text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
+                <span className="text-[10px] sm:text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
               </span>
             </div>
           </div>
@@ -1098,19 +1112,19 @@ function SignalCard({ signal, isExpanded, onToggle }: {
         
         {/* Expanded View */}
         {isExpanded && (
-          <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-4">
+          <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-3 sm:space-y-4">
             {/* Take Profit Levels */}
-            <div className="grid grid-cols-3 gap-2 sm:gap-4 text-sm">
+            <div className="grid grid-cols-3 gap-2 sm:gap-4 text-xs sm:text-sm">
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
-                <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
+                <div className="text-green-400 text-[10px] sm:text-xs mb-1">TP1 (1:1)</div>
                 <div className="font-mono font-medium text-green-400 text-xs sm:text-sm">{formatPrice(signal.take_profit_1)}</div>
               </div>
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
-                <div className="text-green-500 text-xs mb-1">TP2 (2:1)</div>
+                <div className="text-green-500 text-[10px] sm:text-xs mb-1">TP2 (2:1)</div>
                 <div className="font-mono font-medium text-green-500 text-xs sm:text-sm">{formatPrice(signal.take_profit_2)}</div>
               </div>
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
-                <div className="text-green-600 text-xs mb-1">TP3 (3:1)</div>
+                <div className="text-green-600 text-[10px] sm:text-xs mb-1">TP3 (3:1)</div>
                 <div className="font-mono font-medium text-green-600 text-xs sm:text-sm">{formatPrice(signal.take_profit_3)}</div>
               </div>
             </div>
@@ -1118,7 +1132,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
             {/* Traders List */}
             {traders.length > 0 && (
               <div>
-                <div className="text-xs text-muted-foreground mb-2">Traders in this signal ({traders.length})</div>
+                <div className="text-[10px] sm:text-xs text-muted-foreground mb-2">Traders ({traders.length})</div>
                 <div className="space-y-2">
                   {traders.map((trader) => {
                     const traderEntry = trader.entry_price || 0;
@@ -1140,19 +1154,19 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                         className="block p-2 bg-background rounded-lg hover:bg-muted/50 transition-colors"
                       >
                         <div className="flex items-center justify-between mb-1">
-                          <div className="flex items-center gap-2">
-                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                          <div className="flex items-center gap-1.5 sm:gap-2">
+                            <span className={`text-[10px] sm:text-xs px-1 sm:px-1.5 py-0.5 rounded font-medium ${
                               trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
                             }`}>
-                              {trader.tier === 'elite' ? 'Elite' : 'Good'}
+                              {trader.tier === 'elite' ? 'E' : 'G'}
                             </span>
-                            <span className="font-mono text-xs text-muted-foreground">
+                            <span className="font-mono text-[10px] sm:text-xs text-muted-foreground">
                               {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
                             </span>
                             <ExternalLink className="h-3 w-3 text-muted-foreground" />
                           </div>
-                          <div className="flex items-center gap-2 text-xs">
-                            <span className={(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}>
+                          <div className="flex items-center gap-1.5 sm:gap-2 text-[10px] sm:text-xs">
+                            <span className={`font-mono ${(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
                               {formatPnl(trader.pnl_7d || 0)}
                             </span>
                             <span className="text-muted-foreground">
@@ -1161,13 +1175,13 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                           </div>
                         </div>
                         {/* Entry details row */}
-                        <div className="flex items-center justify-between text-xs text-muted-foreground pl-1">
-                          <div className="flex items-center gap-2">
+                        <div className="flex items-center justify-between text-[10px] sm:text-xs text-muted-foreground pl-1">
+                          <div className="flex items-center gap-1.5 sm:gap-2">
                             {traderEntry > 0 && (
                               <>
                                 <span>Entry: <span className="font-mono text-foreground">{formatPrice(traderEntry)}</span></span>
                                 {traderPnl && (
-                                  <span className={traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}>
+                                  <span className={`font-mono ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
                                     ({traderPnl.display})
                                   </span>
                                 )}
@@ -1175,7 +1189,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                             )}
                           </div>
                           {entryTime && (
-                            <span className="text-xs">{entryTime}</span>
+                            <span className="text-[10px] sm:text-xs hidden sm:inline">{entryTime}</span>
                           )}
                         </div>
                       </a>
@@ -1247,12 +1261,22 @@ export default function SignalsPage() {
   const fetchSignalStats = useCallback(async () => {
     const { data } = await supabase
       .from('quality_signals')
-      .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop, final_pnl_pct')
+      .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop, final_pnl_pct, entry_price, current_price, direction')
       .not('outcome', 'is', null);
 
     if (data) {
       const total = data.length;
-      const wins = data.filter(s => s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0)).length;
+      const wins = data.filter(s => {
+        // Calculate actual P&L from prices
+        if (s.entry_price && s.current_price) {
+          const pnl = s.direction === 'long' 
+            ? ((s.current_price - s.entry_price) / s.entry_price) * 100
+            : ((s.entry_price - s.current_price) / s.entry_price) * 100;
+          return pnl > 0;
+        }
+        // Fall back to stored data
+        return s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0);
+      }).length;
       const stopped = data.filter(s => s.hit_stop || s.outcome === 'stopped_out').length;
       const open = data.filter(s => s.outcome === 'open').length;
       const closed = total - open;
@@ -1310,17 +1334,17 @@ export default function SignalsPage() {
         <div className="max-w-3xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-lg sm:text-xl font-semibold">Quality Signals</h1>
-              <p className="text-xs sm:text-sm text-muted-foreground">
+              <h1 className="text-base sm:text-xl font-semibold">Quality Signals</h1>
+              <p className="text-[10px] sm:text-sm text-muted-foreground">
                 Following {stats?.tracked_count || 0} traders
               </p>
             </div>
             <div className="flex items-center gap-2 sm:gap-4">
               {stats && (
-                <div className="text-xs sm:text-sm">
-                  <span className="text-green-500 font-medium">{stats.elite_count} Elite</span>
+                <div className="text-[10px] sm:text-sm">
+                  <span className="text-green-500 font-medium">{stats.elite_count} E</span>
                   <span className="text-muted-foreground mx-1">·</span>
-                  <span className="text-blue-500 font-medium">{stats.good_count} Good</span>
+                  <span className="text-blue-500 font-medium">{stats.good_count} G</span>
                 </div>
               )}
               <button
@@ -1333,7 +1357,7 @@ export default function SignalsPage() {
               <button
                 onClick={handleRefresh}
                 disabled={isLoading}
-                className="px-2 sm:px-3 py-1.5 text-xs sm:text-sm bg-secondary hover:bg-secondary/80 rounded-md transition-colors disabled:opacity-50"
+                className="px-2 sm:px-3 py-1.5 text-[10px] sm:text-sm bg-secondary hover:bg-secondary/80 rounded-md transition-colors disabled:opacity-50"
               >
                 Refresh
               </button>
@@ -1348,12 +1372,12 @@ export default function SignalsPage() {
           onClick={() => setShowTrackRecord(true)}
         />
         
-        <div className="flex gap-2 mb-4 sm:mb-6 overflow-x-auto pb-1">
+        <div className="flex gap-1.5 sm:gap-2 mb-4 sm:mb-6 overflow-x-auto pb-1">
           {(['all', 'strong', 'long', 'short'] as const).map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
-              className={`px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap ${
+              className={`px-2.5 sm:px-3 py-1.5 text-[10px] sm:text-sm rounded-md transition-colors whitespace-nowrap ${
                 filter === f 
                   ? f === 'long' ? 'bg-green-600 text-white'
                   : f === 'short' ? 'bg-red-600 text-white'
@@ -1382,16 +1406,16 @@ export default function SignalsPage() {
           </div>
         ) : (
           <Card>
-            <CardContent className="py-12 text-center">
-              <h3 className="text-lg font-medium mb-2">No Active Signals</h3>
-              <p className="text-muted-foreground text-sm">
+            <CardContent className="py-8 sm:py-12 text-center">
+              <h3 className="text-base sm:text-lg font-medium mb-2">No Active Signals</h3>
+              <p className="text-muted-foreground text-xs sm:text-sm">
                 Signals appear when elite traders open positions or multiple quality traders converge.
               </p>
             </CardContent>
           </Card>
         )}
 
-        <div className="flex items-center justify-center gap-2 mt-6 text-xs sm:text-sm text-muted-foreground">
+        <div className="flex items-center justify-center gap-2 mt-6 text-[10px] sm:text-sm text-muted-foreground">
           <span className="relative flex h-2 w-2">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
             <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>

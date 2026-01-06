@@ -951,23 +951,26 @@ function SignalPerformanceSummary({
 }) {
   if (!stats || stats.total === 0) return null;
   
-  const closedCount = stats.total - stats.open;
-  if (closedCount === 0) return null;
-  
   return (
     <button
       onClick={onClick}
-      className="w-full flex flex-wrap items-center gap-1.5 sm:gap-3 text-xs sm:text-sm bg-muted/30 hover:bg-muted/50 rounded-lg px-3 py-2 mb-4 sm:mb-6 transition-colors text-left"
+      className="w-full flex items-center justify-center gap-2 sm:gap-4 text-sm sm:text-base bg-muted/40 hover:bg-muted/60 rounded-lg px-4 py-3 mb-4 sm:mb-6 transition-colors border border-border/50"
     >
       <span className="text-muted-foreground">Track Record:</span>
-      <span className="font-medium font-mono">{closedCount}</span>
+      <span className="font-bold font-mono">{stats.total}</span>
       <span className="text-muted-foreground">closed</span>
       <span className="text-muted-foreground">·</span>
-      <span className={`font-mono font-medium ${stats.win_rate >= 50 ? 'text-green-500' : 'text-red-500'}`}>
+      <span className="font-bold font-mono text-green-500">{stats.wins}</span>
+      <span className="text-green-500">wins</span>
+      <span className="text-muted-foreground">·</span>
+      <span className="font-bold font-mono text-red-500">{stats.stopped}</span>
+      <span className="text-red-500">stopped</span>
+      <span className="text-muted-foreground">·</span>
+      <span className={`font-bold font-mono ${stats.win_rate >= 50 ? 'text-green-500' : 'text-red-500'}`}>
         {stats.win_rate.toFixed(0)}%
       </span>
       <span className="text-muted-foreground">WR</span>
-      <ChevronDown className="h-4 w-4 text-muted-foreground ml-auto" />
+      <ChevronDown className="h-4 w-4 text-muted-foreground ml-1" />
     </button>
   );
 }

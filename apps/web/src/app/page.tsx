@@ -332,8 +332,7 @@ function TrackRecordModal({
       .select('*')
       .eq('is_active', false)
       .not('closed_at', 'is', null)
-      .order('closed_at', { ascending: false })
-      .limit(50);
+      .order('closed_at', { ascending: false });
 
     if (data && !error) {
       setClosedSignals(data);
@@ -1259,10 +1258,12 @@ export default function SignalsPage() {
   }, [supabase]);
 
   const fetchSignalStats = useCallback(async () => {
+    // Only get CLOSED signals (same criteria as modal)
     const { data } = await supabase
       .from('quality_signals')
       .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop, final_pnl_pct, entry_price, current_price, direction')
-      .not('outcome', 'is', null);
+      .eq('is_active', false)
+      .not('closed_at', 'is', null);
 
     if (data) {
       const total = data.length;
@@ -1278,15 +1279,13 @@ export default function SignalsPage() {
         return s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0);
       }).length;
       const stopped = data.filter(s => s.hit_stop || s.outcome === 'stopped_out').length;
-      const open = data.filter(s => s.outcome === 'open').length;
-      const closed = total - open;
       
       setSignalStats({
         total,
         wins,
         stopped,
-        open,
-        win_rate: closed > 0 ? (wins / closed) * 100 : 0
+        open: 0,
+        win_rate: total > 0 ? (wins / total) * 100 : 0
       });
     }
   }, [supabase]);

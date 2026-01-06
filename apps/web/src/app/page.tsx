@@ -1326,60 +1326,6 @@ function SignalPerformanceSummary({
 }
 
 // ============================================
-// PRICE DISPLAY
-// ============================================
-
-function PriceDisplay({ signal }: { signal: QualitySignal }) {
-  const entry = signal.entry_price || signal.current_price;
-  const current = signal.current_price;
-  const pnlPct = signal.current_pnl_pct || 0;
-  const isProfit = pnlPct > 0;
-  
-  const traders = Array.isArray(signal.traders) ? signal.traders : [];
-  
-  const openedDates = traders
-    .map(t => t.opened_at)
-    .filter((d): d is string => d !== null && d !== undefined);
-  
-  const mostRecentEntry = openedDates.length > 0 
-    ? openedDates.reduce((latest, d) => new Date(d) > new Date(latest) ? d : latest)
-    : null;
-  
-  const entryTimeDisplay = mostRecentEntry ? formatDateEST(mostRecentEntry) : null;
-  
-  // Calculate duration
-  const durationDisplay = mostRecentEntry 
-    ? formatTimeAgo(mostRecentEntry)
-    : null;
-  
-  return (
-    <div className="space-y-1">
-      {/* Row 1: Entry, Now, P&L */}
-      <div className="flex items-baseline gap-3 sm:gap-4 text-sm">
-        <div className="flex items-baseline gap-1.5">
-          <span className="text-muted-foreground">Entry</span>
-          <span className="font-mono font-semibold">{formatPrice(entry)}</span>
-        </div>
-        <span className="text-muted-foreground">→</span>
-        <div className="flex items-baseline gap-1.5">
-          <span className="text-muted-foreground">Now</span>
-          <span className="font-mono font-semibold">{formatPrice(current)}</span>
-          <span className={`font-mono font-bold text-base ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
-            {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
-          </span>
-        </div>
-      </div>
-      {/* Row 2: Entry Time + Duration */}
-      {entryTimeDisplay && (
-        <div className="text-xs text-muted-foreground">
-          Opened: {entryTimeDisplay} EST {durationDisplay && <span>· {durationDisplay}</span>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================
 // SIGNAL TIER BADGE
 // ============================================
 
@@ -1397,7 +1343,7 @@ function SignalTierBadge({ signal }: { signal: QualitySignal }) {
   }
   
   return (
-    <span className="text-xs text-muted-foreground">
+    <span className="text-xs text-muted-foreground font-medium">
       {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
       {eliteCount > 0 && goodCount > 0 && '+'}
       {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
@@ -1418,75 +1364,149 @@ function SignalCard({ signal, isExpanded, onToggle }: {
   const isLong = signal.direction === 'long';
   const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
   
+  // Get entry time for display
+  const openedDates = traders.map(t => t.opened_at).filter((d): d is string => d !== null && d !== undefined);
+  const mostRecentEntry = openedDates.length > 0 
+    ? openedDates.reduce((latest, d) => new Date(d) > new Date(latest) ? d : latest)
+    : null;
+  const entryTimeDisplay = mostRecentEntry ? formatDateEST(mostRecentEntry) : null;
+  const durationDisplay = mostRecentEntry ? formatTimeAgo(mostRecentEntry) : null;
+  
+  const entry = signal.entry_price || signal.current_price;
+  const current = signal.current_price;
+  const pnlPct = signal.current_pnl_pct || 0;
+  const isProfit = pnlPct >= 0;
+  
   return (
     <Card className="overflow-hidden">
       <CardContent className="p-0">
         <div 
-          className="p-3 sm:p-4 cursor-pointer hover:bg-muted/30 transition-colors"
+          className="p-4 cursor-pointer hover:bg-muted/30 transition-colors"
           onClick={onToggle}
         >
-          {/* Header row */}
-          <div className="flex items-start sm:items-center justify-between mb-2 sm:mb-3 gap-2">
-            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-              <div className="flex items-center gap-1.5 sm:gap-2">
-                <span className="text-lg sm:text-xl font-bold">{signal.coin}</span>
-                <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+          {/* DESKTOP LAYOUT (md and up) */}
+          <div className="hidden md:block">
+            {/* Row 1: Header */}
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-3">
+                <span className="text-xl font-bold w-20">{signal.coin}</span>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded w-14 text-center ${
                   isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
                 }`}>
                   {signal.direction.toUpperCase()}
                 </span>
+                <div className="w-16">
+                  <SignalTierBadge signal={signal} />
+                </div>
+                {signal.funding_context === 'favorable' && (
+                  <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
+                    <Zap className="h-3 w-3" />
+                    Funding pays you
+                  </span>
+                )}
               </div>
-              
-              <SignalTierBadge signal={signal} />
-              
-              {signal.funding_context === 'favorable' && (
-                <span className="text-xs px-1.5 sm:px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
-                  <Zap className="h-3 w-3" />
-                  <span className="hidden sm:inline">Funding pays you</span>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Clock className="h-3 w-3" />
+                  {formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}
                 </span>
-              )}
+                {isExpanded ? <ChevronUp className="h-5 w-5 text-muted-foreground" /> : <ChevronDown className="h-5 w-5 text-muted-foreground" />}
+              </div>
             </div>
             
-            <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-              <span className="text-xs text-muted-foreground flex items-center gap-1">
-                <Clock className="h-3 w-3" />
-                <span>{formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}</span>
-              </span>
-              {isExpanded ? (
-                <ChevronUp className="h-5 w-5 text-muted-foreground" />
-              ) : (
-                <ChevronDown className="h-5 w-5 text-muted-foreground" />
-              )}
+            {/* Row 2: Price data - tabular alignment */}
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center text-sm">
+                <span className="text-muted-foreground w-12">Entry</span>
+                <span className="font-mono font-semibold w-28 text-right">{formatPrice(entry)}</span>
+                <span className="text-muted-foreground mx-3">→</span>
+                <span className="text-muted-foreground w-10">Now</span>
+                <span className="font-mono font-semibold w-28 text-right">{formatPrice(current)}</span>
+                <span className={`font-mono font-bold ml-3 w-20 text-right ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
+                  {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
+                </span>
+              </div>
+              <div className="flex items-center text-sm">
+                <span className="text-muted-foreground mr-2">Stop:</span>
+                <span className="text-red-500 font-mono font-semibold">{formatPrice(signal.stop_loss)}</span>
+                <span className="text-red-500/70 text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
+              </div>
             </div>
+            
+            {/* Row 3: Opened time */}
+            {entryTimeDisplay && (
+              <div className="text-xs text-muted-foreground">
+                Opened: {entryTimeDisplay} EST {durationDisplay && <span>· {durationDisplay}</span>}
+              </div>
+            )}
           </div>
           
-          {/* Price Display + Stop */}
-          <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2">
-            <PriceDisplay signal={signal} />
-            <div className="text-sm">
-              <span className="text-muted-foreground">Stop: </span>
-              <span className="text-red-500 font-mono font-semibold">
-                {formatPrice(signal.stop_loss)} 
-                <span className="text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
+          {/* MOBILE LAYOUT (below md) */}
+          <div className="md:hidden">
+            {/* Row 1: Coin, Direction, Tier | Time, Chevron */}
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-lg font-bold">{signal.coin}</span>
+                <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${
+                  isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
+                }`}>
+                  {signal.direction.toUpperCase()}
+                </span>
+                <SignalTierBadge signal={signal} />
+                {signal.funding_context === 'favorable' && (
+                  <Zap className="h-3.5 w-3.5 text-green-500" />
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Clock className="h-3 w-3" />
+                  {formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}
+                </span>
+                {isExpanded ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
+              </div>
+            </div>
+            
+            {/* Row 2: Entry → Now with P&L */}
+            <div className="grid grid-cols-[auto_auto_auto_auto_1fr] items-center gap-x-2 text-sm mb-2">
+              <span className="text-muted-foreground">Entry</span>
+              <span className="font-mono font-semibold">{formatPrice(entry)}</span>
+              <span className="text-muted-foreground">→</span>
+              <span className="font-mono font-semibold">{formatPrice(current)}</span>
+              <span className={`font-mono font-bold text-right ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
+                {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
               </span>
+            </div>
+            
+            {/* Row 3: Opened time */}
+            {entryTimeDisplay && (
+              <div className="text-xs text-muted-foreground mb-2">
+                Opened: {entryTimeDisplay} EST {durationDisplay && <span>· {durationDisplay}</span>}
+              </div>
+            )}
+            
+            {/* Row 4: Stop */}
+            <div className="flex items-center text-sm">
+              <span className="text-muted-foreground mr-2">Stop:</span>
+              <span className="text-red-500 font-mono font-semibold">{formatPrice(signal.stop_loss)}</span>
+              <span className="text-red-500/70 text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
             </div>
           </div>
         </div>
         
         {/* Expanded View */}
         {isExpanded && (
-          <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-3 sm:space-y-4">
+          <div className="border-t border-border bg-muted/20 p-4 space-y-4">
             {/* Take Profit Levels */}
-            <div className="grid grid-cols-3 gap-2 sm:gap-4">
-              <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
+            <div className="grid grid-cols-3 gap-2 md:gap-3">
+              <div className="bg-background rounded-lg p-2 md:p-3 text-center">
                 <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
                 <div className="font-mono font-semibold text-green-400 text-sm">{formatPrice(signal.take_profit_1)}</div>
               </div>
-              <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
+              <div className="bg-background rounded-lg p-2 md:p-3 text-center">
                 <div className="text-green-500 text-xs mb-1">TP2 (2:1)</div>
                 <div className="font-mono font-semibold text-green-500 text-sm">{formatPrice(signal.take_profit_2)}</div>
               </div>
-              <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
+              <div className="bg-background rounded-lg p-2 md:p-3 text-center">
                 <div className="text-green-600 text-xs mb-1">TP3 (3:1)</div>
                 <div className="font-mono font-semibold text-green-600 text-sm">{formatPrice(signal.take_profit_3)}</div>
               </div>
@@ -1503,10 +1523,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                     const traderPnl = traderEntry && currentPrice 
                       ? formatTraderEntry(traderEntry, currentPrice, signal.direction)
                       : null;
-                    
-                    const entryTime = trader.opened_at 
-                      ? formatDateEST(trader.opened_at)
-                      : null;
+                    const entryTime = trader.opened_at ? formatDateEST(trader.opened_at) : null;
                     
                     return (
                       <a
@@ -1514,9 +1531,9 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                         href={getTraderUrl(trader.address)}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="block p-2.5 bg-background rounded-lg hover:bg-muted/50 transition-colors"
+                        className="block p-3 bg-background rounded-lg hover:bg-muted/50 transition-colors"
                       >
-                        {/* Row 1: Tier badge, address, stats */}
+                        {/* Trader header */}
                         <div className="flex items-center justify-between mb-1.5">
                           <div className="flex items-center gap-2">
                             <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
@@ -1529,7 +1546,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                             </span>
                             <ExternalLink className="h-3 w-3 text-muted-foreground" />
                           </div>
-                          <div className="flex items-center gap-2 text-xs">
+                          <div className="flex items-center gap-3 text-xs">
                             <span className={`font-mono font-medium ${(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
                               {formatPnl(trader.pnl_7d || 0)}
                             </span>
@@ -1538,23 +1555,18 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                             </span>
                           </div>
                         </div>
-                        {/* Row 2: Entry price, P&L, time - all horizontal */}
+                        {/* Trader entry details */}
                         <div className="flex items-center justify-between text-xs text-muted-foreground">
                           <div className="flex items-center gap-2">
-                            {traderEntry > 0 && (
-                              <>
-                                <span>Entry: <span className="font-mono text-foreground font-medium">{formatPrice(traderEntry)}</span></span>
-                                {traderPnl && (
-                                  <span className={`font-mono font-semibold ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                                    {traderPnl.display}
-                                  </span>
-                                )}
-                              </>
+                            <span>Entry:</span>
+                            <span className="font-mono text-foreground font-medium">{formatPrice(traderEntry)}</span>
+                            {traderPnl && (
+                              <span className={`font-mono font-medium ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                                {traderPnl.display}
+                              </span>
                             )}
                           </div>
-                          {entryTime && (
-                            <span className="text-xs">{entryTime}</span>
-                          )}
+                          {entryTime && <span>{entryTime}</span>}
                         </div>
                       </a>
                     );
@@ -1673,20 +1685,35 @@ export default function SignalsPage() {
     fetchSignalStats();
   };
 
-  const filteredSignals = signals.filter((s) => {
-    // Direction/strength filter
-    if (filter === 'strong' && s.signal_strength !== 'strong') return false;
-    if (filter === 'long' && s.direction !== 'long') return false;
-    if (filter === 'short' && s.direction !== 'short') return false;
+  // Helper to get most recent trader entry time
+  const getMostRecentEntryTime = (signal: QualitySignal): number => {
+    const traders = Array.isArray(signal.traders) ? signal.traders : [];
+    const openedDates = traders
+      .map(t => t.opened_at)
+      .filter((d): d is string => d !== null && d !== undefined);
     
-    // Elite Entry filter
-    if (eliteOnly && s.signal_tier !== 'elite_entry') return false;
+    if (openedDates.length === 0) return new Date(signal.created_at).getTime();
     
-    // Single trader filter
-    if (singleTrader && (s.total_traders || 0) > 1) return false;
-    
-    return true;
-  });
+    return Math.max(...openedDates.map(d => new Date(d).getTime()));
+  };
+
+  const filteredSignals = signals
+    .filter((s) => {
+      // Direction/strength filter
+      if (filter === 'strong' && s.signal_strength !== 'strong') return false;
+      if (filter === 'long' && s.direction !== 'long') return false;
+      if (filter === 'short' && s.direction !== 'short') return false;
+      
+      // Elite Entry filter
+      if (eliteOnly && s.signal_tier !== 'elite_entry') return false;
+      
+      // Single trader filter
+      if (singleTrader && (s.total_traders || 0) > 1) return false;
+      
+      return true;
+    })
+    // Sort by most recent trader entry time (newest position at top)
+    .sort((a, b) => getMostRecentEntryTime(b) - getMostRecentEntryTime(a));
 
   if (!mounted) {
     return (

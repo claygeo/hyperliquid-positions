@@ -954,7 +954,7 @@ function SignalPerformanceSummary({
   return (
     <button
       onClick={onClick}
-      className="w-full flex items-center justify-center gap-2 sm:gap-4 text-sm sm:text-base bg-muted/40 hover:bg-muted/60 rounded-lg px-4 py-3 mb-4 sm:mb-6 transition-colors border border-border/50"
+      className="w-full flex items-baseline gap-2 sm:gap-3 text-sm bg-muted/40 hover:bg-muted/60 rounded-lg px-4 py-3 mb-4 sm:mb-6 transition-colors border border-border/50"
     >
       <span className="text-muted-foreground">Track Record:</span>
       <span className="font-bold font-mono">{stats.total}</span>
@@ -970,7 +970,7 @@ function SignalPerformanceSummary({
         {stats.win_rate.toFixed(0)}%
       </span>
       <span className="text-muted-foreground">WR</span>
-      <ChevronDown className="h-4 w-4 text-muted-foreground ml-1" />
+      <ChevronDown className="h-4 w-4 text-muted-foreground ml-auto self-center" />
     </button>
   );
 }

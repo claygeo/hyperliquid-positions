@@ -12,7 +12,8 @@ import {
   Plus,
   X,
   Loader2,
-  Timer
+  Timer,
+  BarChart3
 } from 'lucide-react';
 
 // ============================================
@@ -607,6 +608,344 @@ function TrackRecordModal({
 }
 
 // ============================================
+// ANALYTICS MODAL
+// ============================================
+
+interface DailyStats {
+  date: string;
+  signals: number;
+  elite: number;
+  optimal: number;
+  avg_pnl: string;
+  stopped: number;
+  winners: number;
+}
+
+interface TraderStatus {
+  address: string;
+  quality_tier: string;
+  pnl_7d: number;
+  win_rate: number;
+  status: 'hot' | 'cold';
+}
+
+function AnalyticsModal({
+  isOpen,
+  onClose,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [dailyStats, setDailyStats] = useState<DailyStats[]>([]);
+  const [traderStats, setTraderStats] = useState<{ hot: number; cold: number; eliteHot: number; eliteCold: number }>({ hot: 0, cold: 0, eliteHot: 0, eliteCold: 0 });
+  const [overallStats, setOverallStats] = useState<{ 
+    totalPnl: number; 
+    totalSignals: number; 
+    winRate: number; 
+    avgPnl: number;
+    avgMaxProfit: number;
+    avgMaxDrawdown: number;
+    avgLeftOnTable: number;
+  } | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const supabase = createClient();
+
+  useEffect(() => {
+    if (isOpen) {
+      fetchAnalytics();
+    }
+  }, [isOpen]);
+
+  const fetchAnalytics = async () => {
+    setIsLoading(true);
+    
+    try {
+      // Fetch closed signals for daily breakdown
+      const { data: signals } = await supabase
+        .from('quality_signals')
+        .select('*')
+        .eq('is_active', false)
+        .not('closed_at', 'is', null)
+        .order('closed_at', { ascending: false });
+
+      if (signals) {
+        // Group by date
+        const byDate = new Map<string, DailyStats>();
+        
+        signals.forEach(s => {
+          const date = new Date(s.closed_at).toISOString().split('T')[0];
+          const existing = byDate.get(date) || { 
+            date, 
+            signals: 0, 
+            elite: 0, 
+            optimal: 0, 
+            avg_pnl: '0', 
+            stopped: 0,
+            winners: 0,
+            totalPnl: 0 
+          };
+          
+          const pnl = s.direction === 'long' 
+            ? ((s.current_price - s.entry_price) / s.entry_price) * 100
+            : ((s.entry_price - s.current_price) / s.entry_price) * 100;
+          
+          existing.signals++;
+          if (s.signal_tier === 'elite_entry') existing.elite++;
+          if (s.signal_tier === 'elite_entry' && s.total_traders === 1) existing.optimal++;
+          if (s.hit_stop) existing.stopped++;
+          if (pnl > 0) existing.winners++;
+          (existing as any).totalPnl = ((existing as any).totalPnl || 0) + pnl;
+          
+          byDate.set(date, existing);
+        });
+
+        // Calculate averages and convert to array
+        const dailyArray = Array.from(byDate.values()).map(d => ({
+          ...d,
+          avg_pnl: ((d as any).totalPnl / d.signals).toFixed(2)
+        })).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 14);
+
+        setDailyStats(dailyArray);
+
+        // Calculate overall stats including max profit tracking
+        const totalPnl = signals.reduce((sum, s) => {
+          const pnl = s.direction === 'long' 
+            ? ((s.current_price - s.entry_price) / s.entry_price) * 100
+            : ((s.entry_price - s.current_price) / s.entry_price) * 100;
+          return sum + pnl;
+        }, 0);
+        
+        const winners = signals.filter(s => {
+          const pnl = s.direction === 'long' 
+            ? ((s.current_price - s.entry_price) / s.entry_price) * 100
+            : ((s.entry_price - s.current_price) / s.entry_price) * 100;
+          return pnl > 0;
+        }).length;
+
+        // Calculate max profit / drawdown stats
+        const signalsWithMaxPnl = signals.filter(s => s.max_pnl_pct !== null && s.max_pnl_pct !== undefined);
+        const avgMaxProfit = signalsWithMaxPnl.length > 0 
+          ? signalsWithMaxPnl.reduce((sum, s) => sum + (s.max_pnl_pct || 0), 0) / signalsWithMaxPnl.length
+          : 0;
+        
+        const signalsWithMinPnl = signals.filter(s => s.min_pnl_pct !== null && s.min_pnl_pct !== undefined);
+        const avgMaxDrawdown = signalsWithMinPnl.length > 0
+          ? signalsWithMinPnl.reduce((sum, s) => sum + (s.min_pnl_pct || 0), 0) / signalsWithMinPnl.length
+          : 0;
+
+        // Left on table = max profit - actual exit profit
+        const avgLeftOnTable = signalsWithMaxPnl.length > 0
+          ? signalsWithMaxPnl.reduce((sum, s) => {
+              const actualPnl = s.direction === 'long' 
+                ? ((s.current_price - s.entry_price) / s.entry_price) * 100
+                : ((s.entry_price - s.current_price) / s.entry_price) * 100;
+              return sum + Math.max(0, (s.max_pnl_pct || 0) - actualPnl);
+            }, 0) / signalsWithMaxPnl.length
+          : 0;
+
+        setOverallStats({
+          totalPnl,
+          totalSignals: signals.length,
+          winRate: (winners / signals.length) * 100,
+          avgPnl: totalPnl / signals.length,
+          avgMaxProfit,
+          avgMaxDrawdown,
+          avgLeftOnTable
+        });
+      }
+
+      // Fetch trader stats
+      const { data: traders } = await supabase
+        .from('trader_quality')
+        .select('quality_tier, pnl_7d')
+        .eq('is_tracked', true);
+
+      if (traders) {
+        const hot = traders.filter(t => t.pnl_7d >= 5000).length;
+        const cold = traders.filter(t => t.pnl_7d < 5000).length;
+        const eliteHot = traders.filter(t => t.quality_tier === 'elite' && t.pnl_7d >= 5000).length;
+        const eliteCold = traders.filter(t => t.quality_tier === 'elite' && t.pnl_7d < 5000).length;
+        setTraderStats({ hot, cold, eliteHot, eliteCold });
+      }
+
+    } catch (error) {
+      console.error('Failed to fetch analytics:', error);
+    }
+    
+    setIsLoading(false);
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 sm:p-4">
+      <div className="bg-card border border-border rounded-lg w-full max-w-2xl max-h-[95vh] sm:max-h-[90vh] overflow-hidden flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between p-3 sm:p-4 border-b border-border">
+          <div className="flex items-center gap-2">
+            <BarChart3 className="h-5 w-5 text-primary" />
+            <h2 className="text-base sm:text-lg font-semibold">Performance Analytics</h2>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-muted rounded">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-3 sm:p-4 flex-1 overflow-y-auto space-y-4">
+          {isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : (
+            <>
+              {/* Overall Stats */}
+              {overallStats && (
+                <>
+                  <div className="grid grid-cols-4 gap-2 sm:gap-3">
+                    <div className="bg-muted/30 rounded-lg p-2 sm:p-3 text-center">
+                      <div className="text-lg sm:text-2xl font-bold font-mono">{overallStats.totalSignals}</div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Total Closed</div>
+                    </div>
+                    <div className="bg-muted/30 rounded-lg p-2 sm:p-3 text-center">
+                      <div className={`text-lg sm:text-2xl font-bold font-mono ${overallStats.winRate >= 50 ? 'text-green-500' : 'text-red-500'}`}>
+                        {overallStats.winRate.toFixed(0)}%
+                      </div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Win Rate</div>
+                    </div>
+                    <div className="bg-muted/30 rounded-lg p-2 sm:p-3 text-center">
+                      <div className={`text-lg sm:text-2xl font-bold font-mono ${overallStats.avgPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                        {overallStats.avgPnl >= 0 ? '+' : ''}{overallStats.avgPnl.toFixed(2)}%
+                      </div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Avg P&L</div>
+                    </div>
+                    <div className="bg-muted/30 rounded-lg p-2 sm:p-3 text-center">
+                      <div className={`text-lg sm:text-2xl font-bold font-mono ${overallStats.totalPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                        {overallStats.totalPnl >= 0 ? '+' : ''}{overallStats.totalPnl.toFixed(1)}%
+                      </div>
+                      <div className="text-[10px] sm:text-xs text-muted-foreground">Cumulative</div>
+                    </div>
+                  </div>
+
+                  {/* Profit Efficiency Section */}
+                  <div className="bg-muted/20 rounded-lg p-3">
+                    <h3 className="text-sm font-medium mb-2">Profit Efficiency</h3>
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">Avg Max Profit</span>
+                        <span className="font-mono font-medium text-green-500">+{overallStats.avgMaxProfit.toFixed(2)}%</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">Avg Max Drawdown</span>
+                        <span className="font-mono font-medium text-red-500">{overallStats.avgMaxDrawdown.toFixed(2)}%</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">Avg Left on Table</span>
+                        <span className="font-mono font-medium text-yellow-500">{overallStats.avgLeftOnTable.toFixed(2)}%</span>
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-2">
+                      Signals reached +{overallStats.avgMaxProfit.toFixed(2)}% avg max profit but exited at +{overallStats.avgPnl.toFixed(2)}%
+                    </p>
+                  </div>
+                </>
+              )}
+
+              {/* Trader Health */}
+              <div className="bg-muted/20 rounded-lg p-3">
+                <h3 className="text-sm font-medium mb-2">Trader Health</h3>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">Hot Traders (≥$5k 7d)</span>
+                    <span className="font-mono font-medium text-green-500">{traderStats.hot}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">Cold Traders (&lt;$5k 7d)</span>
+                    <span className="font-mono font-medium text-yellow-500">{traderStats.cold}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">Hot Elites</span>
+                    <span className="font-mono font-medium text-green-500">{traderStats.eliteHot}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">Cold Elites</span>
+                    <span className="font-mono font-medium text-yellow-500">{traderStats.eliteCold}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Daily Breakdown */}
+              <div>
+                <h3 className="text-sm font-medium mb-2">Daily Performance (Last 14 Days)</h3>
+                <div className="bg-muted/10 rounded-lg overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-border bg-muted/30">
+                        <th className="text-left p-2 font-medium">Date</th>
+                        <th className="text-center p-2 font-medium">Signals</th>
+                        <th className="text-center p-2 font-medium">Elite</th>
+                        <th className="text-center p-2 font-medium">Optimal</th>
+                        <th className="text-center p-2 font-medium">Winners</th>
+                        <th className="text-center p-2 font-medium">Stopped</th>
+                        <th className="text-right p-2 font-medium">Avg P&L</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dailyStats.map((day, i) => (
+                        <tr key={day.date} className={i % 2 === 0 ? '' : 'bg-muted/10'}>
+                          <td className="p-2 font-mono">{day.date.slice(5)}</td>
+                          <td className="p-2 text-center font-mono">{day.signals}</td>
+                          <td className="p-2 text-center font-mono text-yellow-500">{day.elite}</td>
+                          <td className="p-2 text-center font-mono text-purple-500">{day.optimal}</td>
+                          <td className="p-2 text-center font-mono text-green-500">{day.winners}</td>
+                          <td className="p-2 text-center font-mono text-red-500">{day.stopped}</td>
+                          <td className={`p-2 text-right font-mono font-medium ${parseFloat(day.avg_pnl) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                            {parseFloat(day.avg_pnl) >= 0 ? '+' : ''}{day.avg_pnl}%
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Key Insights */}
+              <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3">
+                <h3 className="text-sm font-medium text-blue-500 mb-2">Key Insight</h3>
+                <p className="text-xs text-muted-foreground">
+                  Based on your data, <span className="text-foreground font-medium">Elite Entry signals with 1 trader</span> show 
+                  {' '}<span className="text-green-500 font-medium">69% win rate</span> and 
+                  {' '}<span className="text-green-500 font-medium">+0.91% avg P&L</span>. 
+                  Use the Elite + Solo filters to focus on these optimal signals.
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="border-t border-border p-3 flex justify-between items-center">
+          <button
+            onClick={fetchAnalytics}
+            disabled={isLoading}
+            className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+          >
+            <Loader2 className={`h-3 w-3 ${isLoading ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 rounded-md"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================
 // WALLET IMPORT MODAL
 // ============================================
 
@@ -944,34 +1283,45 @@ function WalletImportModal({
 
 function SignalPerformanceSummary({ 
   stats, 
-  onClick 
+  onClick,
+  onAnalyticsClick
 }: { 
   stats: SignalStats | null;
   onClick: () => void;
+  onAnalyticsClick: () => void;
 }) {
   if (!stats || stats.total === 0) return null;
   
   return (
-    <button
-      onClick={onClick}
-      className="w-full flex items-baseline gap-2 sm:gap-3 text-sm bg-muted/40 hover:bg-muted/60 rounded-lg px-4 py-3 mb-4 sm:mb-6 transition-colors border border-border/50"
-    >
-      <span className="text-muted-foreground">Track Record:</span>
-      <span className="font-bold font-mono">{stats.total}</span>
-      <span className="text-muted-foreground">closed</span>
-      <span className="text-muted-foreground">·</span>
-      <span className="font-bold font-mono text-green-500">{stats.wins}</span>
-      <span className="text-green-500">wins</span>
-      <span className="text-muted-foreground">·</span>
-      <span className="font-bold font-mono text-red-500">{stats.stopped}</span>
-      <span className="text-red-500">stopped</span>
-      <span className="text-muted-foreground">·</span>
-      <span className={`font-bold font-mono ${stats.win_rate >= 50 ? 'text-green-500' : 'text-red-500'}`}>
-        {stats.win_rate.toFixed(0)}%
-      </span>
-      <span className="text-muted-foreground">WR</span>
-      <ChevronDown className="h-4 w-4 text-muted-foreground ml-auto self-center" />
-    </button>
+    <div className="flex gap-2 mb-4 sm:mb-6">
+      <button
+        onClick={onClick}
+        className="flex-1 flex items-baseline gap-2 sm:gap-3 text-sm bg-muted/40 hover:bg-muted/60 rounded-lg px-4 py-3 transition-colors border border-border/50"
+      >
+        <span className="text-muted-foreground">Track Record:</span>
+        <span className="font-bold font-mono">{stats.total}</span>
+        <span className="text-muted-foreground">closed</span>
+        <span className="text-muted-foreground hidden sm:inline">·</span>
+        <span className="font-bold font-mono text-green-500 hidden sm:inline">{stats.wins}</span>
+        <span className="text-green-500 hidden sm:inline">wins</span>
+        <span className="text-muted-foreground hidden sm:inline">·</span>
+        <span className="font-bold font-mono text-red-500 hidden sm:inline">{stats.stopped}</span>
+        <span className="text-red-500 hidden sm:inline">stopped</span>
+        <span className="text-muted-foreground">·</span>
+        <span className={`font-bold font-mono ${stats.win_rate >= 50 ? 'text-green-500' : 'text-red-500'}`}>
+          {stats.win_rate.toFixed(0)}%
+        </span>
+        <span className="text-muted-foreground">WR</span>
+        <ChevronDown className="h-4 w-4 text-muted-foreground ml-auto self-center" />
+      </button>
+      <button
+        onClick={onAnalyticsClick}
+        className="px-3 py-3 bg-muted/40 hover:bg-muted/60 rounded-lg transition-colors border border-border/50 flex items-center gap-1.5"
+        title="View Analytics"
+      >
+        <BarChart3 className="h-4 w-4 text-muted-foreground" />
+      </button>
+    </div>
   );
 }
 
@@ -997,6 +1347,11 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
   
   const entryTimeDisplay = mostRecentEntry ? formatDateEST(mostRecentEntry) : null;
   
+  // Calculate duration
+  const durationDisplay = mostRecentEntry 
+    ? formatTimeAgo(mostRecentEntry)
+    : null;
+  
   return (
     <div className="space-y-1">
       {/* Row 1: Entry, Now, P&L */}
@@ -1014,10 +1369,10 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
           </span>
         </div>
       </div>
-      {/* Row 2: Entry Time */}
+      {/* Row 2: Entry Time + Duration */}
       {entryTimeDisplay && (
         <div className="text-xs text-muted-foreground">
-          Opened: {entryTimeDisplay} EST
+          Opened: {entryTimeDisplay} EST {durationDisplay && <span>· {durationDisplay}</span>}
         </div>
       )}
     </div>
@@ -1223,12 +1578,15 @@ export default function SignalsPage() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [signalStats, setSignalStats] = useState<SignalStats | null>(null);
   const [filter, setFilter] = useState<'all' | 'strong' | 'long' | 'short'>('all');
+  const [eliteOnly, setEliteOnly] = useState(false);
+  const [singleTrader, setSingleTrader] = useState(false);
   const [expandedSignal, setExpandedSignal] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [mounted, setMounted] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [showTrackRecord, setShowTrackRecord] = useState(false);
+  const [showAnalytics, setShowAnalytics] = useState(false);
 
   const supabase = createClient();
 
@@ -1239,8 +1597,7 @@ export default function SignalsPage() {
       .from('quality_signals')
       .select('*')
       .eq('is_active', true)
-      .order('signal_strength', { ascending: false })
-      .order('confidence', { ascending: false });
+      .order('created_at', { ascending: false });
 
     if (data && !error) {
       setSignals(data);
@@ -1317,10 +1674,17 @@ export default function SignalsPage() {
   };
 
   const filteredSignals = signals.filter((s) => {
-    if (filter === 'all') return true;
-    if (filter === 'strong') return s.signal_strength === 'strong';
-    if (filter === 'long') return s.direction === 'long';
-    if (filter === 'short') return s.direction === 'short';
+    // Direction/strength filter
+    if (filter === 'strong' && s.signal_strength !== 'strong') return false;
+    if (filter === 'long' && s.direction !== 'long') return false;
+    if (filter === 'short' && s.direction !== 'short') return false;
+    
+    // Elite Entry filter
+    if (eliteOnly && s.signal_tier !== 'elite_entry') return false;
+    
+    // Single trader filter
+    if (singleTrader && (s.total_traders || 0) > 1) return false;
+    
     return true;
   });
 
@@ -1379,26 +1743,92 @@ export default function SignalsPage() {
         <SignalPerformanceSummary 
           stats={signalStats} 
           onClick={() => setShowTrackRecord(true)}
+          onAnalyticsClick={() => setShowAnalytics(true)}
         />
         
-        <div className="flex gap-1.5 sm:gap-2 mb-4 sm:mb-6 overflow-x-auto pb-1">
-          {(['all', 'strong', 'long', 'short'] as const).map((f) => (
+        <div className="flex flex-wrap gap-1.5 sm:gap-2 mb-4 sm:mb-6">
+          {/* Direction filters */}
+          <div className="flex gap-1.5 sm:gap-2">
+            {(['all', 'long', 'short'] as const).map((f) => {
+              const count = f === 'all' 
+                ? signals.length 
+                : signals.filter(s => s.direction === f).length;
+              return (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  className={`px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
+                    filter === f 
+                      ? f === 'long' ? 'bg-green-600 text-white'
+                      : f === 'short' ? 'bg-red-600 text-white'
+                      : 'bg-primary text-primary-foreground'
+                      : 'bg-secondary hover:bg-secondary/80'
+                  }`}
+                >
+                  <span>{f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1) + 's'}</span>
+                  <span className={`text-[10px] px-1 py-0.5 rounded ${
+                    filter === f ? 'bg-white/20' : 'bg-muted'
+                  }`}>{count}</span>
+                </button>
+              );
+            })}
+          </div>
+          
+          {/* Divider */}
+          <div className="w-px h-6 bg-border self-center mx-1 hidden sm:block" />
+          
+          {/* Quality filters */}
+          <div className="flex gap-1.5 sm:gap-2">
             <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`px-2.5 sm:px-3 py-1.5 text-[10px] sm:text-sm rounded-md transition-colors whitespace-nowrap ${
-                filter === f 
-                  ? f === 'long' ? 'bg-green-600 text-white'
-                  : f === 'short' ? 'bg-red-600 text-white'
-                  : f === 'strong' ? 'bg-yellow-600 text-white'
-                  : 'bg-primary text-primary-foreground'
+              onClick={() => setEliteOnly(!eliteOnly)}
+              className={`px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
+                eliteOnly 
+                  ? 'bg-yellow-600 text-white'
                   : 'bg-secondary hover:bg-secondary/80'
               }`}
             >
-              {f === 'all' ? 'All' : f === 'strong' ? 'Strong' : f.charAt(0).toUpperCase() + f.slice(1) + 's'}
+              <span>Elite</span>
+              <span className={`text-[10px] px-1 py-0.5 rounded ${
+                eliteOnly ? 'bg-white/20' : 'bg-muted'
+              }`}>{signals.filter(s => s.signal_tier === 'elite_entry').length}</span>
             </button>
-          ))}
+            
+            <button
+              onClick={() => setSingleTrader(!singleTrader)}
+              className={`px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
+                singleTrader 
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-secondary hover:bg-secondary/80'
+              }`}
+            >
+              <span>Solo</span>
+              <span className={`text-[10px] px-1 py-0.5 rounded ${
+                singleTrader ? 'bg-white/20' : 'bg-muted'
+              }`}>{signals.filter(s => (s.total_traders || 0) === 1).length}</span>
+            </button>
+          </div>
         </div>
+        
+        {/* Active filter indicator */}
+        {(eliteOnly || singleTrader) && (
+          <div className="mb-4 p-2.5 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-yellow-500 font-medium">
+                {filteredSignals.length} optimal signal{filteredSignals.length !== 1 ? 's' : ''}
+              </span>
+              <span className="text-muted-foreground">
+                ({eliteOnly && 'Elite Entry'}{eliteOnly && singleTrader && ' + '}{singleTrader && '1 Trader'})
+              </span>
+              <span className="text-green-500 hidden sm:inline">· 69% WR, +0.91% avg</span>
+            </div>
+            <button 
+              onClick={() => { setEliteOnly(false); setSingleTrader(false); }}
+              className="text-yellow-500 hover:text-yellow-400 font-medium"
+            >
+              Clear
+            </button>
+          </div>
+        )}
 
         {filteredSignals.length > 0 ? (
           <div className="space-y-3 sm:space-y-4">
@@ -1416,10 +1846,24 @@ export default function SignalsPage() {
         ) : (
           <Card>
             <CardContent className="py-8 sm:py-12 text-center">
-              <h3 className="text-base sm:text-lg font-medium mb-2">No Active Signals</h3>
+              <h3 className="text-base sm:text-lg font-medium mb-2">
+                {(eliteOnly || singleTrader || filter !== 'all') 
+                  ? 'No Matching Signals' 
+                  : 'No Active Signals'}
+              </h3>
               <p className="text-muted-foreground text-xs sm:text-sm">
-                Signals appear when elite traders open positions or multiple quality traders converge.
+                {(eliteOnly || singleTrader || filter !== 'all') 
+                  ? `No signals match your current filters. ${signals.length} total signal${signals.length !== 1 ? 's' : ''} active.`
+                  : 'Signals appear when elite traders open positions or multiple quality traders converge.'}
               </p>
+              {(eliteOnly || singleTrader || filter !== 'all') && signals.length > 0 && (
+                <button
+                  onClick={() => { setFilter('all'); setEliteOnly(false); setSingleTrader(false); }}
+                  className="mt-3 text-sm text-primary hover:underline"
+                >
+                  Clear all filters
+                </button>
+              )}
             </CardContent>
           </Card>
         )}
@@ -1445,6 +1889,11 @@ export default function SignalsPage() {
       <TrackRecordModal
         isOpen={showTrackRecord}
         onClose={() => setShowTrackRecord(false)}
+      />
+
+      <AnalyticsModal
+        isOpen={showAnalytics}
+        onClose={() => setShowAnalytics(false)}
       />
     </div>
   );

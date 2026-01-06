@@ -995,25 +995,31 @@ function PriceDisplay({ signal }: { signal: QualitySignal }) {
     ? openedDates.reduce((latest, d) => new Date(d) > new Date(latest) ? d : latest)
     : null;
   
-  const entryTimeDisplay = mostRecentEntry ? formatTimeWithEST(mostRecentEntry) : null;
+  const entryTimeDisplay = mostRecentEntry ? formatDateEST(mostRecentEntry) : null;
   
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center gap-0.5 sm:gap-4 text-xs sm:text-sm">
-      <div className="flex items-center gap-1.5 sm:gap-2">
-        <span className="text-muted-foreground">Entry</span>
-        <span className="font-mono font-medium">{formatPrice(entry)}</span>
-        {entryTimeDisplay && (
-          <span className="text-muted-foreground text-[10px] sm:text-xs hidden sm:inline">({entryTimeDisplay})</span>
-        )}
+    <div className="space-y-1">
+      {/* Row 1: Entry, Now, P&L */}
+      <div className="flex items-baseline gap-3 sm:gap-4 text-sm">
+        <div className="flex items-baseline gap-1.5">
+          <span className="text-muted-foreground">Entry</span>
+          <span className="font-mono font-semibold">{formatPrice(entry)}</span>
+        </div>
+        <span className="text-muted-foreground">→</span>
+        <div className="flex items-baseline gap-1.5">
+          <span className="text-muted-foreground">Now</span>
+          <span className="font-mono font-semibold">{formatPrice(current)}</span>
+          <span className={`font-mono font-bold text-base ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
+            {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+          </span>
+        </div>
       </div>
-      <span className="text-muted-foreground hidden sm:inline">→</span>
-      <div className="flex items-center gap-1.5 sm:gap-2">
-        <span className="text-muted-foreground">Now</span>
-        <span className="font-mono font-medium">{formatPrice(current)}</span>
-        <span className={`font-mono font-medium ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
-          ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%)
-        </span>
-      </div>
+      {/* Row 2: Entry Time */}
+      {entryTimeDisplay && (
+        <div className="text-xs text-muted-foreground">
+          Opened: {entryTimeDisplay} EST
+        </div>
+      )}
     </div>
   );
 }
@@ -1029,14 +1035,14 @@ function SignalTierBadge({ signal }: { signal: QualitySignal }) {
   
   if (tier === 'elite_entry') {
     return (
-      <span className="text-[10px] sm:text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
+      <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
         Elite
       </span>
     );
   }
   
   return (
-    <span className="text-[10px] sm:text-xs text-muted-foreground">
+    <span className="text-xs text-muted-foreground">
       {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
       {eliteCount > 0 && goodCount > 0 && '+'}
       {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
@@ -1068,8 +1074,8 @@ function SignalCard({ signal, isExpanded, onToggle }: {
           <div className="flex items-start sm:items-center justify-between mb-2 sm:mb-3 gap-2">
             <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
               <div className="flex items-center gap-1.5 sm:gap-2">
-                <span className="text-base sm:text-xl font-bold">{signal.coin}</span>
-                <span className={`text-[10px] sm:text-xs font-bold px-1.5 sm:px-2 py-0.5 rounded ${
+                <span className="text-lg sm:text-xl font-bold">{signal.coin}</span>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded ${
                   isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
                 }`}>
                   {signal.direction.toUpperCase()}
@@ -1079,7 +1085,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
               <SignalTierBadge signal={signal} />
               
               {signal.funding_context === 'favorable' && (
-                <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
+                <span className="text-xs px-1.5 sm:px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
                   <Zap className="h-3 w-3" />
                   <span className="hidden sm:inline">Funding pays you</span>
                 </span>
@@ -1087,26 +1093,26 @@ function SignalCard({ signal, isExpanded, onToggle }: {
             </div>
             
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-              <span className="text-[10px] sm:text-xs text-muted-foreground flex items-center gap-1">
+              <span className="text-xs text-muted-foreground flex items-center gap-1">
                 <Clock className="h-3 w-3" />
                 <span>{formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}</span>
               </span>
               {isExpanded ? (
-                <ChevronUp className="h-4 sm:h-5 w-4 sm:w-5 text-muted-foreground" />
+                <ChevronUp className="h-5 w-5 text-muted-foreground" />
               ) : (
-                <ChevronDown className="h-4 sm:h-5 w-4 sm:w-5 text-muted-foreground" />
+                <ChevronDown className="h-5 w-5 text-muted-foreground" />
               )}
             </div>
           </div>
           
-          {/* Price + Stop */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-2">
+          {/* Price Display + Stop */}
+          <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2">
             <PriceDisplay signal={signal} />
-            <div className="text-xs sm:text-sm">
+            <div className="text-sm">
               <span className="text-muted-foreground">Stop: </span>
-              <span className="text-red-500 font-mono">
+              <span className="text-red-500 font-mono font-semibold">
                 {formatPrice(signal.stop_loss)} 
-                <span className="text-[10px] sm:text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
+                <span className="text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
               </span>
             </div>
           </div>
@@ -1116,25 +1122,25 @@ function SignalCard({ signal, isExpanded, onToggle }: {
         {isExpanded && (
           <div className="border-t border-border bg-muted/20 p-3 sm:p-4 space-y-3 sm:space-y-4">
             {/* Take Profit Levels */}
-            <div className="grid grid-cols-3 gap-2 sm:gap-4 text-xs sm:text-sm">
+            <div className="grid grid-cols-3 gap-2 sm:gap-4">
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
-                <div className="text-green-400 text-[10px] sm:text-xs mb-1">TP1 (1:1)</div>
-                <div className="font-mono font-medium text-green-400 text-xs sm:text-sm">{formatPrice(signal.take_profit_1)}</div>
+                <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
+                <div className="font-mono font-semibold text-green-400 text-sm">{formatPrice(signal.take_profit_1)}</div>
               </div>
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
-                <div className="text-green-500 text-[10px] sm:text-xs mb-1">TP2 (2:1)</div>
-                <div className="font-mono font-medium text-green-500 text-xs sm:text-sm">{formatPrice(signal.take_profit_2)}</div>
+                <div className="text-green-500 text-xs mb-1">TP2 (2:1)</div>
+                <div className="font-mono font-semibold text-green-500 text-sm">{formatPrice(signal.take_profit_2)}</div>
               </div>
               <div className="bg-background rounded-lg p-2 sm:p-3 text-center">
-                <div className="text-green-600 text-[10px] sm:text-xs mb-1">TP3 (3:1)</div>
-                <div className="font-mono font-medium text-green-600 text-xs sm:text-sm">{formatPrice(signal.take_profit_3)}</div>
+                <div className="text-green-600 text-xs mb-1">TP3 (3:1)</div>
+                <div className="font-mono font-semibold text-green-600 text-sm">{formatPrice(signal.take_profit_3)}</div>
               </div>
             </div>
             
             {/* Traders List */}
             {traders.length > 0 && (
               <div>
-                <div className="text-[10px] sm:text-xs text-muted-foreground mb-2">Traders ({traders.length})</div>
+                <div className="text-xs text-muted-foreground mb-2">Traders ({traders.length})</div>
                 <div className="space-y-2">
                   {traders.map((trader) => {
                     const traderEntry = trader.entry_price || 0;
@@ -1144,7 +1150,7 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                       : null;
                     
                     const entryTime = trader.opened_at 
-                      ? formatTimeWithEST(trader.opened_at)
+                      ? formatDateEST(trader.opened_at)
                       : null;
                     
                     return (
@@ -1153,22 +1159,23 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                         href={getTraderUrl(trader.address)}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="block p-2 bg-background rounded-lg hover:bg-muted/50 transition-colors"
+                        className="block p-2.5 bg-background rounded-lg hover:bg-muted/50 transition-colors"
                       >
-                        <div className="flex items-center justify-between mb-1">
-                          <div className="flex items-center gap-1.5 sm:gap-2">
-                            <span className={`text-[10px] sm:text-xs px-1 sm:px-1.5 py-0.5 rounded font-medium ${
+                        {/* Row 1: Tier badge, address, stats */}
+                        <div className="flex items-center justify-between mb-1.5">
+                          <div className="flex items-center gap-2">
+                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
                               trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
                             }`}>
                               {trader.tier === 'elite' ? 'E' : 'G'}
                             </span>
-                            <span className="font-mono text-[10px] sm:text-xs text-muted-foreground">
+                            <span className="font-mono text-xs text-muted-foreground">
                               {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
                             </span>
                             <ExternalLink className="h-3 w-3 text-muted-foreground" />
                           </div>
-                          <div className="flex items-center gap-1.5 sm:gap-2 text-[10px] sm:text-xs">
-                            <span className={`font-mono ${(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className={`font-mono font-medium ${(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
                               {formatPnl(trader.pnl_7d || 0)}
                             </span>
                             <span className="text-muted-foreground">
@@ -1176,22 +1183,22 @@ function SignalCard({ signal, isExpanded, onToggle }: {
                             </span>
                           </div>
                         </div>
-                        {/* Entry details row */}
-                        <div className="flex items-center justify-between text-[10px] sm:text-xs text-muted-foreground pl-1">
-                          <div className="flex items-center gap-1.5 sm:gap-2">
+                        {/* Row 2: Entry price, P&L, time - all horizontal */}
+                        <div className="flex items-center justify-between text-xs text-muted-foreground">
+                          <div className="flex items-center gap-2">
                             {traderEntry > 0 && (
                               <>
-                                <span>Entry: <span className="font-mono text-foreground">{formatPrice(traderEntry)}</span></span>
+                                <span>Entry: <span className="font-mono text-foreground font-medium">{formatPrice(traderEntry)}</span></span>
                                 {traderPnl && (
-                                  <span className={`font-mono ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                                    ({traderPnl.display})
+                                  <span className={`font-mono font-semibold ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                                    {traderPnl.display}
                                   </span>
                                 )}
                               </>
                             )}
                           </div>
                           {entryTime && (
-                            <span className="text-[10px] sm:text-xs hidden sm:inline">{entryTime}</span>
+                            <span className="text-xs">{entryTime}</span>
                           )}
                         </div>
                       </a>

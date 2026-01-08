@@ -1,5 +1,10 @@
-// Signal Generator V12.3
+// Signal Generator V12.4
 // 
+// V12.4 CHANGES (Create Missing Signals):
+// - Added createMissingSignals() to create signals for eligible positions without one
+// - Runs on startup and every 10 minutes alongside reconciliation
+// - Fixes the case where positions exist but no signal was ever created
+//
 // V12.3 CHANGES (Reconciliation Fix):
 // - Added reconcileActiveSignals() to sync signals with actual positions
 // - Runs on startup and every 10 minutes
@@ -12,22 +17,14 @@
 // - Trailing stop: activates at +0.5%, trails 0.5% behind peak
 // - Coin blacklist: GRASS, ZEC, SOL, ETH (negative historical expectancy)
 //
-// V12.1 CHANGES:
-// - Fresh position filtering - only include traders who opened within MAX_POSITION_AGE_HOURS
-// - Prevents signals from being created for stale positions opened days/weeks ago
-//
-// V12 CHANGES:
-// - Tracks per-trader exit data (exit_price, exited_at, exit_type)
-// - When a trader closes their position, we capture their exit price/time
-// - When signal closes, any remaining traders get exit data populated
-//
 // ARCHITECTURE:
-// - EVENT-DRIVEN: Only creates signals when we WITNESS a position open
+// - EVENT-DRIVEN: Creates signals when we WITNESS a position open
 // - VERIFIED: Every signal has entry_detected_at = when WE saw the open
 // - EXIT TRACKING: Each trader has exit_price, exited_at, exit_type
 // - FRESH ONLY: Filters out positions older than MAX_POSITION_AGE_HOURS
 // - SMART EXIT: Fixed TP, trailing stop, time-based exit
 // - RECONCILIATION: Periodic sync to catch missed events
+// - MISSING SIGNAL CREATION: Creates signals for eligible positions without one
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
@@ -42,27 +39,12 @@ const logger = createLogger('signal-generator-v12');
 // Configuration
 // ============================================
 
-// V12.1: Maximum age of a position to be included in signals (in hours)
-// Positions older than this are considered "stale" and won't trigger/join signals
 const MAX_POSITION_AGE_HOURS = 24;
-
-// V12.2: Exit Strategy Configuration (data-driven)
-// Based on analysis: 12-24h holds = +2.66% avg, 24h+ = -1.60% avg
-const MAX_SIGNAL_AGE_HOURS = 20;  // Close signals after 20 hours (before they turn negative)
-
-// Fixed take profit - data shows +2% TP = +23.26% vs +14.28% current
+const MAX_SIGNAL_AGE_HOURS = 20;
 const FIXED_TP_PCT = 2.0;
-
-// Trailing stop configuration
-// 75% of signals reach +0.5%, so activate trailing stop there
 const TRAILING_STOP_ACTIVATE_PCT = 0.5;
-const TRAILING_STOP_DISTANCE_PCT = 0.5;  // Trail 0.5% behind peak
-
-// Coin blacklist - these coins have negative expectancy
-// GRASS: -6.97%, ZEC: -6.44%, SOL: -0.59%, ETH: -2.63%
+const TRAILING_STOP_DISTANCE_PCT = 0.5;
 const COIN_BLACKLIST = ['GRASS', 'ZEC', 'SOL', 'ETH'];
-
-// V12.3: Reconciliation interval (every 10 minutes)
 const RECONCILIATION_INTERVAL_MS = 10 * 60 * 1000;
 
 // ============================================
@@ -150,9 +132,6 @@ function determineSignalTier(eliteCount: number, goodCount: number): SignalTier 
   if (eliteCount >= 2 || (eliteCount >= 1 && goodCount >= 1) || goodCount >= 3) {
     return 'confirmed';
   }
-  if (eliteCount >= 1) {
-    return 'elite_entry';
-  }
   return 'elite_entry';
 }
 
@@ -163,7 +142,7 @@ function shouldCreateSignal(eliteCount: number, goodCount: number): boolean {
 }
 
 // ============================================
-// V12.1: Position Age Filtering
+// Position Age Filtering
 // ============================================
 
 function isPositionFresh(openedAt: string | null | undefined): boolean {
@@ -260,11 +239,6 @@ async function getAllTradersInPosition(
 
   for (const pos of positions) {
     if (filterFresh && !isPositionFresh(pos.opened_at)) {
-      const ageHours = getPositionAgeHours(pos.opened_at);
-      logger.debug(
-        `Skipping stale position: ${pos.address.slice(0, 8)}... in ${coin} | ` +
-        `Opened ${ageHours.toFixed(1)}h ago (max: ${MAX_POSITION_AGE_HOURS}h)`
-      );
       staleCount++;
       continue;
     }
@@ -436,6 +410,147 @@ async function updateTraderExitInSignal(signal: ActiveSignal, traderAddress: str
 }
 
 // ============================================
+// V12.4: Create Missing Signals
+// ============================================
+
+async function createMissingSignals(): Promise<void> {
+  try {
+    logger.info('Checking for missing signals...');
+    
+    // Get all unique coin/direction combinations with fresh elite/good positions
+    const { data: eligiblePositions } = await db.client
+      .from('trader_positions')
+      .select('coin, direction')
+      .gte('opened_at', new Date(Date.now() - MAX_POSITION_AGE_HOURS * 60 * 60 * 1000).toISOString());
+    
+    if (!eligiblePositions || eligiblePositions.length === 0) {
+      logger.debug('No fresh positions found');
+      return;
+    }
+    
+    // Get unique coin/direction pairs
+    const pairs = new Set<string>();
+    for (const pos of eligiblePositions) {
+      pairs.add(`${pos.coin}|${pos.direction}`);
+    }
+    
+    let createdCount = 0;
+    
+    for (const pair of pairs) {
+      const [coin, direction] = pair.split('|');
+      
+      // Skip blacklisted coins
+      if (COIN_BLACKLIST.includes(coin)) continue;
+      
+      // Check if active signal exists
+      const existingSignal = await getActiveSignalForCoin(coin, direction);
+      if (existingSignal) continue;
+      
+      // Get fresh traders for this position
+      const traders = await getAllTradersInPosition(coin, direction, true);
+      const eliteCount = traders.filter(t => t.tier === 'elite').length;
+      const goodCount = traders.filter(t => t.tier === 'good').length;
+      
+      // Check if should create signal
+      if (!shouldCreateSignal(eliteCount, goodCount)) continue;
+      
+      // Create the signal
+      await createSignalFromExistingPositions(coin, direction as 'long' | 'short', traders);
+      createdCount++;
+    }
+    
+    if (createdCount > 0) {
+      logger.info(`Created ${createdCount} missing signals`);
+    } else {
+      logger.debug('No missing signals to create');
+    }
+  } catch (error) {
+    logger.error('Failed to create missing signals', error);
+  }
+}
+
+async function createSignalFromExistingPositions(
+  coin: string, 
+  direction: 'long' | 'short', 
+  traders: TraderForSignal[]
+): Promise<void> {
+  const eliteCount = traders.filter(t => t.tier === 'elite').length;
+  const goodCount = traders.filter(t => t.tier === 'good').length;
+  const signalTier = determineSignalTier(eliteCount, goodCount);
+  
+  const combinedPnl7d = traders.reduce((sum, t) => sum + t.pnl_7d, 0);
+  const combinedPnl30d = traders.reduce((sum, t) => sum + t.pnl_30d, 0);
+  const avgWinRate = traders.reduce((sum, t) => sum + t.win_rate, 0) / traders.length;
+  const avgProfitFactor = traders.reduce((sum, t) => sum + t.profit_factor, 0) / traders.length;
+  const avgLeverage = traders.reduce((sum, t) => sum + t.leverage, 0) / traders.length;
+  const avgConvictionPct = traders.reduce((sum, t) => sum + t.conviction_pct, 0) / traders.length;
+  const totalPositionValue = traders.reduce((sum, t) => sum + t.position_value, 0);
+  
+  const currentPrice = await hyperliquid.getMidPrice(coin);
+  if (!currentPrice) {
+    logger.error(`Could not get price for ${coin}`);
+    return;
+  }
+  
+  const stopData = await calculateEnhancedStopLoss(coin, direction, traders, currentPrice);
+  const tps = calculateTakeProfits(direction, currentPrice, stopData.stopLoss);
+  const fundingData = await getSignalFundingContext(coin, direction);
+  const confidence = calculateConfidence(eliteCount, goodCount, avgWinRate, avgProfitFactor, combinedPnl7d, avgConvictionPct, fundingData.context, signalTier);
+  const riskScore = calculateRiskScore(avgProfitFactor, avgWinRate, stopData.stopDistancePct, eliteCount, stopData.volatilityRank, fundingData.context, signalTier);
+  const suggestedLeverage = calculateSuggestedLeverage(avgLeverage, stopData.stopDistancePct);
+  
+  let combinedAccountValue = 0;
+  for (const t of traders) {
+    const quality = await getTraderQuality(t.address);
+    if (quality) combinedAccountValue += quality.account_value;
+  }
+  
+  const entryPrices = traders.map(t => t.entry_price).filter(p => p > 0);
+  const entryRangeLow = entryPrices.length > 0 ? Math.min(...entryPrices) : currentPrice * 0.99;
+  const entryRangeHigh = entryPrices.length > 0 ? Math.max(...entryPrices) : currentPrice * 1.01;
+  
+  // Use the earliest position open time as entry_detected_at
+  const earliestOpen = traders
+    .map(t => t.opened_at)
+    .filter(Boolean)
+    .sort()[0] || new Date().toISOString();
+  
+  const signalData = {
+    coin, direction,
+    elite_count: eliteCount, good_count: goodCount, total_traders: traders.length,
+    combined_pnl_7d: combinedPnl7d, combined_pnl_30d: combinedPnl30d, combined_account_value: combinedAccountValue,
+    avg_win_rate: avgWinRate, avg_profit_factor: avgProfitFactor, total_position_value: totalPositionValue,
+    avg_entry_price: currentPrice, avg_leverage: avgLeverage, traders,
+    signal_tier: signalTier, signal_strength: determineSignalStrength(eliteCount, goodCount), confidence,
+    directional_agreement: 1.0, opposing_traders: 0,
+    suggested_entry: currentPrice, entry_price: currentPrice,
+    entry_range_low: entryRangeLow, entry_range_high: entryRangeHigh,
+    stop_loss: stopData.stopLoss, stop_distance_pct: stopData.stopDistancePct,
+    take_profit_1: tps.tp1, take_profit_2: tps.tp2, take_profit_3: tps.tp3,
+    suggested_leverage: suggestedLeverage, risk_score: riskScore,
+    avg_conviction_pct: avgConvictionPct, funding_context: fundingData.context, current_funding_rate: fundingData.fundingRate,
+    volatility_adjusted_stop: stopData.stopLoss, atr_multiple: stopData.atrMultiple,
+    current_price: currentPrice, is_active: true, outcome: 'open',
+    entry_detected_at: earliestOpen, is_verified_open: true,
+    trigger_event_id: null,
+    expires_at: new Date(Date.now() + config.signals.expiryHours * 60 * 60 * 1000).toISOString(),
+  };
+  
+  const { error } = await db.client.from('quality_signals').insert(signalData);
+  
+  if (error) {
+    logger.error(`Failed to create missing signal for ${coin}`, error);
+    return;
+  }
+  
+  logger.info(
+    `[RECOVERED] NEW SIGNAL: ${coin} ${direction.toUpperCase()} | ` +
+    `${eliteCount}E + ${goodCount}G | Entry: $${currentPrice.toFixed(4)} | ` +
+    `Tier: ${signalTier} | Confidence: ${confidence}%`
+  );
+}
+
+// ============================================
 // V12.3: Signal Reconciliation
 // ============================================
 
@@ -457,14 +572,11 @@ async function reconcileActiveSignals(): Promise<void> {
     let updatedCount = 0;
     
     for (const signal of activeSignals) {
-      // Get CURRENT traders with positions (not from signal's cached array)
-      // Use filterFresh=false to get all current positions regardless of age
       const currentTraders = await getAllTradersInPosition(signal.coin, signal.direction, false);
       
       const eliteCount = currentTraders.filter(t => t.tier === 'elite').length;
       const goodCount = currentTraders.filter(t => t.tier === 'good').length;
       
-      // Check if signal should be closed - no traders remaining
       if (currentTraders.length === 0) {
         await closeSignal(signal as ActiveSignal, 'all_traders_exited_reconcile');
         logger.info(`RECONCILE CLOSE: ${signal.coin} ${signal.direction} - no traders remaining`);
@@ -472,21 +584,18 @@ async function reconcileActiveSignals(): Promise<void> {
         continue;
       }
       
-      // Check if signal should be closed - doesn't meet minimum threshold
       if (!shouldCreateSignal(eliteCount, goodCount)) {
         await closeSignal(signal as ActiveSignal, 'below_minimum_traders_reconcile');
-        logger.info(`RECONCILE CLOSE: ${signal.coin} ${signal.direction} - only ${eliteCount}E + ${goodCount}G (need 1E or 3G)`);
+        logger.info(`RECONCILE CLOSE: ${signal.coin} ${signal.direction} - only ${eliteCount}E + ${goodCount}G`);
         closedCount++;
         continue;
       }
       
-      // Check if counts are out of sync
       const cachedElite = signal.elite_count || 0;
       const cachedGood = signal.good_count || 0;
       const cachedTotal = signal.total_traders || 0;
       
       if (eliteCount !== cachedElite || goodCount !== cachedGood || currentTraders.length !== cachedTotal) {
-        // Update signal with current trader data
         const newTier = determineSignalTier(eliteCount, goodCount);
         const combinedPnl7d = currentTraders.reduce((sum, t) => sum + t.pnl_7d, 0);
         const avgWinRate = currentTraders.length > 0 
@@ -527,8 +636,7 @@ async function reconcileActiveSignals(): Promise<void> {
         
         logger.info(
           `RECONCILE UPDATE: ${signal.coin} ${signal.direction} | ` +
-          `${cachedElite}E+${cachedGood}G -> ${eliteCount}E+${goodCount}G | ` +
-          `Tier: ${signal.signal_tier} -> ${newTier}`
+          `${cachedElite}E+${cachedGood}G -> ${eliteCount}E+${goodCount}G`
         );
         updatedCount++;
       }
@@ -569,14 +677,12 @@ export async function updateSignalTraderTiers(): Promise<void> {
         const currentQuality = await getTraderQuality(trader.address);
         
         if (!currentQuality || currentQuality.quality_tier === 'weak') {
-          logger.info(`Removing ${trader.address.slice(0, 8)}... from ${signal.coin} - was ${trader.tier}, now ${currentQuality?.quality_tier || 'untracked'}`);
           removedCount++;
           updated = true;
           continue;
         }
 
         if (currentQuality.quality_tier !== trader.tier) {
-          logger.info(`Updating ${trader.address.slice(0, 8)}... in ${signal.coin} - ${trader.tier} -> ${currentQuality.quality_tier}`);
           trader.tier = currentQuality.quality_tier as 'elite' | 'good';
           trader.pnl_7d = currentQuality.pnl_7d || 0;
           trader.pnl_30d = currentQuality.pnl_30d || 0;
@@ -618,8 +724,6 @@ export async function updateSignalTraderTiers(): Promise<void> {
               updated_at: new Date().toISOString(),
             })
             .eq('id', signal.id);
-
-          logger.info(`Updated ${signal.coin} ${signal.direction}: removed ${removedCount}, now ${eliteCount}E + ${goodCount}G (${newTier})`);
         }
       }
     }
@@ -637,11 +741,10 @@ async function handleOpenEvent(change: PositionChange): Promise<void> {
   
   const trader = await getTraderQuality(address);
   if (!trader || trader.quality_tier === 'weak') {
-    logger.debug(`Open event for ${coin} by ${address.slice(0, 8)}... - not tracked`);
     return;
   }
 
-  logger.info(`OPEN: ${trader.quality_tier.toUpperCase()} ${address.slice(0, 8)}... opened ${direction} ${coin}`);
+  logger.info(`[OPEN] ${trader.quality_tier.toUpperCase()} ${address.slice(0, 8)}... opened ${direction} ${coin}`);
 
   const existingSignal = await getActiveSignalForCoin(coin, direction);
   
@@ -665,7 +768,6 @@ async function handleTraderJoinsSignal(signal: ActiveSignal, change: PositionCha
 
   const fundingData = await getSignalFundingContext(signal.coin, signal.direction as 'long' | 'short');
   const newTier = determineSignalTier(eliteCount, goodCount);
-  const oldTier = signal.signal_tier || 'elite_entry';
   const confidence = calculateConfidence(eliteCount, goodCount, avgWinRate, avgProfitFactor, combinedPnl7d, avgConvictionPct, fundingData.context, newTier);
 
   await db.client
@@ -687,23 +789,19 @@ async function handleTraderJoinsSignal(signal: ActiveSignal, change: PositionCha
     })
     .eq('id', signal.id);
 
-  const tierUpgrade = newTier !== oldTier ? ` | UPGRADED: ${oldTier} -> ${newTier}` : '';
-  logger.info(`Signal updated: ${signal.coin} ${signal.direction} | +1 ${trader.quality_tier} | Now ${eliteCount}E + ${goodCount}G | Confidence: ${signal.confidence}% -> ${confidence}%${tierUpgrade}`);
+  logger.info(`Signal updated: ${signal.coin} ${signal.direction} | +1 ${trader.quality_tier} | Now ${eliteCount}E + ${goodCount}G`);
 }
 
 async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQuality): Promise<void> {
   const { coin, direction, detected_at } = change;
   
-  // V12.2: Skip blacklisted coins
   if (COIN_BLACKLIST.includes(coin)) {
-    logger.debug(`Skipping ${coin} - blacklisted due to negative historical performance`);
     return;
   }
   
   const allTraders = await getAllTradersInPosition(coin, direction, true);
   
   if (allTraders.length === 0) {
-    logger.debug(`No fresh quality traders for ${coin} ${direction} (within ${MAX_POSITION_AGE_HOURS}h)`);
     return;
   }
 
@@ -711,7 +809,6 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
   const goodCount = allTraders.filter(t => t.tier === 'good').length;
 
   if (!shouldCreateSignal(eliteCount, goodCount)) {
-    logger.debug(`${coin} ${direction}: ${eliteCount}E + ${goodCount}G - need 1+ elite OR 3+ good`);
     return;
   }
 
@@ -725,21 +822,12 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
   const totalPositionValue = allTraders.reduce((sum, t) => sum + t.position_value, 0);
 
   if (signalTier !== 'elite_entry') {
-    if (combinedPnl7d < config.signals.minCombinedPnl7d) {
-      logger.debug(`${coin} ${direction}: Combined 7d PnL too low ($${combinedPnl7d.toFixed(0)})`);
-      return;
-    }
-    if (avgWinRate < config.signals.minAvgWinRate) {
-      logger.debug(`${coin} ${direction}: Avg win rate too low (${(avgWinRate * 100).toFixed(1)}%)`);
-      return;
-    }
+    if (combinedPnl7d < config.signals.minCombinedPnl7d) return;
+    if (avgWinRate < config.signals.minAvgWinRate) return;
   }
 
   const currentPrice = await hyperliquid.getMidPrice(coin);
-  if (!currentPrice) {
-    logger.error(`Could not get price for ${coin}`);
-    return;
-  }
+  if (!currentPrice) return;
 
   const stopData = await calculateEnhancedStopLoss(coin, direction, allTraders, currentPrice);
   const tps = calculateTakeProfits(direction, currentPrice, stopData.stopLoss);
@@ -786,11 +874,10 @@ async function evaluateNewSignal(change: PositionChange, triggerTrader: TraderQu
     return;
   }
 
-  const tierEmoji = signalTier === 'elite_entry' ? '[ELITE]' : signalTier === 'consensus' ? '[CONSENSUS]' : '[CONFIRMED]';
   logger.info(
-    `${tierEmoji} NEW SIGNAL: ${coin} ${direction.toUpperCase()} | ` +
-    `${eliteCount}E + ${goodCount}G | Entry: $${currentPrice.toFixed(4)} | Stop: ${stopData.stopDistancePct.toFixed(1)}% | ` +
-    `Confidence: ${confidence}%`
+    `[NEW SIGNAL] ${coin} ${direction.toUpperCase()} | ` +
+    `${eliteCount}E + ${goodCount}G | Entry: $${currentPrice.toFixed(4)} | ` +
+    `Tier: ${signalTier} | Confidence: ${confidence}%`
   );
 }
 
@@ -814,8 +901,6 @@ async function handleIncreaseEvent(change: PositionChange): Promise<void> {
     .from('quality_signals')
     .update({ traders: allTraders, avg_conviction_pct: avgConvictionPct, total_position_value: totalPositionValue, updated_at: new Date().toISOString() })
     .eq('id', existingSignal.id);
-
-  logger.info(`${coin} ${direction}: ${address.slice(0, 8)}... added +${change.size_change.toFixed(4)} @ $${change.price_at_event.toFixed(2)}`);
 }
 
 async function handleDecreaseEvent(change: PositionChange): Promise<void> {
@@ -932,7 +1017,7 @@ async function closeSignal(signal: ActiveSignal, reason: string, tradersWithExit
     })
     .eq('id', signal.id);
 
-  logger.info(`Signal closed: ${signal.coin} ${signal.direction} | ${reason} | P&L: ${pnlPct > 0 ? '+' : ''}${pnlPct.toFixed(2)}%`);
+  logger.info(`[CLOSED] ${signal.coin} ${signal.direction} | ${reason} | P&L: ${pnlPct > 0 ? '+' : ''}${pnlPct.toFixed(2)}%`);
 }
 
 // ============================================
@@ -1026,19 +1111,19 @@ async function checkPriceTargets(): Promise<void> {
 
     if (hitStop) {
       await closeSignalWithReason('stopped_out', 'stop_loss_hit');
-      logger.info(`STOP HIT: ${signal.coin} ${signal.direction} | P&L: ${currentPnlPct.toFixed(2)}%`);
+      logger.info(`[STOP] ${signal.coin} ${signal.direction} | P&L: ${currentPnlPct.toFixed(2)}%`);
     } 
     else if (hitFixedTp) {
       await closeSignalWithReason('tp_hit', `fixed_tp_${FIXED_TP_PCT}pct`);
-      logger.info(`FIXED TP HIT: ${signal.coin} ${signal.direction} | P&L: +${currentPnlPct.toFixed(2)}% (target: +${FIXED_TP_PCT}%)`);
+      logger.info(`[TP HIT] ${signal.coin} ${signal.direction} | P&L: +${currentPnlPct.toFixed(2)}%`);
     }
     else if (hitTrailingStop) {
       await closeSignalWithReason('trailing_stop', `trailing_stop_from_${maxPnlPct.toFixed(2)}pct`);
-      logger.info(`TRAILING STOP: ${signal.coin} ${signal.direction} | P&L: +${currentPnlPct.toFixed(2)}% (peak was +${maxPnlPct.toFixed(2)}%)`);
+      logger.info(`[TRAIL STOP] ${signal.coin} ${signal.direction} | P&L: +${currentPnlPct.toFixed(2)}%`);
     }
     else if (hitTimeStop) {
       await closeSignalWithReason('time_stop', `exceeded_${MAX_SIGNAL_AGE_HOURS}h`);
-      logger.info(`TIME STOP: ${signal.coin} ${signal.direction} | P&L: ${currentPnlPct >= 0 ? '+' : ''}${currentPnlPct.toFixed(2)}% | Age: ${signalAgeHours.toFixed(1)}h`);
+      logger.info(`[TIME STOP] ${signal.coin} ${signal.direction} | P&L: ${currentPnlPct.toFixed(2)}%`);
     }
     else {
       await db.client.from('quality_signals').update({
@@ -1065,31 +1150,35 @@ let tierUpdateInterval: NodeJS.Timeout | null = null;
 let reconciliationInterval: NodeJS.Timeout | null = null;
 
 export async function initializeSignalGenerator(): Promise<void> {
-  logger.info(`Signal Generator V12.3 initializing...`);
+  logger.info(`Signal Generator V12.4 initializing...`);
   logger.info(`  - Fresh positions only: ${MAX_POSITION_AGE_HOURS}h max age`);
-  logger.info(`  - Exit strategy: ${FIXED_TP_PCT}% TP | ${MAX_SIGNAL_AGE_HOURS}h time stop | trailing after +${TRAILING_STOP_ACTIVATE_PCT}%`);
+  logger.info(`  - Exit strategy: ${FIXED_TP_PCT}% TP | ${MAX_SIGNAL_AGE_HOURS}h time stop`);
   logger.info(`  - Coin blacklist: ${COIN_BLACKLIST.join(', ')}`);
   logger.info(`  - Reconciliation: every ${RECONCILIATION_INTERVAL_MS / 60000} minutes`);
   
-  // V12.3: Run reconciliation on startup
+  // V12.4: Run both reconciliation AND missing signal creation on startup
   await reconcileActiveSignals();
+  await createMissingSignals();
   
   subscribeToPositionChanges(processPositionChanges);
   
   priceCheckInterval = setInterval(checkPriceTargets, 60 * 1000);
   tierUpdateInterval = setInterval(updateSignalTraderTiers, 5 * 60 * 1000);
   
-  // V12.3: Periodic reconciliation to catch missed events
-  reconciliationInterval = setInterval(reconcileActiveSignals, RECONCILIATION_INTERVAL_MS);
+  // V12.4: Run both periodically
+  reconciliationInterval = setInterval(async () => {
+    await reconcileActiveSignals();
+    await createMissingSignals();
+  }, RECONCILIATION_INTERVAL_MS);
   
-  logger.info('Signal Generator V12.3 ready - with position reconciliation');
+  logger.info('Signal Generator V12.4 ready');
 }
 
 export function stopSignalGenerator(): void {
   if (priceCheckInterval) { clearInterval(priceCheckInterval); priceCheckInterval = null; }
   if (tierUpdateInterval) { clearInterval(tierUpdateInterval); tierUpdateInterval = null; }
   if (reconciliationInterval) { clearInterval(reconciliationInterval); reconciliationInterval = null; }
-  logger.info('Signal Generator V12.3 stopped');
+  logger.info('Signal Generator stopped');
 }
 
 // ============================================
@@ -1112,12 +1201,13 @@ export async function getVerifiedSignals(): Promise<unknown[]> {
 }
 
 export async function generateSignals(): Promise<void> {
-  logger.debug('generateSignals() - V12.3 is event-driven');
+  logger.debug('generateSignals() - V12.4 is event-driven');
 }
 
-export { reconcileActiveSignals };
+export { reconcileActiveSignals, createMissingSignals };
 
 export default {
   initializeSignalGenerator, stopSignalGenerator, processPositionChanges, updateSignalTraderTiers,
-  getActiveSignals, getSignalForCoin, getVerifiedSignals, generateSignals, reconcileActiveSignals,
+  getActiveSignals, getSignalForCoin, getVerifiedSignals, generateSignals, 
+  reconcileActiveSignals, createMissingSignals,
 };

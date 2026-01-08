@@ -1077,7 +1077,7 @@ async function checkPriceTargets(): Promise<void> {
 
     const hitStop = direction === 'long' ? currentPrice <= signal.stop_loss : currentPrice >= signal.stop_loss;
     const hitFixedTp = currentPnlPct >= FIXED_TP_PCT;
-    const hitTimeStop = signalAgeHours >= MAX_SIGNAL_AGE_HOURS;
+    const hitTimeStop = false;
     
     const trailingStopActive = maxPnlPct >= TRAILING_STOP_ACTIVATE_PCT;
     const hitTrailingStop = trailingStopActive && (maxPnlPct - currentPnlPct) >= TRAILING_STOP_DISTANCE_PCT;

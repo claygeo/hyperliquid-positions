@@ -1,5 +1,11 @@
-// Position Tracker V7.2
-// CHANGES FROM V7:
+// Position Tracker V7.3
+// 
+// V7.3 CHANGES (Fix Notification Timing):
+// - CRITICAL: Notify signal generator BEFORE saving positions to DB
+// - This ensures signal generator can query positions before they're deleted
+// - Fixed race condition where close events weren't being processed
+//
+// V7.2 CHANGES:
 // - REMOVED: Fill history lookups (unreliable for active traders)
 // - SIMPLIFIED: opened_at = detected_at for new positions (we witnessed it)
 // - KEPT: Event detection (open, increase, decrease, close, flip)
@@ -11,7 +17,7 @@ import db from '../db/client.js';
 import { config } from '../config.js';
 import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
 
-const logger = createLogger('position-tracker-v7.2');
+const logger = createLogger('position-tracker-v7.3');
 
 // ============================================
 // Types
@@ -41,7 +47,7 @@ interface TrackedPosition {
 }
 
 export interface PositionChange {
-  id?: number; // Populated after DB insert
+  id?: number;
   address: string;
   coin: string;
   event_type: 'open' | 'increase' | 'decrease' | 'close' | 'flip';
@@ -400,7 +406,7 @@ async function saveOpenOrders(orders: TrackedOpenOrder[]): Promise<void> {
 }
 
 // ============================================
-// Position Processing (V7.2 - Simplified)
+// Position Processing
 // ============================================
 
 async function processPositions(
@@ -441,27 +447,19 @@ async function processPositions(
       ? parseFloat(pendingEntry.limitPx || pendingEntry.triggerPx || '0')
       : null;
 
-    // V7.2: Get previous state from cache
     const key = `${address}-${coin}`;
     const prev = previousPositions.get(key);
     
-    // V7.2 SIMPLIFIED: Determine opened_at
-    // - If same direction position exists in cache, keep its opened_at
-    // - If new position or direction flip, opened_at = NOW (we witnessed it)
     let openedAt: Date;
     
     if (prev && prev.direction === currentDirection && prev.opened_at) {
-      // Same position continuing - keep original open time
       openedAt = prev.opened_at;
     } else {
-      // New position or flip - we're witnessing this open NOW
       openedAt = now;
     }
 
-    // Calculate position age
     const positionAgeHours = (now.getTime() - openedAt.getTime()) / (1000 * 60 * 60);
 
-    // Track peak/trough unrealized P&L
     const peakUnrealizedPnl = prev 
       ? Math.max(prev.peak_unrealized_pnl || unrealizedPnl, unrealizedPnl)
       : unrealizedPnl;
@@ -563,7 +561,6 @@ async function pollPositions(): Promise<void> {
   isPolling = true;
 
   try {
-    // Load previous positions from DB on first poll
     await loadPreviousPositionsFromDb();
 
     const { data: trackedTraders, error } = await db.client
@@ -582,7 +579,6 @@ async function pollPositions(): Promise<void> {
     const allOpenOrders: TrackedOpenOrder[] = [];
     const positionChanges: PositionChange[] = [];
 
-    // Get current prices once
     const allMids = await hyperliquid.getAllMids();
 
     for (const trader of trackedTraders) {
@@ -600,7 +596,6 @@ async function pollPositions(): Promise<void> {
         data.accountValue
       );
 
-      // Track which coins this trader currently has positions in
       const currentCoins = new Set(processed.map(p => p.coin));
       
       // Detect changes for current positions
@@ -619,7 +614,7 @@ async function pollPositions(): Promise<void> {
           positionChanges.push(change);
         }
         
-        // Update cache
+        // Update cache AFTER detecting changes
         updatePreviousPositionCache(trader.address, position.coin, position);
       }
 
@@ -640,7 +635,7 @@ async function pollPositions(): Promise<void> {
             positionChanges.push(change);
           }
           
-          // Remove from cache
+          // Remove from cache AFTER detecting changes
           previousPositions.delete(key);
         }
       }
@@ -653,6 +648,14 @@ async function pollPositions(): Promise<void> {
       await new Promise(resolve => setTimeout(resolve, config.rateLimit.delayBetweenRequests));
     }
 
+    // V7.3 CRITICAL FIX: Notify signal generator BEFORE saving positions
+    // This ensures signal generator can still query positions that are about to be deleted
+    if (positionChanges.length > 0 && onPositionChanges) {
+      logger.debug(`Notifying signal generator of ${positionChanges.length} changes BEFORE saving to DB`);
+      await onPositionChanges(positionChanges);
+    }
+
+    // Now save positions (which deletes closed positions)
     await savePositions(allPositions);
     await saveOpenOrders(allOpenOrders);
 
@@ -660,11 +663,6 @@ async function pollPositions(): Promise<void> {
       `Updated ${allPositions.length} positions, ${allOpenOrders.length} orders` +
       (positionChanges.length > 0 ? `, ${positionChanges.length} changes detected` : '')
     );
-
-    // V7.2: Notify signal generator of changes
-    if (positionChanges.length > 0 && onPositionChanges) {
-      await onPositionChanges(positionChanges);
-    }
 
   } catch (error) {
     logger.error('Position polling failed', error);
@@ -678,7 +676,7 @@ async function pollPositions(): Promise<void> {
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V7.2 starting...');
+  logger.info('Position tracker V7.3 starting...');
   
   pollPositions();
   

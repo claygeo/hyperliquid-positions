@@ -1,5 +1,11 @@
-// Position Tracker V7.4
+// Position Tracker V7.5
 // 
+// V7.5 CHANGES (Accurate Position Open Times):
+// - NEW: Track "seenWallets" to distinguish newly added wallets vs. already tracked
+// - NEW: For newly added wallets, query fill history to get ACTUAL opened_at timestamp
+// - FIX: Don't emit fake "open" events for existing positions on newly added wallets
+// - KEPT: All V7.4 functionality (proper close detection, etc.)
+//
 // V7.4 CHANGES (Fix Both Open AND Close Events):
 // - REVERT: Save positions FIRST, then notify (V7.3 broke opens)
 // - FIX: savePositions now properly deletes ALL positions for polled addresses
@@ -8,23 +14,13 @@
 // - This fixes BOTH:
 //   1. Open events: New positions are in DB when signal generator queries
 //   2. Close events: Closed positions are deleted before signal generator queries
-//
-// V7.3 CHANGES (REVERTED - caused missing signals):
-// - Tried notifying before save, but this broke open events
-//
-// V7.2 CHANGES:
-// - REMOVED: Fill history lookups (unreliable for active traders)
-// - SIMPLIFIED: opened_at = detected_at for new positions (we witnessed it)
-// - KEPT: Event detection (open, increase, decrease, close, flip)
-// - KEPT: Position history tracking
-// - ADDED: Returns position changes for signal generator to consume
 
 import { createLogger } from '../utils/logger.js';
 import db from '../db/client.js';
 import { config } from '../config.js';
-import hyperliquid, { Position, OpenOrder } from '../utils/hyperliquid-api.js';
+import hyperliquid, { Position, OpenOrder, findPositionOpenTime } from '../utils/hyperliquid-api.js';
 
-const logger = createLogger('position-tracker-v7.4');
+const logger = createLogger('position-tracker-v7.5');
 
 // ============================================
 // Types
@@ -102,6 +98,9 @@ const previousPositions = new Map<string, PreviousPositionState>();
 // Track if we've loaded from DB this session
 let hasLoadedFromDb = false;
 
+// V7.5: Track which wallets we've polled before (to detect newly added wallets)
+const seenWallets = new Set<string>();
+
 // Callback for position changes (signal generator will subscribe)
 type PositionChangeCallback = (changes: PositionChange[]) => Promise<void>;
 let onPositionChanges: PositionChangeCallback | null = null;
@@ -141,8 +140,12 @@ async function loadPreviousPositionsFromDb(): Promise<void> {
           peak_unrealized_pnl: pos.peak_unrealized_pnl || 0,
           trough_unrealized_pnl: pos.trough_unrealized_pnl || 0,
         });
+        
+        // V7.5: Mark wallets with existing positions as "seen"
+        seenWallets.add(pos.address);
       }
       logger.info(`Loaded ${dbPositions.length} previous positions from database`);
+      logger.info(`Marked ${seenWallets.size} wallets as previously seen`);
     }
     
     hasLoadedFromDb = true;
@@ -420,7 +423,8 @@ async function processPositions(
   address: string,
   positions: Position[],
   orders: OpenOrder[],
-  accountValue: number
+  accountValue: number,
+  isNewWallet: boolean  // V7.5: Pass this flag
 ): Promise<TrackedPosition[]> {
   const results: TrackedPosition[] = [];
   const now = new Date();
@@ -460,8 +464,31 @@ async function processPositions(
     let openedAt: Date;
     
     if (prev && prev.direction === currentDirection && prev.opened_at) {
+      // We already know when this position was opened
       openedAt = prev.opened_at;
+    } else if (isNewWallet) {
+      // V7.5: NEW WALLET - Query fill history to get actual open time
+      logger.debug(`[NEW WALLET] Querying fill history for ${address.slice(0, 8)}... ${coin} ${currentDirection}`);
+      
+      const fillData = await findPositionOpenTime(address, coin, currentDirection, 30);
+      
+      if (fillData) {
+        openedAt = fillData.openedAt;
+        logger.info(
+          `[DISCOVERED] ${address.slice(0, 8)}... ${coin} ${currentDirection.toUpperCase()} | ` +
+          `Actual open: ${openedAt.toISOString().slice(0, 16)} | ` +
+          `Entry: $${fillData.entryPrice.toFixed(2)}`
+        );
+      } else {
+        // Couldn't find fill history - mark as old so it doesn't generate signals
+        openedAt = new Date(now.getTime() - (48 * 60 * 60 * 1000)); // 48 hours ago
+        logger.warn(
+          `[DISCOVERED] ${address.slice(0, 8)}... ${coin} ${currentDirection.toUpperCase()} | ` +
+          `No fill history found, marking as stale`
+        );
+      }
     } else {
+      // Existing wallet, new position = we witnessed the open
       openedAt = now;
     }
 
@@ -594,6 +621,9 @@ async function pollPositions(): Promise<void> {
     
     // V7.4: Track which addresses we successfully polled
     const polledAddresses = new Set<string>();
+    
+    // V7.5: Track newly added wallets this poll cycle
+    const newWalletsThisCycle: string[] = [];
 
     const allMids = await hyperliquid.getAllMids();
 
@@ -607,44 +637,32 @@ async function pollPositions(): Promise<void> {
 
       // V7.4: Track this address as successfully polled
       polledAddresses.add(trader.address);
+      
+      // V7.5: Check if this is a newly added wallet
+      const isNewWallet = !seenWallets.has(trader.address);
+      if (isNewWallet) {
+        newWalletsThisCycle.push(trader.address);
+      }
 
       const processed = await processPositions(
         trader.address,
         data.positions,
         data.openOrders,
-        data.accountValue
+        data.accountValue,
+        isNewWallet  // V7.5: Pass the flag
       );
 
       const currentCoins = new Set(processed.map(p => p.coin));
       
-      // Detect changes for current positions
-      for (const position of processed) {
-        const key = `${trader.address}-${position.coin}`;
-        const prev = previousPositions.get(key);
-        const currentPrice = parseFloat(allMids[position.coin] || '0');
-        
-        const change = detectPositionChange(trader.address, position, prev || null, currentPrice);
-        
-        if (change) {
-          const eventId = await savePositionChange(change);
-          if (eventId) {
-            change.id = eventId;
-          }
-          positionChanges.push(change);
-        }
-        
-        // Update cache AFTER detecting changes
-        updatePreviousPositionCache(trader.address, position.coin, position);
-      }
-
-      // Detect closed positions (existed in cache but not in current)
-      for (const [key, prev] of previousPositions) {
-        if (!key.startsWith(trader.address)) continue;
-        
-        const coin = prev.coin;
-        if (!currentCoins.has(coin)) {
-          const currentPrice = parseFloat(allMids[coin] || '0');
-          const change = detectPositionChange(trader.address, null, prev, currentPrice);
+      // V7.5: Only detect changes for EXISTING wallets (not newly added)
+      if (!isNewWallet) {
+        // Detect changes for current positions
+        for (const position of processed) {
+          const key = `${trader.address}-${position.coin}`;
+          const prev = previousPositions.get(key);
+          const currentPrice = parseFloat(allMids[position.coin] || '0');
+          
+          const change = detectPositionChange(trader.address, position, prev || null, currentPrice);
           
           if (change) {
             const eventId = await savePositionChange(change);
@@ -654,8 +672,42 @@ async function pollPositions(): Promise<void> {
             positionChanges.push(change);
           }
           
-          // Remove from cache AFTER detecting changes
-          previousPositions.delete(key);
+          // Update cache AFTER detecting changes
+          updatePreviousPositionCache(trader.address, position.coin, position);
+        }
+
+        // Detect closed positions (existed in cache but not in current)
+        for (const [key, prev] of previousPositions) {
+          if (!key.startsWith(trader.address)) continue;
+          
+          const coin = prev.coin;
+          if (!currentCoins.has(coin)) {
+            const currentPrice = parseFloat(allMids[coin] || '0');
+            const change = detectPositionChange(trader.address, null, prev, currentPrice);
+            
+            if (change) {
+              const eventId = await savePositionChange(change);
+              if (eventId) {
+                change.id = eventId;
+              }
+              positionChanges.push(change);
+            }
+            
+            // Remove from cache AFTER detecting changes
+            previousPositions.delete(key);
+          }
+        }
+      } else {
+        // V7.5: NEW WALLET - Just populate the cache, don't emit events
+        for (const position of processed) {
+          updatePreviousPositionCache(trader.address, position.coin, position);
+        }
+        
+        if (processed.length > 0) {
+          logger.info(
+            `[NEW WALLET] ${trader.address.slice(0, 8)}... has ${processed.length} existing positions ` +
+            `(not emitting open events)`
+          );
         }
       }
 
@@ -665,6 +717,11 @@ async function pollPositions(): Promise<void> {
       allOpenOrders.push(...orders);
 
       await new Promise(resolve => setTimeout(resolve, config.rateLimit.delayBetweenRequests));
+    }
+
+    // V7.5: Mark all newly polled wallets as "seen" AFTER processing
+    for (const address of newWalletsThisCycle) {
+      seenWallets.add(address);
     }
 
     // V7.4: Save positions FIRST (so new positions are queryable)
@@ -678,10 +735,11 @@ async function pollPositions(): Promise<void> {
       await onPositionChanges(positionChanges);
     }
 
-    logger.info(
-      `Updated ${allPositions.length} positions for ${polledAddresses.size} traders, ${allOpenOrders.length} orders` +
-      (positionChanges.length > 0 ? `, ${positionChanges.length} changes detected` : '')
-    );
+    const logMessage = `Updated ${allPositions.length} positions for ${polledAddresses.size} traders, ${allOpenOrders.length} orders`;
+    const changeMessage = positionChanges.length > 0 ? `, ${positionChanges.length} changes detected` : '';
+    const newWalletMessage = newWalletsThisCycle.length > 0 ? `, ${newWalletsThisCycle.length} new wallets initialized` : '';
+    
+    logger.info(logMessage + changeMessage + newWalletMessage);
 
   } catch (error) {
     logger.error('Position polling failed', error);
@@ -695,7 +753,9 @@ async function pollPositions(): Promise<void> {
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V7.4 starting...');
+  logger.info('Position tracker V7.5 starting...');
+  logger.info('  - Accurate opened_at from fill history for new wallets');
+  logger.info('  - No false open events for existing positions');
   
   pollPositions();
   
@@ -777,6 +837,16 @@ export async function getRecentPositionChanges(hours: number = 24): Promise<Posi
   return (data || []) as PositionChange[];
 }
 
+// V7.5: Export for testing/debugging
+export function getSeenWallets(): Set<string> {
+  return new Set(seenWallets);
+}
+
+export function clearSeenWallets(): void {
+  seenWallets.clear();
+  logger.info('Cleared seen wallets cache');
+}
+
 export default {
   startPositionTracker,
   stopPositionTracker,
@@ -785,4 +855,6 @@ export default {
   getPositionsForCoin,
   getFreshPositions,
   getRecentPositionChanges,
+  getSeenWallets,
+  clearSeenWallets,
 };

@@ -6,8 +6,6 @@ import { Card, CardContent } from '@/components/ui/card';
 import { 
   ChevronDown, 
   ChevronUp, 
-  Zap,
-  Clock,
   ExternalLink,
   Plus,
   X,
@@ -73,6 +71,22 @@ interface QualitySignal {
   invalidation_reason?: string;
 }
 
+// Flattened position - one per trader
+interface FlatPosition {
+  id: string; // unique key: signalId-traderAddress
+  signalId: number;
+  coin: string;
+  direction: string;
+  trader: TraderInfo;
+  currentPrice: number;
+  stopLoss: number;
+  takeProfit1: number;
+  takeProfit2: number;
+  takeProfit3: number;
+  openedAt: string;
+  signalCreatedAt: string;
+}
+
 interface SystemStats {
   elite_count: number;
   good_count: number;
@@ -121,22 +135,6 @@ function formatPrice(price: number): string {
   if (price >= 1) return '$' + price.toFixed(2);
   if (price >= 0.01) return '$' + price.toFixed(4);
   return '$' + price.toFixed(6);
-}
-
-function formatTimeAgo(dateString: string): string {
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  
-  if (diffMins < 1) return 'Just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  
-  const diffHours = Math.floor(diffMins / 60);
-  if (diffHours < 24) return `${diffHours}h ago`;
-  
-  const diffDays = Math.floor(diffHours / 24);
-  return `${diffDays}d ago`;
 }
 
 function formatDateEST(dateString: string): string {
@@ -195,21 +193,6 @@ function formatDuration(startDate: string, endDate: string): string {
   }
   
   return `${minutes}m`;
-}
-
-function formatTraderEntry(entryPrice: number, currentPrice: number, direction: string): { pnlPct: number; display: string } {
-  let pnlPct: number;
-  if (direction === 'long') {
-    pnlPct = ((currentPrice - entryPrice) / entryPrice) * 100;
-  } else {
-    pnlPct = ((entryPrice - currentPrice) / entryPrice) * 100;
-  }
-  
-  const sign = pnlPct >= 0 ? '+' : '';
-  return {
-    pnlPct,
-    display: `${sign}${pnlPct.toFixed(1)}%`
-  };
 }
 
 function getTraderUrl(address: string): string {
@@ -291,16 +274,47 @@ function formatAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
+// Flatten signals into individual positions
+function flattenSignals(signals: QualitySignal[]): FlatPosition[] {
+  const positions: FlatPosition[] = [];
+  
+  for (const signal of signals) {
+    const traders = Array.isArray(signal.traders) ? signal.traders : [];
+    
+    for (const trader of traders) {
+      positions.push({
+        id: `${signal.id}-${trader.address}`,
+        signalId: signal.id,
+        coin: signal.coin,
+        direction: signal.direction,
+        trader: trader,
+        currentPrice: signal.current_price,
+        stopLoss: signal.stop_loss,
+        takeProfit1: signal.take_profit_1,
+        takeProfit2: signal.take_profit_2,
+        takeProfit3: signal.take_profit_3,
+        openedAt: trader.opened_at || signal.created_at,
+        signalCreatedAt: signal.created_at,
+      });
+    }
+  }
+  
+  // Sort by opened_at descending (newest first)
+  return positions.sort((a, b) => 
+    new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime()
+  );
+}
+
 // ============================================
-// SIGNAL BOTTOM SHEET
+// POSITION BOTTOM SHEET
 // ============================================
 
-function SignalBottomSheet({
-  signal,
+function PositionBottomSheet({
+  position,
   isOpen,
   onClose,
 }: {
-  signal: QualitySignal | null;
+  position: FlatPosition | null;
   isOpen: boolean;
   onClose: () => void;
 }) {
@@ -308,21 +322,14 @@ function SignalBottomSheet({
   const [currentY, setCurrentY] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
 
-  if (!signal) return null;
+  if (!position) return null;
 
-  const traders = Array.isArray(signal.traders) ? signal.traders : [];
-  const isLong = signal.direction === 'long';
-  const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
-  
-  const entry = signal.entry_price || signal.current_price;
-  const current = signal.current_price;
-  const pnlPct = signal.current_pnl_pct || calculatePnlFromPrices(entry, current, signal.direction);
+  const { trader, coin, direction, currentPrice, stopLoss, takeProfit1, takeProfit2, takeProfit3, openedAt } = position;
+  const isLong = direction === 'long';
+  const entry = trader.entry_price || 0;
+  const pnlPct = entry && currentPrice ? calculatePnlFromPrices(entry, currentPrice, direction) : 0;
   const isProfit = pnlPct >= 0;
-
-  const openedDates = traders.map(t => t.opened_at).filter((d): d is string => d !== null && d !== undefined);
-  const earliestEntry = openedDates.length > 0 
-    ? openedDates.reduce((earliest, d) => new Date(d) < new Date(earliest) ? d : earliest)
-    : signal.created_at;
+  const stopPct = entry ? Math.abs((stopLoss - entry) / entry * 100) : 0;
 
   const handleTouchStart = (e: React.TouchEvent) => {
     setStartY(e.touches[0].clientY);
@@ -370,23 +377,25 @@ function SignalBottomSheet({
           <div className="w-10 h-1 bg-muted-foreground/30 rounded-full" />
         </div>
 
-        {/* Sheet Content - Scrollable */}
+        {/* Sheet Content */}
         <div className="flex-1 overflow-y-auto">
           {/* Header */}
           <div className="px-4 pb-4 border-b border-border">
             {/* Title Row */}
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <span className="text-xl font-bold">{signal.coin}</span>
+                <span className="text-xl font-bold">{coin}</span>
                 <span className={`text-xs font-bold px-2 py-0.5 rounded ${
                   isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
                 }`}>
-                  {signal.direction.toUpperCase()}
+                  {direction.toUpperCase()}
                 </span>
-                <span className="text-sm text-muted-foreground">
-                  {signal.elite_count > 0 && <span className="text-green-500">{signal.elite_count}E</span>}
-                  {signal.elite_count > 0 && signal.good_count > 0 && ' + '}
-                  {signal.good_count > 0 && <span className="text-blue-500">{signal.good_count}G</span>}
+                <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                  trader.tier === 'elite' 
+                    ? 'bg-purple-500/20 text-purple-400' 
+                    : 'bg-blue-500/20 text-blue-400'
+                }`}>
+                  {trader.tier === 'elite' ? 'ELITE' : 'GOOD'}
                 </span>
               </div>
               <span className={`text-xl font-bold font-mono ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
@@ -398,15 +407,15 @@ function SignalBottomSheet({
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <div className="text-muted-foreground text-xs mb-0.5">Entry</div>
-                <div className="font-mono">{formatPrice(entry)} → {formatPrice(current)}</div>
+                <div className="font-mono">{formatPrice(entry)} → {formatPrice(currentPrice)}</div>
               </div>
               <div>
                 <div className="text-muted-foreground text-xs mb-0.5">Opened</div>
-                <div className="text-sm">{formatDateTimeEST(earliestEntry)}</div>
+                <div className="text-sm">{formatDateTimeEST(openedAt)}</div>
               </div>
               <div>
                 <div className="text-muted-foreground text-xs mb-0.5">Stop Loss</div>
-                <div className="text-red-500 font-mono">{formatPrice(signal.stop_loss)} (-{stopPct.toFixed(1)}%)</div>
+                <div className="text-red-500 font-mono">{formatPrice(stopLoss)} (-{stopPct.toFixed(1)}%)</div>
               </div>
             </div>
           </div>
@@ -415,75 +424,55 @@ function SignalBottomSheet({
           <div className="grid grid-cols-3 gap-2 p-4 border-b border-border">
             <div className="bg-muted/30 rounded-lg p-3 text-center">
               <div className="text-xs text-muted-foreground mb-1">TP1 (1:1)</div>
-              <div className="font-mono font-semibold text-green-500">{formatPrice(signal.take_profit_1)}</div>
+              <div className="font-mono font-semibold text-green-500">{formatPrice(takeProfit1)}</div>
             </div>
             <div className="bg-muted/30 rounded-lg p-3 text-center">
               <div className="text-xs text-muted-foreground mb-1">TP2 (2:1)</div>
-              <div className="font-mono font-semibold text-green-500">{formatPrice(signal.take_profit_2)}</div>
+              <div className="font-mono font-semibold text-green-500">{formatPrice(takeProfit2)}</div>
             </div>
             <div className="bg-muted/30 rounded-lg p-3 text-center">
               <div className="text-xs text-muted-foreground mb-1">TP3 (3:1)</div>
-              <div className="font-mono font-semibold text-green-500">{formatPrice(signal.take_profit_3)}</div>
+              <div className="font-mono font-semibold text-green-500">{formatPrice(takeProfit3)}</div>
             </div>
           </div>
 
-          {/* Traders */}
+          {/* Trader Info */}
           <div className="p-4">
-            <div className="text-sm text-muted-foreground mb-3">Traders ({traders.length})</div>
-            <div className="space-y-2">
-              {traders.map((trader) => {
-                const traderEntry = trader.entry_price || 0;
-                const traderPnl = traderEntry && current 
-                  ? formatTraderEntry(traderEntry, current, signal.direction)
-                  : null;
-                const entryTime = trader.opened_at ? formatDateEST(trader.opened_at) : null;
-                
-                return (
-                  <a
-                    key={trader.address}
-                    href={getTraderUrl(trader.address)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-2 p-2.5 bg-muted/20 rounded-lg hover:bg-muted/40 transition-colors"
-                  >
-                    {/* Tier Badge */}
-                    <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-semibold flex-shrink-0 ${
-                      trader.tier === 'elite' 
-                        ? 'bg-purple-500/20 text-purple-400' 
-                        : 'bg-blue-500/20 text-blue-400'
-                    }`}>
-                      {trader.tier === 'elite' ? 'E' : 'G'}
-                    </span>
-                    
-                    {/* Address */}
-                    <span className="font-mono text-xs text-muted-foreground flex items-center gap-1 flex-shrink-0">
-                      {formatAddress(trader.address)}
-                      <ExternalLink className="h-3 w-3 opacity-50" />
-                    </span>
-                    
-                    {/* Stats */}
-                    <span className="text-[11px] text-muted-foreground flex-shrink-0">
-                      {formatPnl(trader.pnl_7d || 0)} · {((trader.win_rate || 0) * 100).toFixed(0)}%
-                    </span>
-                    
-                    {/* Right side - Entry & Time */}
-                    <div className="ml-auto text-right flex-shrink-0">
-                      <div className="text-sm font-mono">
-                        {formatPrice(traderEntry)}
-                        {traderPnl && (
-                          <span className={`ml-1 text-xs ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                            {traderPnl.display}
-                          </span>
-                        )}
-                      </div>
-                      {entryTime && (
-                        <div className="text-[11px] text-muted-foreground">{entryTime}</div>
-                      )}
-                    </div>
-                  </a>
-                );
-              })}
-            </div>
+            <div className="text-sm text-muted-foreground mb-3">Trader</div>
+            <a
+              href={getTraderUrl(trader.address)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block p-4 bg-muted/20 rounded-lg hover:bg-muted/40 transition-colors"
+            >
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold ${
+                    trader.tier === 'elite' 
+                      ? 'bg-purple-500/20 text-purple-400' 
+                      : 'bg-blue-500/20 text-blue-400'
+                  }`}>
+                    {trader.tier === 'elite' ? 'E' : 'G'}
+                  </span>
+                  <span className="font-mono text-sm">{formatAddress(trader.address)}</span>
+                  <ExternalLink className="h-4 w-4 text-muted-foreground" />
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-4 text-center">
+                <div>
+                  <div className="text-lg font-bold font-mono text-green-500">{formatPnl(trader.pnl_7d || 0)}</div>
+                  <div className="text-xs text-muted-foreground">7d P&L</div>
+                </div>
+                <div>
+                  <div className="text-lg font-bold font-mono">{((trader.win_rate || 0) * 100).toFixed(0)}%</div>
+                  <div className="text-xs text-muted-foreground">Win Rate</div>
+                </div>
+                <div>
+                  <div className="text-lg font-bold font-mono">{formatPnl(trader.position_value || 0)}</div>
+                  <div className="text-xs text-muted-foreground">Position</div>
+                </div>
+              </div>
+            </a>
           </div>
 
           {/* Bottom safe area */}
@@ -716,7 +705,7 @@ function TrackRecordModal({
                             {traders.map((trader) => {
                               const hasExitData = trader.exit_price !== null && trader.exit_price !== undefined;
                               const traderPnl = hasExitData && trader.entry_price
-                                ? formatTraderEntry(trader.entry_price, trader.exit_price!, signal.direction)
+                                ? calculatePnlFromPrices(trader.entry_price, trader.exit_price!, signal.direction)
                                 : null;
                               
                               return (
@@ -740,9 +729,9 @@ function TrackRecordModal({
                                       <ExternalLink className="h-3 w-3 text-muted-foreground" />
                                     </div>
                                     <div className="flex items-center gap-1.5 sm:gap-2">
-                                      {traderPnl && (
-                                        <span className={`font-mono font-medium text-[10px] sm:text-xs ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                                          {traderPnl.display}
+                                      {traderPnl !== null && (
+                                        <span className={`font-mono font-medium text-[10px] sm:text-xs ${traderPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                                          {traderPnl >= 0 ? '+' : ''}{traderPnl.toFixed(1)}%
                                         </span>
                                       )}
                                       <span className="text-muted-foreground text-[10px] sm:text-xs">
@@ -1074,16 +1063,6 @@ function AnalyticsModal({
                     </tbody>
                   </table>
                 </div>
-              </div>
-
-              <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3">
-                <h3 className="text-sm font-medium text-blue-500 mb-2">Key Insight</h3>
-                <p className="text-xs text-muted-foreground">
-                  Based on your data, <span className="text-foreground font-medium">Elite Entry signals with 1 trader</span> show 
-                  {' '}<span className="text-green-500 font-medium">69% win rate</span> and 
-                  {' '}<span className="text-green-500 font-medium">+0.91% avg P&L</span>. 
-                  Use the Elite + Solo filters to focus on these optimal signals.
-                </p>
               </div>
             </>
           )}
@@ -1491,52 +1470,43 @@ function SignalPerformanceSummary({
 }
 
 // ============================================
-// SIGNAL CARD (Compact - Opens Bottom Sheet)
+// POSITION CARD (Individual Trader Position)
 // ============================================
 
-function SignalCard({ signal, onClick }: { 
-  signal: QualitySignal; 
+function PositionCard({ position, onClick }: { 
+  position: FlatPosition; 
   onClick: () => void;
 }) {
-  const traders = Array.isArray(signal.traders) ? signal.traders : [];
-  const isLong = signal.direction === 'long';
-  
-  const openedDates = traders.map(t => t.opened_at).filter((d): d is string => d !== null && d !== undefined);
-  const earliestEntry = openedDates.length > 0 
-    ? openedDates.reduce((earliest, d) => new Date(d) < new Date(earliest) ? d : earliest)
-    : signal.created_at;
-  
-  const entry = signal.entry_price || signal.current_price;
-  const current = signal.current_price;
-  const pnlPct = signal.current_pnl_pct || calculatePnlFromPrices(entry, current, signal.direction);
+  const { trader, coin, direction, currentPrice, stopLoss, openedAt } = position;
+  const isLong = direction === 'long';
+  const entry = trader.entry_price || 0;
+  const pnlPct = entry && currentPrice ? calculatePnlFromPrices(entry, currentPrice, direction) : 0;
   const isProfit = pnlPct >= 0;
-
-  const traderDisplay = () => {
-    if (signal.elite_count > 0 && signal.good_count > 0) {
-      return `${signal.elite_count}E + ${signal.good_count}G`;
-    } else if (signal.elite_count > 0) {
-      return `${signal.elite_count}E`;
-    } else if (signal.good_count > 0) {
-      return `${signal.good_count}G`;
-    }
-    return '';
-  };
   
   return (
     <div 
       className="bg-card border border-border rounded-lg p-3 cursor-pointer hover:bg-muted/30 transition-colors active:bg-muted/50"
       onClick={onClick}
     >
-      {/* Row 1: Coin, Direction, Trader Count | P&L */}
+      {/* Row 1: Coin, Direction, Tier Badge | P&L */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
-          <span className="text-base font-bold">{signal.coin}</span>
+          <span className="text-base font-bold">{coin}</span>
           <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
             isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
           }`}>
-            {signal.direction.toUpperCase()}
+            {direction.toUpperCase()}
           </span>
-          <span className="text-xs text-muted-foreground">{traderDisplay()}</span>
+          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+            trader.tier === 'elite' 
+              ? 'bg-purple-500/20 text-purple-400' 
+              : 'bg-blue-500/20 text-blue-400'
+          }`}>
+            {trader.tier === 'elite' ? 'E' : 'G'}
+          </span>
+          <span className="font-mono text-xs text-muted-foreground">
+            {formatAddress(trader.address)}
+          </span>
         </div>
         <span className={`text-base font-bold font-mono ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
           {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
@@ -1546,16 +1516,16 @@ function SignalCard({ signal, onClick }: {
       {/* Row 2: Entry → Current | Stop */}
       <div className="flex items-center justify-between mb-1.5 text-sm">
         <span className="font-mono">
-          {formatPrice(entry)} <span className="text-muted-foreground mx-1">→</span> {formatPrice(current)}
+          {formatPrice(entry)} <span className="text-muted-foreground mx-1">→</span> {formatPrice(currentPrice)}
         </span>
         <span className="text-red-500 text-sm">
-          Stop: {formatPrice(signal.stop_loss)}
+          Stop: {formatPrice(stopLoss)}
         </span>
       </div>
       
       {/* Row 3: Opened time */}
       <div className="text-xs text-muted-foreground">
-        {formatDateTimeEST(earliestEntry)}
+        {formatDateTimeEST(openedAt)}
       </div>
     </div>
   );
@@ -1569,10 +1539,9 @@ export default function SignalsPage() {
   const [signals, setSignals] = useState<QualitySignal[]>([]);
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [signalStats, setSignalStats] = useState<SignalStats | null>(null);
-  const [filter, setFilter] = useState<'all' | 'strong' | 'long' | 'short'>('all');
+  const [filter, setFilter] = useState<'all' | 'long' | 'short'>('all');
   const [eliteOnly, setEliteOnly] = useState(false);
-  const [singleTrader, setSingleTrader] = useState(false);
-  const [selectedSignal, setSelectedSignal] = useState<QualitySignal | null>(null);
+  const [selectedPosition, setSelectedPosition] = useState<FlatPosition | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [mounted, setMounted] = useState(false);
@@ -1662,34 +1631,28 @@ export default function SignalsPage() {
     fetchSignalStats();
   };
 
-  const getMostRecentEntryTime = (signal: QualitySignal): number => {
-    const traders = Array.isArray(signal.traders) ? signal.traders : [];
-    const openedDates = traders
-      .map(t => t.opened_at)
-      .filter((d): d is string => d !== null && d !== undefined);
-    
-    if (openedDates.length === 0) return new Date(signal.created_at).getTime();
-    
-    return Math.max(...openedDates.map(d => new Date(d).getTime()));
-  };
+  // Flatten signals into individual positions
+  const allPositions = flattenSignals(signals);
+  
+  // Apply filters
+  const filteredPositions = allPositions.filter((p) => {
+    if (filter === 'long' && p.direction !== 'long') return false;
+    if (filter === 'short' && p.direction !== 'short') return false;
+    if (eliteOnly && p.trader.tier !== 'elite') return false;
+    return true;
+  });
 
-  const filteredSignals = signals
-    .filter((s) => {
-      if (filter === 'strong' && s.signal_strength !== 'strong') return false;
-      if (filter === 'long' && s.direction !== 'long') return false;
-      if (filter === 'short' && s.direction !== 'short') return false;
-      if (eliteOnly && s.signal_tier !== 'elite_entry') return false;
-      if (singleTrader && (s.total_traders || 0) > 1) return false;
-      return true;
-    })
-    .sort((a, b) => getMostRecentEntryTime(b) - getMostRecentEntryTime(a));
+  // Count for filters
+  const longCount = allPositions.filter(p => p.direction === 'long').length;
+  const shortCount = allPositions.filter(p => p.direction === 'short').length;
+  const eliteCount = allPositions.filter(p => p.trader.tier === 'elite').length;
 
   if (!mounted) {
     return (
       <div className="min-h-screen bg-background font-sans">
         <header className="border-b border-border">
           <div className="max-w-lg mx-auto px-4 py-4">
-            <h1 className="text-xl font-semibold">Quality Signals</h1>
+            <h1 className="text-xl font-semibold">Position Feed</h1>
             <p className="text-sm text-muted-foreground">Loading...</p>
           </div>
         </header>
@@ -1703,7 +1666,7 @@ export default function SignalsPage() {
         <div className="max-w-lg mx-auto px-3 sm:px-4 py-3 sm:py-4">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-base sm:text-xl font-semibold">Quality Signals</h1>
+              <h1 className="text-base sm:text-xl font-semibold">Position Feed</h1>
               <p className="text-[10px] sm:text-sm text-muted-foreground">
                 Following {stats?.tracked_count || 0} traders
               </p>
@@ -1711,9 +1674,9 @@ export default function SignalsPage() {
             <div className="flex items-center gap-2 sm:gap-4">
               {stats && (
                 <div className="text-[10px] sm:text-sm">
-                  <span className="text-green-500 font-medium">{stats.elite_count} E</span>
+                  <span className="text-purple-400 font-medium">{stats.elite_count} E</span>
                   <span className="text-muted-foreground mx-1">·</span>
-                  <span className="text-blue-500 font-medium">{stats.good_count} G</span>
+                  <span className="text-blue-400 font-medium">{stats.good_count} G</span>
                 </div>
               )}
               <button
@@ -1746,9 +1709,7 @@ export default function SignalsPage() {
           {/* Direction filters */}
           <div className="flex gap-1.5 sm:gap-2">
             {(['all', 'long', 'short'] as const).map((f) => {
-              const count = f === 'all' 
-                ? signals.length 
-                : signals.filter(s => s.direction === f).length;
+              const count = f === 'all' ? allPositions.length : f === 'long' ? longCount : shortCount;
               return (
                 <button
                   key={f}
@@ -1772,66 +1733,29 @@ export default function SignalsPage() {
           
           <div className="w-px h-6 bg-border self-center mx-1 hidden sm:block" />
           
-          {/* Quality filters */}
-          <div className="flex gap-1.5 sm:gap-2">
-            <button
-              onClick={() => setEliteOnly(!eliteOnly)}
-              className={`px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
-                eliteOnly 
-                  ? 'bg-yellow-600 text-white'
-                  : 'bg-secondary hover:bg-secondary/80'
-              }`}
-            >
-              <span>Elite</span>
-              <span className={`text-[10px] px-1 py-0.5 rounded ${
-                eliteOnly ? 'bg-white/20' : 'bg-muted'
-              }`}>{signals.filter(s => s.signal_tier === 'elite_entry').length}</span>
-            </button>
-            
-            <button
-              onClick={() => setSingleTrader(!singleTrader)}
-              className={`px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
-                singleTrader 
-                  ? 'bg-purple-600 text-white'
-                  : 'bg-secondary hover:bg-secondary/80'
-              }`}
-            >
-              <span>Solo</span>
-              <span className={`text-[10px] px-1 py-0.5 rounded ${
-                singleTrader ? 'bg-white/20' : 'bg-muted'
-              }`}>{signals.filter(s => (s.total_traders || 0) === 1).length}</span>
-            </button>
-          </div>
+          {/* Elite filter */}
+          <button
+            onClick={() => setEliteOnly(!eliteOnly)}
+            className={`px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
+              eliteOnly 
+                ? 'bg-purple-600 text-white'
+                : 'bg-secondary hover:bg-secondary/80'
+            }`}
+          >
+            <span>Elite</span>
+            <span className={`text-[10px] px-1 py-0.5 rounded ${
+              eliteOnly ? 'bg-white/20' : 'bg-muted'
+            }`}>{eliteCount}</span>
+          </button>
         </div>
-        
-        {/* Active filter indicator */}
-        {(eliteOnly || singleTrader) && (
-          <div className="mb-4 p-2.5 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="text-yellow-500 font-medium">
-                {filteredSignals.length} optimal signal{filteredSignals.length !== 1 ? 's' : ''}
-              </span>
-              <span className="text-muted-foreground">
-                ({eliteOnly && 'Elite Entry'}{eliteOnly && singleTrader && ' + '}{singleTrader && '1 Trader'})
-              </span>
-              <span className="text-green-500 hidden sm:inline">· 69% WR, +0.91% avg</span>
-            </div>
-            <button 
-              onClick={() => { setEliteOnly(false); setSingleTrader(false); }}
-              className="text-yellow-500 hover:text-yellow-400 font-medium"
-            >
-              Clear
-            </button>
-          </div>
-        )}
 
-        {filteredSignals.length > 0 ? (
+        {filteredPositions.length > 0 ? (
           <div className="space-y-2.5">
-            {filteredSignals.map((signal) => (
-              <SignalCard 
-                key={signal.id} 
-                signal={signal}
-                onClick={() => setSelectedSignal(signal)}
+            {filteredPositions.map((position) => (
+              <PositionCard 
+                key={position.id} 
+                position={position}
+                onClick={() => setSelectedPosition(position)}
               />
             ))}
           </div>
@@ -1839,18 +1763,18 @@ export default function SignalsPage() {
           <Card>
             <CardContent className="py-8 sm:py-12 text-center">
               <h3 className="text-base sm:text-lg font-medium mb-2">
-                {(eliteOnly || singleTrader || filter !== 'all') 
-                  ? 'No Matching Signals' 
-                  : 'No Active Signals'}
+                {(eliteOnly || filter !== 'all') 
+                  ? 'No Matching Positions' 
+                  : 'No Active Positions'}
               </h3>
               <p className="text-muted-foreground text-xs sm:text-sm">
-                {(eliteOnly || singleTrader || filter !== 'all') 
-                  ? `No signals match your current filters. ${signals.length} total signal${signals.length !== 1 ? 's' : ''} active.`
-                  : 'Signals appear when elite traders open positions or multiple quality traders converge.'}
+                {(eliteOnly || filter !== 'all') 
+                  ? `No positions match your current filters. ${allPositions.length} total position${allPositions.length !== 1 ? 's' : ''} active.`
+                  : 'Positions appear when tracked traders open new trades.'}
               </p>
-              {(eliteOnly || singleTrader || filter !== 'all') && signals.length > 0 && (
+              {(eliteOnly || filter !== 'all') && allPositions.length > 0 && (
                 <button
-                  onClick={() => { setFilter('all'); setEliteOnly(false); setSingleTrader(false); }}
+                  onClick={() => { setFilter('all'); setEliteOnly(false); }}
                   className="mt-3 text-sm text-primary hover:underline"
                 >
                   Clear all filters
@@ -1870,10 +1794,10 @@ export default function SignalsPage() {
       </main>
 
       {/* Bottom Sheet */}
-      <SignalBottomSheet
-        signal={selectedSignal}
-        isOpen={selectedSignal !== null}
-        onClose={() => setSelectedSignal(null)}
+      <PositionBottomSheet
+        position={selectedPosition}
+        isOpen={selectedPosition !== null}
+        onClose={() => setSelectedPosition(null)}
       />
 
       <WalletImportModal 

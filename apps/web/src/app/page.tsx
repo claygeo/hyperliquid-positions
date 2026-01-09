@@ -31,7 +31,6 @@ interface TraderInfo {
   opened_at?: string | null;
   unrealized_pnl?: number;
   unrealized_pnl_pct?: number;
-  // V12: Exit tracking fields
   exit_price?: number | null;
   exited_at?: string | null;
   exit_type?: 'manual' | 'stopped' | 'liquidated' | 'signal_closed' | null;
@@ -140,40 +139,6 @@ function formatTimeAgo(dateString: string): string {
   return `${diffDays}d ago`;
 }
 
-function formatTimeWithEST(dateString: string): string {
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  const diffHours = Math.floor(diffMins / 60);
-  const diffDays = Math.floor(diffHours / 24);
-  
-  const estTime = date.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-    timeZone: 'America/New_York'
-  });
-  
-  const estDate = date.toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'America/New_York'
-  });
-  
-  let ago: string;
-  if (diffMins < 1) ago = 'just now';
-  else if (diffMins < 60) ago = `${diffMins}m ago`;
-  else if (diffHours < 24) ago = `${diffHours}h ago`;
-  else ago = `${diffDays}d ago`;
-  
-  if (diffHours >= 24) {
-    return `${ago} (${estDate}, ${estTime} EST)`;
-  }
-  
-  return `${ago} (${estTime} EST)`;
-}
-
 function formatDateEST(dateString: string): string {
   const date = new Date(dateString);
   return date.toLocaleDateString('en-US', {
@@ -184,6 +149,31 @@ function formatDateEST(dateString: string): string {
     hour12: true,
     timeZone: 'America/New_York'
   });
+}
+
+function formatDateTimeEST(dateString: string): string {
+  const date = new Date(dateString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMins / 60);
+  
+  const estDateTime = date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'America/New_York'
+  });
+  
+  let ago: string;
+  if (diffMins < 1) ago = 'just now';
+  else if (diffMins < 60) ago = `${diffMins}m ago`;
+  else if (diffHours < 24) ago = `${diffHours}h ago`;
+  else ago = `${Math.floor(diffHours / 24)}d ago`;
+  
+  return `${estDateTime} EST · ${ago}`;
 }
 
 function formatDuration(startDate: string, endDate: string): string {
@@ -223,7 +213,7 @@ function formatTraderEntry(entryPrice: number, currentPrice: number, direction: 
 }
 
 function getTraderUrl(address: string): string {
-  return `https://legacy.hyperdash.com/trader/${address}`;
+  return `https://hyperdash.info/trader/${address}`;
 }
 
 function parseAddresses(input: string): string[] {
@@ -235,7 +225,6 @@ function parseAddresses(input: string): string[] {
   return [...new Set(addresses)];
 }
 
-// Human-readable invalidation reasons
 function formatInvalidationReason(reason: string | undefined): string {
   if (!reason) return 'Closed';
   
@@ -256,7 +245,6 @@ function formatInvalidationReason(reason: string | undefined): string {
   return reasonMap[reason] || reason.replace(/_/g, ' ');
 }
 
-// Calculate P&L from entry/exit prices
 function calculatePnlFromPrices(entryPrice: number, exitPrice: number, direction: string): number {
   if (!entryPrice || !exitPrice) return 0;
   
@@ -268,29 +256,24 @@ function calculatePnlFromPrices(entryPrice: number, exitPrice: number, direction
 }
 
 function getOutcomeDisplay(signal: QualitySignal): { label: string; color: string; sublabel?: string } {
-  // Calculate P&L from actual prices (more accurate than stored final_pnl_pct)
   const calculatedPnl = calculatePnlFromPrices(
     signal.entry_price, 
     signal.current_price, 
     signal.direction
   );
   
-  // Use calculated P&L, fall back to stored if no prices
   const pnl = (signal.entry_price && signal.current_price) ? calculatedPnl : (signal.final_pnl_pct || 0);
   const pnlDisplay = `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`;
   const pnlColor = pnl >= 0 ? 'text-green-500' : 'text-red-500';
   
-  // TP hits - show P&L with TP label
   if (signal.hit_tp3) return { label: pnlDisplay, color: 'text-green-500', sublabel: 'TP3 Hit' };
   if (signal.hit_tp2) return { label: pnlDisplay, color: 'text-green-500', sublabel: 'TP2 Hit' };
   if (signal.hit_tp1) return { label: pnlDisplay, color: 'text-green-400', sublabel: 'TP1 Hit' };
   
-  // Stopped - show P&L with "Stopped" sublabel
   if (signal.hit_stop || signal.outcome === 'stopped_out') {
     return { label: pnlDisplay, color: 'text-red-500', sublabel: 'Stopped' };
   }
   
-  // Invalidated with reason - show P&L with reason
   if (signal.invalidation_reason) {
     const reasonText = formatInvalidationReason(signal.invalidation_reason);
     return {
@@ -300,8 +283,215 @@ function getOutcomeDisplay(signal: QualitySignal): { label: string; color: strin
     };
   }
   
-  // Generic outcome - just show P&L
   return { label: pnlDisplay, color: pnlColor };
+}
+
+function formatAddress(address: string): string {
+  if (!address || address.length < 14) return address;
+  return `${address.slice(0, 10)}...${address.slice(-4)}`;
+}
+
+// ============================================
+// SIGNAL BOTTOM SHEET
+// ============================================
+
+function SignalBottomSheet({
+  signal,
+  isOpen,
+  onClose,
+}: {
+  signal: QualitySignal | null;
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [startY, setStartY] = useState(0);
+  const [currentY, setCurrentY] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+
+  if (!signal) return null;
+
+  const traders = Array.isArray(signal.traders) ? signal.traders : [];
+  const isLong = signal.direction === 'long';
+  const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
+  
+  const entry = signal.entry_price || signal.current_price;
+  const current = signal.current_price;
+  const pnlPct = signal.current_pnl_pct || calculatePnlFromPrices(entry, current, signal.direction);
+  const isProfit = pnlPct >= 0;
+
+  const openedDates = traders.map(t => t.opened_at).filter((d): d is string => d !== null && d !== undefined);
+  const earliestEntry = openedDates.length > 0 
+    ? openedDates.reduce((earliest, d) => new Date(d) < new Date(earliest) ? d : earliest)
+    : signal.created_at;
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    setStartY(e.touches[0].clientY);
+    setIsDragging(true);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!isDragging) return;
+    setCurrentY(e.touches[0].clientY);
+  };
+
+  const handleTouchEnd = () => {
+    if (isDragging && currentY - startY > 100) {
+      onClose();
+    }
+    setIsDragging(false);
+    setStartY(0);
+    setCurrentY(0);
+  };
+
+  const dragOffset = isDragging && currentY > startY ? currentY - startY : 0;
+
+  return (
+    <>
+      {/* Overlay */}
+      <div 
+        className={`fixed inset-0 bg-black/50 z-40 transition-opacity duration-300 ${
+          isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        }`}
+        onClick={onClose}
+      />
+      
+      {/* Bottom Sheet */}
+      <div 
+        className={`fixed left-0 right-0 bottom-0 bg-card border-t border-border rounded-t-2xl z-50 transition-transform duration-300 ease-out max-h-[85vh] overflow-hidden flex flex-col ${
+          isOpen ? 'translate-y-0' : 'translate-y-full'
+        }`}
+        style={{ transform: isOpen ? `translateY(${dragOffset}px)` : 'translateY(100%)' }}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+      >
+        {/* Handle */}
+        <div className="flex justify-center pt-3 pb-2 cursor-grab">
+          <div className="w-10 h-1 bg-muted-foreground/30 rounded-full" />
+        </div>
+
+        {/* Sheet Content - Scrollable */}
+        <div className="flex-1 overflow-y-auto">
+          {/* Header */}
+          <div className="px-4 pb-4 border-b border-border">
+            {/* Title Row */}
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xl font-bold">{signal.coin}</span>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                  isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
+                }`}>
+                  {signal.direction.toUpperCase()}
+                </span>
+                <span className="text-sm text-muted-foreground">
+                  {signal.elite_count > 0 && <span className="text-green-500">{signal.elite_count}E</span>}
+                  {signal.elite_count > 0 && signal.good_count > 0 && ' + '}
+                  {signal.good_count > 0 && <span className="text-blue-500">{signal.good_count}G</span>}
+                </span>
+              </div>
+              <span className={`text-xl font-bold font-mono ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
+                {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
+              </span>
+            </div>
+
+            {/* Meta Grid */}
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div>
+                <div className="text-muted-foreground text-xs mb-0.5">Entry</div>
+                <div className="font-mono">{formatPrice(entry)} → {formatPrice(current)}</div>
+              </div>
+              <div>
+                <div className="text-muted-foreground text-xs mb-0.5">Opened</div>
+                <div className="text-sm">{formatDateTimeEST(earliestEntry)}</div>
+              </div>
+              <div>
+                <div className="text-muted-foreground text-xs mb-0.5">Stop Loss</div>
+                <div className="text-red-500 font-mono">{formatPrice(signal.stop_loss)} (-{stopPct.toFixed(1)}%)</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Take Profits */}
+          <div className="grid grid-cols-3 gap-2 p-4 border-b border-border">
+            <div className="bg-muted/30 rounded-lg p-3 text-center">
+              <div className="text-xs text-muted-foreground mb-1">TP1 (1:1)</div>
+              <div className="font-mono font-semibold text-green-500">{formatPrice(signal.take_profit_1)}</div>
+            </div>
+            <div className="bg-muted/30 rounded-lg p-3 text-center">
+              <div className="text-xs text-muted-foreground mb-1">TP2 (2:1)</div>
+              <div className="font-mono font-semibold text-green-500">{formatPrice(signal.take_profit_2)}</div>
+            </div>
+            <div className="bg-muted/30 rounded-lg p-3 text-center">
+              <div className="text-xs text-muted-foreground mb-1">TP3 (3:1)</div>
+              <div className="font-mono font-semibold text-green-500">{formatPrice(signal.take_profit_3)}</div>
+            </div>
+          </div>
+
+          {/* Traders */}
+          <div className="p-4">
+            <div className="text-sm text-muted-foreground mb-3">Traders ({traders.length})</div>
+            <div className="space-y-2">
+              {traders.map((trader) => {
+                const traderEntry = trader.entry_price || 0;
+                const traderPnl = traderEntry && current 
+                  ? formatTraderEntry(traderEntry, current, signal.direction)
+                  : null;
+                const entryTime = trader.opened_at ? formatDateEST(trader.opened_at) : null;
+                
+                return (
+                  <a
+                    key={trader.address}
+                    href={getTraderUrl(trader.address)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 p-2.5 bg-muted/20 rounded-lg hover:bg-muted/40 transition-colors"
+                  >
+                    {/* Tier Badge */}
+                    <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-semibold flex-shrink-0 ${
+                      trader.tier === 'elite' 
+                        ? 'bg-purple-500/20 text-purple-400' 
+                        : 'bg-blue-500/20 text-blue-400'
+                    }`}>
+                      {trader.tier === 'elite' ? 'E' : 'G'}
+                    </span>
+                    
+                    {/* Address */}
+                    <span className="font-mono text-xs text-muted-foreground flex items-center gap-1 flex-shrink-0">
+                      {formatAddress(trader.address)}
+                      <ExternalLink className="h-3 w-3 opacity-50" />
+                    </span>
+                    
+                    {/* Stats */}
+                    <span className="text-[11px] text-muted-foreground flex-shrink-0">
+                      {formatPnl(trader.pnl_7d || 0)} · {((trader.win_rate || 0) * 100).toFixed(0)}%
+                    </span>
+                    
+                    {/* Right side - Entry & Time */}
+                    <div className="ml-auto text-right flex-shrink-0">
+                      <div className="text-sm font-mono">
+                        {formatPrice(traderEntry)}
+                        {traderPnl && (
+                          <span className={`ml-1 text-xs ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                            {traderPnl.display}
+                          </span>
+                        )}
+                      </div>
+                      {entryTime && (
+                        <div className="text-[11px] text-muted-foreground">{entryTime}</div>
+                      )}
+                    </div>
+                  </a>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Bottom safe area */}
+          <div className="h-6" />
+        </div>
+      </div>
+    </>
+  );
 }
 
 // ============================================
@@ -426,7 +616,7 @@ function TrackRecordModal({
                     className="p-2.5 sm:p-3 cursor-pointer hover:bg-muted/30 transition-colors"
                     onClick={() => setExpandedSignal(isExpanded ? null : signal.id)}
                   >
-                    {/* Top Row: Coin, Direction, Stats, P&L */}
+                    {/* Top Row */}
                     <div className="flex items-center justify-between gap-2 mb-1.5 sm:mb-2">
                       <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
                         <span className="font-bold text-sm sm:text-base">{signal.coin}</span>
@@ -462,7 +652,7 @@ function TrackRecordModal({
                       </div>
                     </div>
                     
-                    {/* Bottom Row: Entry, Exit, Date */}
+                    {/* Bottom Row */}
                     <div className="flex items-center justify-between text-xs sm:text-sm">
                       <div className="flex items-center gap-2 sm:gap-4">
                         <span className="text-muted-foreground">
@@ -560,7 +750,6 @@ function TrackRecordModal({
                                       </span>
                                     </div>
                                   </div>
-                                  {/* Entry Row */}
                                   <div className="text-[10px] sm:text-xs text-muted-foreground pl-5 sm:pl-6">
                                     <span>
                                       Entry: <span className="font-mono text-foreground">{formatPrice(trader.entry_price)}</span>
@@ -569,7 +758,6 @@ function TrackRecordModal({
                                       )}
                                     </span>
                                   </div>
-                                  {/* Exit Row */}
                                   {hasExitData && (
                                     <div className="text-[10px] sm:text-xs text-muted-foreground pl-5 sm:pl-6 mt-0.5">
                                       <span>
@@ -621,14 +809,6 @@ interface DailyStats {
   winners: number;
 }
 
-interface TraderStatus {
-  address: string;
-  quality_tier: string;
-  pnl_7d: number;
-  win_rate: number;
-  status: 'hot' | 'cold';
-}
-
 function AnalyticsModal({
   isOpen,
   onClose,
@@ -660,7 +840,6 @@ function AnalyticsModal({
     setIsLoading(true);
     
     try {
-      // Fetch closed signals for daily breakdown
       const { data: signals } = await supabase
         .from('quality_signals')
         .select('*')
@@ -669,7 +848,6 @@ function AnalyticsModal({
         .order('closed_at', { ascending: false });
 
       if (signals) {
-        // Group by date
         const byDate = new Map<string, DailyStats>();
         
         signals.forEach(s => {
@@ -699,7 +877,6 @@ function AnalyticsModal({
           byDate.set(date, existing);
         });
 
-        // Calculate averages and convert to array
         const dailyArray = Array.from(byDate.values()).map(d => ({
           ...d,
           avg_pnl: ((d as any).totalPnl / d.signals).toFixed(2)
@@ -707,7 +884,6 @@ function AnalyticsModal({
 
         setDailyStats(dailyArray);
 
-        // Calculate overall stats including max profit tracking
         const totalPnl = signals.reduce((sum, s) => {
           const pnl = s.direction === 'long' 
             ? ((s.current_price - s.entry_price) / s.entry_price) * 100
@@ -722,7 +898,6 @@ function AnalyticsModal({
           return pnl > 0;
         }).length;
 
-        // Calculate max profit / drawdown stats
         const signalsWithMaxPnl = signals.filter(s => s.max_pnl_pct !== null && s.max_pnl_pct !== undefined);
         const avgMaxProfit = signalsWithMaxPnl.length > 0 
           ? signalsWithMaxPnl.reduce((sum, s) => sum + (s.max_pnl_pct || 0), 0) / signalsWithMaxPnl.length
@@ -733,7 +908,6 @@ function AnalyticsModal({
           ? signalsWithMinPnl.reduce((sum, s) => sum + (s.min_pnl_pct || 0), 0) / signalsWithMinPnl.length
           : 0;
 
-        // Left on table = max profit - actual exit profit
         const avgLeftOnTable = signalsWithMaxPnl.length > 0
           ? signalsWithMaxPnl.reduce((sum, s) => {
               const actualPnl = s.direction === 'long' 
@@ -754,7 +928,6 @@ function AnalyticsModal({
         });
       }
 
-      // Fetch trader stats
       const { data: traders } = await supabase
         .from('trader_quality')
         .select('quality_tier, pnl_7d')
@@ -780,7 +953,6 @@ function AnalyticsModal({
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 sm:p-4">
       <div className="bg-card border border-border rounded-lg w-full max-w-2xl max-h-[95vh] sm:max-h-[90vh] overflow-hidden flex flex-col">
-        {/* Header */}
         <div className="flex items-center justify-between p-3 sm:p-4 border-b border-border">
           <div className="flex items-center gap-2">
             <BarChart3 className="h-5 w-5 text-primary" />
@@ -791,7 +963,6 @@ function AnalyticsModal({
           </button>
         </div>
 
-        {/* Content */}
         <div className="p-3 sm:p-4 flex-1 overflow-y-auto space-y-4">
           {isLoading ? (
             <div className="flex items-center justify-center py-12">
@@ -799,7 +970,6 @@ function AnalyticsModal({
             </div>
           ) : (
             <>
-              {/* Overall Stats */}
               {overallStats && (
                 <>
                   <div className="grid grid-cols-4 gap-2 sm:gap-3">
@@ -827,7 +997,6 @@ function AnalyticsModal({
                     </div>
                   </div>
 
-                  {/* Profit Efficiency Section */}
                   <div className="bg-muted/20 rounded-lg p-3">
                     <h3 className="text-sm font-medium mb-2">Profit Efficiency</h3>
                     <div className="grid grid-cols-3 gap-3">
@@ -851,7 +1020,6 @@ function AnalyticsModal({
                 </>
               )}
 
-              {/* Trader Health */}
               <div className="bg-muted/20 rounded-lg p-3">
                 <h3 className="text-sm font-medium mb-2">Trader Health</h3>
                 <div className="grid grid-cols-2 gap-3">
@@ -874,7 +1042,6 @@ function AnalyticsModal({
                 </div>
               </div>
 
-              {/* Daily Breakdown */}
               <div>
                 <h3 className="text-sm font-medium mb-2">Daily Performance (Last 14 Days)</h3>
                 <div className="bg-muted/10 rounded-lg overflow-hidden">
@@ -909,7 +1076,6 @@ function AnalyticsModal({
                 </div>
               </div>
 
-              {/* Key Insights */}
               <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3">
                 <h3 className="text-sm font-medium text-blue-500 mb-2">Key Insight</h3>
                 <p className="text-xs text-muted-foreground">
@@ -923,7 +1089,6 @@ function AnalyticsModal({
           )}
         </div>
 
-        {/* Footer */}
         <div className="border-t border-border p-3 flex justify-between items-center">
           <button
             onClick={fetchAnalytics}
@@ -1278,7 +1443,7 @@ function WalletImportModal({
 }
 
 // ============================================
-// SIGNAL PERFORMANCE SUMMARY (Clickable)
+// SIGNAL PERFORMANCE SUMMARY
 // ============================================
 
 function SignalPerformanceSummary({ 
@@ -1326,258 +1491,73 @@ function SignalPerformanceSummary({
 }
 
 // ============================================
-// SIGNAL TIER BADGE
+// SIGNAL CARD (Compact - Opens Bottom Sheet)
 // ============================================
 
-function SignalTierBadge({ signal }: { signal: QualitySignal }) {
-  const tier = signal.signal_tier;
-  const eliteCount = signal.elite_count || 0;
-  const goodCount = signal.good_count || 0;
-  
-  if (tier === 'elite_entry') {
-    return (
-      <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
-        Elite
-      </span>
-    );
-  }
-  
-  return (
-    <span className="text-xs text-muted-foreground font-medium">
-      {eliteCount > 0 && <span className="text-green-500">{eliteCount}E</span>}
-      {eliteCount > 0 && goodCount > 0 && '+'}
-      {goodCount > 0 && <span className="text-blue-500">{goodCount}G</span>}
-    </span>
-  );
-}
-
-// ============================================
-// SIGNAL CARD
-// ============================================
-
-function SignalCard({ signal, isExpanded, onToggle }: { 
+function SignalCard({ signal, onClick }: { 
   signal: QualitySignal; 
-  isExpanded: boolean;
-  onToggle: () => void;
+  onClick: () => void;
 }) {
   const traders = Array.isArray(signal.traders) ? signal.traders : [];
   const isLong = signal.direction === 'long';
-  const stopPct = signal.stop_distance_pct || Math.abs((signal.stop_loss - signal.entry_price) / signal.entry_price * 100);
   
-  // Get entry time for display
   const openedDates = traders.map(t => t.opened_at).filter((d): d is string => d !== null && d !== undefined);
-  const mostRecentEntry = openedDates.length > 0 
-    ? openedDates.reduce((latest, d) => new Date(d) > new Date(latest) ? d : latest)
-    : null;
-  const entryTimeDisplay = mostRecentEntry ? formatDateEST(mostRecentEntry) : null;
-  const durationDisplay = mostRecentEntry ? formatTimeAgo(mostRecentEntry) : null;
+  const earliestEntry = openedDates.length > 0 
+    ? openedDates.reduce((earliest, d) => new Date(d) < new Date(earliest) ? d : earliest)
+    : signal.created_at;
   
   const entry = signal.entry_price || signal.current_price;
   const current = signal.current_price;
-  const pnlPct = signal.current_pnl_pct || 0;
+  const pnlPct = signal.current_pnl_pct || calculatePnlFromPrices(entry, current, signal.direction);
   const isProfit = pnlPct >= 0;
+
+  const traderDisplay = () => {
+    if (signal.elite_count > 0 && signal.good_count > 0) {
+      return `${signal.elite_count}E + ${signal.good_count}G`;
+    } else if (signal.elite_count > 0) {
+      return `${signal.elite_count}E`;
+    } else if (signal.good_count > 0) {
+      return `${signal.good_count}G`;
+    }
+    return '';
+  };
   
   return (
-    <Card className="overflow-hidden">
-      <CardContent className="p-0">
-        <div 
-          className="p-4 cursor-pointer hover:bg-muted/30 transition-colors"
-          onClick={onToggle}
-        >
-          {/* DESKTOP LAYOUT (md and up) */}
-          <div className="hidden md:block">
-            {/* Row 1: Header */}
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-3">
-                <span className="text-xl font-bold w-20">{signal.coin}</span>
-                <span className={`text-xs font-bold px-2 py-0.5 rounded w-14 text-center ${
-                  isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
-                }`}>
-                  {signal.direction.toUpperCase()}
-                </span>
-                <div className="w-16">
-                  <SignalTierBadge signal={signal} />
-                </div>
-                {signal.funding_context === 'favorable' && (
-                  <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-500 flex items-center gap-1">
-                    <Zap className="h-3 w-3" />
-                    Funding pays you
-                  </span>
-                )}
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground flex items-center gap-1">
-                  <Clock className="h-3 w-3" />
-                  {formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}
-                </span>
-                {isExpanded ? <ChevronUp className="h-5 w-5 text-muted-foreground" /> : <ChevronDown className="h-5 w-5 text-muted-foreground" />}
-              </div>
-            </div>
-            
-            {/* Row 2: Price data - tabular alignment */}
-            <div className="flex items-center justify-between mb-1.5">
-              <div className="flex items-center text-sm">
-                <span className="text-muted-foreground w-12">Entry</span>
-                <span className="font-mono font-semibold w-28 text-right">{formatPrice(entry)}</span>
-                <span className="text-muted-foreground mx-3">→</span>
-                <span className="text-muted-foreground w-10">Now</span>
-                <span className="font-mono font-semibold w-28 text-right">{formatPrice(current)}</span>
-                <span className={`font-mono font-bold ml-3 w-20 text-right ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
-                  {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
-                </span>
-              </div>
-              <div className="flex items-center text-sm">
-                <span className="text-muted-foreground mr-2">Stop:</span>
-                <span className="text-red-500 font-mono font-semibold">{formatPrice(signal.stop_loss)}</span>
-                <span className="text-red-500/70 text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
-              </div>
-            </div>
-            
-            {/* Row 3: Opened time */}
-            {entryTimeDisplay && (
-              <div className="text-xs text-muted-foreground">
-                Opened: {entryTimeDisplay} EST {durationDisplay && <span>· {durationDisplay}</span>}
-              </div>
-            )}
-          </div>
-          
-          {/* MOBILE LAYOUT (below md) */}
-          <div className="md:hidden">
-            {/* Row 1: Coin, Direction, Tier | Time, Chevron */}
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-2">
-                <span className="text-lg font-bold">{signal.coin}</span>
-                <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${
-                  isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
-                }`}>
-                  {signal.direction.toUpperCase()}
-                </span>
-                <SignalTierBadge signal={signal} />
-                {signal.funding_context === 'favorable' && (
-                  <Zap className="h-3.5 w-3.5 text-green-500" />
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground flex items-center gap-1">
-                  <Clock className="h-3 w-3" />
-                  {formatTimeAgo(signal.updated_at || signal.created_at).replace(' ago', '')}
-                </span>
-                {isExpanded ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
-              </div>
-            </div>
-            
-            {/* Row 2: Entry → Now with P&L */}
-            <div className="grid grid-cols-[auto_auto_auto_auto_1fr] items-center gap-x-2 text-sm mb-2">
-              <span className="text-muted-foreground">Entry</span>
-              <span className="font-mono font-semibold">{formatPrice(entry)}</span>
-              <span className="text-muted-foreground">→</span>
-              <span className="font-mono font-semibold">{formatPrice(current)}</span>
-              <span className={`font-mono font-bold text-right ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
-                {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
-              </span>
-            </div>
-            
-            {/* Row 3: Opened time */}
-            {entryTimeDisplay && (
-              <div className="text-xs text-muted-foreground mb-2">
-                Opened: {entryTimeDisplay} EST {durationDisplay && <span>· {durationDisplay}</span>}
-              </div>
-            )}
-            
-            {/* Row 4: Stop */}
-            <div className="flex items-center text-sm">
-              <span className="text-muted-foreground mr-2">Stop:</span>
-              <span className="text-red-500 font-mono font-semibold">{formatPrice(signal.stop_loss)}</span>
-              <span className="text-red-500/70 text-xs ml-1">(-{stopPct.toFixed(1)}%)</span>
-            </div>
-          </div>
+    <div 
+      className="bg-card border border-border rounded-lg p-3 cursor-pointer hover:bg-muted/30 transition-colors active:bg-muted/50"
+      onClick={onClick}
+    >
+      {/* Row 1: Coin, Direction, Trader Count | P&L */}
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-base font-bold">{signal.coin}</span>
+          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+            isLong ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'
+          }`}>
+            {signal.direction.toUpperCase()}
+          </span>
+          <span className="text-xs text-muted-foreground">{traderDisplay()}</span>
         </div>
-        
-        {/* Expanded View */}
-        {isExpanded && (
-          <div className="border-t border-border bg-muted/20 p-4 space-y-4">
-            {/* Take Profit Levels */}
-            <div className="grid grid-cols-3 gap-2 md:gap-3">
-              <div className="bg-background rounded-lg p-2 md:p-3 text-center">
-                <div className="text-green-400 text-xs mb-1">TP1 (1:1)</div>
-                <div className="font-mono font-semibold text-green-400 text-sm">{formatPrice(signal.take_profit_1)}</div>
-              </div>
-              <div className="bg-background rounded-lg p-2 md:p-3 text-center">
-                <div className="text-green-500 text-xs mb-1">TP2 (2:1)</div>
-                <div className="font-mono font-semibold text-green-500 text-sm">{formatPrice(signal.take_profit_2)}</div>
-              </div>
-              <div className="bg-background rounded-lg p-2 md:p-3 text-center">
-                <div className="text-green-600 text-xs mb-1">TP3 (3:1)</div>
-                <div className="font-mono font-semibold text-green-600 text-sm">{formatPrice(signal.take_profit_3)}</div>
-              </div>
-            </div>
-            
-            {/* Traders List */}
-            {traders.length > 0 && (
-              <div>
-                <div className="text-xs text-muted-foreground mb-2">Traders ({traders.length})</div>
-                <div className="space-y-2">
-                  {traders.map((trader) => {
-                    const traderEntry = trader.entry_price || 0;
-                    const currentPrice = signal.current_price || 0;
-                    const traderPnl = traderEntry && currentPrice 
-                      ? formatTraderEntry(traderEntry, currentPrice, signal.direction)
-                      : null;
-                    const entryTime = trader.opened_at ? formatDateEST(trader.opened_at) : null;
-                    
-                    return (
-                      <a
-                        key={trader.address}
-                        href={getTraderUrl(trader.address)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="block p-3 bg-background rounded-lg hover:bg-muted/50 transition-colors"
-                      >
-                        {/* Trader header */}
-                        <div className="flex items-center justify-between mb-1.5">
-                          <div className="flex items-center gap-2">
-                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                              trader.tier === 'elite' ? 'bg-green-500/20 text-green-500' : 'bg-blue-500/20 text-blue-500'
-                            }`}>
-                              {trader.tier === 'elite' ? 'E' : 'G'}
-                            </span>
-                            <span className="font-mono text-xs text-muted-foreground">
-                              {trader.address.slice(0, 6)}...{trader.address.slice(-4)}
-                            </span>
-                            <ExternalLink className="h-3 w-3 text-muted-foreground" />
-                          </div>
-                          <div className="flex items-center gap-3 text-xs">
-                            <span className={`font-mono font-medium ${(trader.pnl_7d || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                              {formatPnl(trader.pnl_7d || 0)}
-                            </span>
-                            <span className="text-muted-foreground">
-                              {((trader.win_rate || 0) * 100).toFixed(0)}% WR
-                            </span>
-                          </div>
-                        </div>
-                        {/* Trader entry details */}
-                        <div className="flex items-center justify-between text-xs text-muted-foreground">
-                          <div className="flex items-center gap-2">
-                            <span>Entry:</span>
-                            <span className="font-mono text-foreground font-medium">{formatPrice(traderEntry)}</span>
-                            {traderPnl && (
-                              <span className={`font-mono font-medium ${traderPnl.pnlPct >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                                {traderPnl.display}
-                              </span>
-                            )}
-                          </div>
-                          {entryTime && <span>{entryTime}</span>}
-                        </div>
-                      </a>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+        <span className={`text-base font-bold font-mono ${isProfit ? 'text-green-500' : 'text-red-500'}`}>
+          {isProfit ? '+' : ''}{pnlPct.toFixed(2)}%
+        </span>
+      </div>
+      
+      {/* Row 2: Entry → Current | Stop */}
+      <div className="flex items-center justify-between mb-1.5 text-sm">
+        <span className="font-mono">
+          {formatPrice(entry)} <span className="text-muted-foreground mx-1">→</span> {formatPrice(current)}
+        </span>
+        <span className="text-red-500 text-sm">
+          Stop: {formatPrice(signal.stop_loss)}
+        </span>
+      </div>
+      
+      {/* Row 3: Opened time */}
+      <div className="text-xs text-muted-foreground">
+        {formatDateTimeEST(earliestEntry)}
+      </div>
+    </div>
   );
 }
 
@@ -1592,7 +1572,7 @@ export default function SignalsPage() {
   const [filter, setFilter] = useState<'all' | 'strong' | 'long' | 'short'>('all');
   const [eliteOnly, setEliteOnly] = useState(false);
   const [singleTrader, setSingleTrader] = useState(false);
-  const [expandedSignal, setExpandedSignal] = useState<number | null>(null);
+  const [selectedSignal, setSelectedSignal] = useState<QualitySignal | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [mounted, setMounted] = useState(false);
@@ -1637,7 +1617,6 @@ export default function SignalsPage() {
   }, [supabase]);
 
   const fetchSignalStats = useCallback(async () => {
-    // Only get CLOSED signals (same criteria as modal)
     const { data } = await supabase
       .from('quality_signals')
       .select('outcome, hit_tp1, hit_tp2, hit_tp3, hit_stop, final_pnl_pct, entry_price, current_price, direction')
@@ -1647,14 +1626,12 @@ export default function SignalsPage() {
     if (data) {
       const total = data.length;
       const wins = data.filter(s => {
-        // Calculate actual P&L from prices
         if (s.entry_price && s.current_price) {
           const pnl = s.direction === 'long' 
             ? ((s.current_price - s.entry_price) / s.entry_price) * 100
             : ((s.entry_price - s.current_price) / s.entry_price) * 100;
           return pnl > 0;
         }
-        // Fall back to stored data
         return s.hit_tp1 || s.hit_tp2 || s.hit_tp3 || s.outcome === 'profit' || (s.final_pnl_pct && s.final_pnl_pct > 0);
       }).length;
       const stopped = data.filter(s => s.hit_stop || s.outcome === 'stopped_out').length;
@@ -1685,7 +1662,6 @@ export default function SignalsPage() {
     fetchSignalStats();
   };
 
-  // Helper to get most recent trader entry time
   const getMostRecentEntryTime = (signal: QualitySignal): number => {
     const traders = Array.isArray(signal.traders) ? signal.traders : [];
     const openedDates = traders
@@ -1699,27 +1675,20 @@ export default function SignalsPage() {
 
   const filteredSignals = signals
     .filter((s) => {
-      // Direction/strength filter
       if (filter === 'strong' && s.signal_strength !== 'strong') return false;
       if (filter === 'long' && s.direction !== 'long') return false;
       if (filter === 'short' && s.direction !== 'short') return false;
-      
-      // Elite Entry filter
       if (eliteOnly && s.signal_tier !== 'elite_entry') return false;
-      
-      // Single trader filter
       if (singleTrader && (s.total_traders || 0) > 1) return false;
-      
       return true;
     })
-    // Sort by most recent trader entry time (newest position at top)
     .sort((a, b) => getMostRecentEntryTime(b) - getMostRecentEntryTime(a));
 
   if (!mounted) {
     return (
       <div className="min-h-screen bg-background font-sans">
         <header className="border-b border-border">
-          <div className="max-w-3xl mx-auto px-4 py-4">
+          <div className="max-w-lg mx-auto px-4 py-4">
             <h1 className="text-xl font-semibold">Quality Signals</h1>
             <p className="text-sm text-muted-foreground">Loading...</p>
           </div>
@@ -1731,7 +1700,7 @@ export default function SignalsPage() {
   return (
     <div className="min-h-screen bg-background font-sans">
       <header className="border-b border-border sticky top-0 bg-background z-20">
-        <div className="max-w-3xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
+        <div className="max-w-lg mx-auto px-3 sm:px-4 py-3 sm:py-4">
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-base sm:text-xl font-semibold">Quality Signals</h1>
@@ -1766,7 +1735,7 @@ export default function SignalsPage() {
         </div>
       </header>
 
-      <main className="max-w-3xl mx-auto px-3 sm:px-4 py-4 sm:py-6">
+      <main className="max-w-lg mx-auto px-3 sm:px-4 py-4 sm:py-6">
         <SignalPerformanceSummary 
           stats={signalStats} 
           onClick={() => setShowTrackRecord(true)}
@@ -1801,7 +1770,6 @@ export default function SignalsPage() {
             })}
           </div>
           
-          {/* Divider */}
           <div className="w-px h-6 bg-border self-center mx-1 hidden sm:block" />
           
           {/* Quality filters */}
@@ -1858,15 +1826,12 @@ export default function SignalsPage() {
         )}
 
         {filteredSignals.length > 0 ? (
-          <div className="space-y-3 sm:space-y-4">
+          <div className="space-y-2.5">
             {filteredSignals.map((signal) => (
               <SignalCard 
                 key={signal.id} 
                 signal={signal}
-                isExpanded={expandedSignal === signal.id}
-                onToggle={() => setExpandedSignal(
-                  expandedSignal === signal.id ? null : signal.id
-                )}
+                onClick={() => setSelectedSignal(signal)}
               />
             ))}
           </div>
@@ -1903,6 +1868,13 @@ export default function SignalsPage() {
           <span>Live · Updated {lastRefresh}</span>
         </div>
       </main>
+
+      {/* Bottom Sheet */}
+      <SignalBottomSheet
+        signal={selectedSignal}
+        isOpen={selectedSignal !== null}
+        onClose={() => setSelectedSignal(null)}
+      />
 
       <WalletImportModal 
         isOpen={showImportModal}

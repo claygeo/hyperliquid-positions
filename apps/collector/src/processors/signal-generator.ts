@@ -38,7 +38,7 @@ const logger = createLogger('signal-generator-v12');
 // ============================================
 
 const MAX_POSITION_AGE_HOURS = 24;
-const COIN_BLACKLIST = ['GRASS', 'ZEC', 'SOL', 'ETH'];
+const COIN_BLACKLIST = ['GRASS', 'ZEC'];
 const RECONCILIATION_INTERVAL_MS = 10 * 60 * 1000;
 
 // ============================================

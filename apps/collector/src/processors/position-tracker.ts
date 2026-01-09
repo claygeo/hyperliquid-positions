@@ -1,5 +1,10 @@
-// Position Tracker V7.5
+// Position Tracker V7.6
 // 
+// V7.6 CHANGES (Fix discovered positions on existing wallets):
+// - Query fill history for ANY new position, not just new wallets
+// - If position > 1 hour old, use actual timestamp from fill history
+// - Fixes: unblacklisted coins getting wrong timestamps
+//
 // V7.5 CHANGES (Accurate Position Open Times):
 // - NEW: Track "seenWallets" to distinguish newly added wallets vs. already tracked
 // - NEW: For newly added wallets, query fill history to get ACTUAL opened_at timestamp
@@ -20,7 +25,7 @@ import db from '../db/client.js';
 import { config } from '../config.js';
 import hyperliquid, { Position, OpenOrder, findPositionOpenTime } from '../utils/hyperliquid-api.js';
 
-const logger = createLogger('position-tracker-v7.5');
+const logger = createLogger('position-tracker-v7.6');
 
 // ============================================
 // Types
@@ -488,8 +493,28 @@ async function processPositions(
         );
       }
     } else {
-      // Existing wallet, new position = we witnessed the open
-      openedAt = now;
+      // V7.6: Existing wallet, new position - query fill history to check if genuinely new
+      const fillData = await findPositionOpenTime(address, coin, currentDirection, 30);
+      
+      if (fillData) {
+        const fillAgeHours = (now.getTime() - fillData.openedAt.getTime()) / (1000 * 60 * 60);
+        
+        if (fillAgeHours < 1) {
+          // Position opened within last hour - genuinely new, use now for accuracy
+          openedAt = now;
+        } else {
+          // Position is older - we just discovered it (e.g., unblacklisted coin)
+          openedAt = fillData.openedAt;
+          logger.info(
+            `[DISCOVERED-EXISTING] ${address.slice(0, 8)}... ${coin} ${currentDirection.toUpperCase()} | ` +
+            `Actual open: ${openedAt.toISOString().slice(0, 16)} | ` +
+            `Entry: $${fillData.entryPrice.toFixed(2)}`
+          );
+        }
+      } else {
+        // Couldn't find fill history - assume genuinely new
+        openedAt = now;
+      }
     }
 
     const positionAgeHours = (now.getTime() - openedAt.getTime()) / (1000 * 60 * 60);
@@ -753,8 +778,9 @@ async function pollPositions(): Promise<void> {
 // ============================================
 
 export function startPositionTracker(): void {
-  logger.info('Position tracker V7.5 starting...');
+  logger.info('Position tracker V7.6 starting...');
   logger.info('  - Accurate opened_at from fill history for new wallets');
+  logger.info('  - Accurate opened_at for new positions on existing wallets');
   logger.info('  - No false open events for existing positions');
   
   pollPositions();
